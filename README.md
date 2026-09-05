@@ -1,4 +1,4 @@
-# Multimodal Robotic Manipulation Framework with Natural Language Control
+# Multimodal Conversational Robotic Arm for Natural Language-Based Object Manipulation
 
 **Capstone Project — Team 178**  
 Modular perception-driven manipulation framework on **NVIDIA Isaac Sim 5.1 + PhysX**, featuring multimodal sensory perception, resident LLM cognitive intent parsing (**Qwen 2.5-3B-Instruct**), physics-constrained grasp synthesis, collision-aware motion planning, and an **NVIDIA GR00T N1.7** policy backend.

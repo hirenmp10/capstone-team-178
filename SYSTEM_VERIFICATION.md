@@ -1,8 +1,11 @@
-# System Verification & Experimental Evaluation Report
+# Multimodal Conversational Robotic Arm for Natural Language-Based Object Manipulation
+## System Verification & Experimental Evaluation Report
 
-## 1. Executive Summary & System Scope
+**Capstone Project — Team 178**
 
-This repository contains the verified implementation and experimental evaluation of the **Perception-Driven Robotic Manipulation Framework with Natural Language Control** on **NVIDIA Isaac Sim 5.1 + PhysX**.
+### 1. Executive Summary & System Scope
+
+This repository contains the verified implementation and experimental evaluation of the **Multimodal Conversational Robotic Arm for Natural Language-Based Object Manipulation** on **NVIDIA Isaac Sim 5.1 + PhysX**.
 
 ### Verified System Capabilities
 * **Active & Verified in Current Deployment:**

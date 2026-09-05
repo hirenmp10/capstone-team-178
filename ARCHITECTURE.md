@@ -1,4 +1,6 @@
-# Manipulation Framework — Architecture
+# Multimodal Conversational Robotic Arm for Natural Language-Based Object Manipulation — Architecture
+
+**Capstone Project — Team 178**
 
 A modular robotic manipulation framework on Isaac Sim 5.1 + PhysX, with a GR00T N1.7
 policy backend. Every behaviour emerges from perception, planning and memory. There are
