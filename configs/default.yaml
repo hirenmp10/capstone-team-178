@@ -1,0 +1,261 @@
+# Default framework configuration.
+#
+# Every tunable in the framework lives in a file like this one. Modules read
+# config; they do not contain literals. If you find yourself editing a number
+# inside mfw/, it belongs here instead.
+#
+# Loaded and validated by mfw.config.schema.load_config, which rejects unknown
+# keys so a typo fails at startup rather than silently keeping a default.
+
+simulation:
+  headless: true
+  physics_dt: 0.008333333   # 120 Hz; contact-rich grasping is unstable at 60
+  rendering_dt: 0.033333333 # 30 Hz
+  stage_units_in_meters: 1.0
+  renderer: RayTracedLighting
+  settle_steps: 60
+
+physics:
+  # Tuned for stable parallel-jaw grasping under pure PhysX. The defaults let a
+  # rigid object jitter out from between the fingers, which is the failure that
+  # tempts people into fake attachment. High friction + many position iterations
+  # + zero restitution is what makes real contact hold.
+  solver_position_iterations: 32
+  solver_velocity_iterations: 4
+  static_friction: 1.2
+  dynamic_friction: 1.1
+  restitution: 0.0
+  finger_static_friction: 1.6
+  finger_dynamic_friction: 1.5
+  contact_offset: 0.002
+  rest_offset: 0.0005
+  stabilization_threshold: 0.0   # stabilization damps the contact velocities a grasp needs
+  enable_ccd: true
+  sleep_threshold: 0.0           # a carried object must never be put to sleep
+  gpu_dynamics: false
+  max_depenetration_velocity: 1.0
+
+robot:
+  usd_subpath: /Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd
+  prim_path: /World/Franka
+  name: franka
+  base_position: [0.0, 0.0, 0.0]
+  base_quat: [1.0, 0.0, 0.0, 0.0]
+
+  arm_joint_names:
+    - panda_joint1
+    - panda_joint2
+    - panda_joint3
+    - panda_joint4
+    - panda_joint5
+    - panda_joint6
+    - panda_joint7
+  finger_joint_names: [panda_finger_joint1, panda_finger_joint2]
+
+  # THE critical frame definition.
+  #
+  # Isaac Sim's shipped Franka example sets end_effector_prim_path to
+  # "panda_rightfinger" -- one finger, not the grasp point. Planning grasps
+  # against that frame offsets every approach by the finger half-span and makes
+  # picks miss while the logs still report success.
+  #
+  # Here the TCP is derived: panda_hand, translated +103.4 mm along the hand's
+  # local +Z (out of the palm), which lands at the fingertip midpoint.
+  tcp_parent_prim: panda_hand
+  tcp_offset_from_hand: [0.0, 0.0, 0.1034]
+  left_finger_prim: panda_leftfinger
+  right_finger_prim: panda_rightfinger
+
+  home_joint_positions: [0.0, -1.16, 0.0, -2.3, 0.0, 1.6, 0.79]
+  gripper_open_width: 0.08
+  gripper_closed_width: 0.0
+  gripper_force: 40.0      # force control; commanding a closed position ejects the object
+  gripper_speed: 0.05
+  joint_velocity_limit: 1.0
+  joint_position_tolerance: 0.01
+
+# Two cameras, not one. The GR00T oxe_droid embodiment config declares
+# modality_keys ["exterior_image_1_left", "wrist_image_left"], so an exterior
+# view is a hard requirement of the policy contract, not a nicety. The classical
+# backend uses the same pair: the wrist view for servoing, the exterior view for
+# scene-wide observation that the wrist camera occludes during a grasp.
+wrist_camera:
+  name: wrist_camera
+  prim_path: /World/Franka/panda_hand/wrist_camera
+  parent_prim: /World/Franka/panda_hand
+  resolution: [640, 480]
+  focal_length: 1.93
+  horizontal_aperture: 3.896
+  vertical_aperture: 2.453
+  clipping_range: [0.01, 3.0]
+  # Mounted on the hand, looking along the approach axis just past the fingers.
+  position: [0.05, 0.0, 0.02]
+  quat: [0.0, 0.0, 1.0, 0.0]
+  enable_depth: true
+  enable_segmentation: true
+
+exterior_camera:
+  name: exterior_camera
+  prim_path: /World/exterior_camera
+  parent_prim: ""
+  resolution: [640, 480]
+  focal_length: 2.4
+  horizontal_aperture: 3.896
+  vertical_aperture: 2.453
+  clipping_range: [0.05, 6.0]
+  # Front-left three-quarter view. Orientation is derived from look_at rather
+  # than written as a quaternion: a slightly-wrong quaternion aims the camera at
+  # empty floor, and downstream that reads as "the detector found nothing"
+  # rather than "the camera is pointing the wrong way".
+  position: [1.4, -0.8, 1.1]
+  look_at: [0.5, 0.0, 0.45]   # centre of the table top
+  up: [0.0, 0.0, 1.0]
+  enable_depth: true
+  enable_segmentation: true
+
+perception:
+  min_points_per_object: 60
+  min_confidence: 0.25
+  depth_min: 0.05
+  depth_max: 3.0
+  voxel_size: 0.004
+  outlier_std_ratio: 2.0
+  # Instance masks carry a halo of edge pixels whose depth interpolates onto the
+  # background, forming a skirt of points on the table. Raw min/max sizing
+  # inflated a 0.12 m box to 0.22 m here; grasp width comes straight from these
+  # extents, so trimming is load-bearing, not cosmetic.
+  bbox_trim_percentile: 2.0
+  max_points_for_outlier_filter: 4000
+  track_match_distance: 0.06
+  track_max_age_steps: 600
+  ground_plane_z: 0.0
+  ground_clearance: 0.005
+  max_scene_graph_age_s: 1.0
+
+grasp:
+  num_orientation_samples: 16
+  approach_offset: 0.10
+  # Clearance the fingers need beyond the object's own width.
+  finger_width_margin: 0.010
+  # The gripper physically opens to 80 mm (robot.gripper_open_width). 0.075 left
+  # 5 mm of that unused, and with the margin on top the effective ceiling was
+  # 63 mm -- which rejected the 65 mm YCB soup can as "too wide for a gripper
+  # that spans 75 mm". 78 mm keeps 2 mm clear of the hard limit so a commanded
+  # open never saturates, and raises the largest graspable object to 68 mm.
+  max_grasp_width: 0.078
+  min_grasp_width: 0.005
+  top_grasp_bias: 0.6
+  collision_check_samples: 12
+  max_candidates: 64
+  min_score: 0.15
+  lift_height: 0.12
+  place_clearance: 0.02
+
+motion:
+  planner: rrt        # Franka is the only robot with a shipped Lula RRT config
+  max_planning_time_s: 5.0
+  interpolation_dt: 0.02
+  max_joint_velocity: 1.0
+  max_joint_acceleration: 2.0
+  collision_margin: 0.015
+  obstacle_inflation: 0.01
+  max_replan_attempts: 3
+  cartesian_step: 0.005
+  # Deviation from the *path*, not lag behind the time-indexed setpoint. Healthy
+  # motion at 1 rad/s trails its setpoint by ~0.176 rad (measured), but stays on
+  # the path; a deflected arm leaves it. See JointTrajectoryController.
+  tracking_error_limit: 0.15
+  tracking_violation_steps: 12
+  stall_abort_steps: 400
+  ik_max_iterations: 150
+  ik_position_tolerance: 0.002
+  ik_orientation_tolerance: 0.02
+
+memory:
+  max_scene_history: 200
+  max_command_history: 100
+  pronoun_words: [it, that, this, them, the object]
+  reference_recency_weight: 0.7
+  persist_path: logs/memory_state.json
+
+gr00t:
+  # Disabled until a checkpoint and a 3.12 server are actually in place.
+  # The classical backend is fully functional without this.
+  enabled: false
+  host: 127.0.0.1
+  port: 5555          # NVIDIA PolicyServer default
+  embodiment_tag: oxe_droid_relative_eef_relative_joint
+  model_path: nvidia/GR00T-N1.7-3B
+  action_horizon: 40           # fixed by the embodiment config's delta_indices
+  actions_executed_per_chunk: 8
+  observation_history: 16      # serves delta_indices [-15, 0]
+  exterior_camera_key: exterior_image_1_left
+  wrist_camera_key: wrist_image_left
+  image_size: [224, 224]
+  request_timeout_s: 30.0    # a 3B VLA forward pass is not instant
+  max_relative_translation: 0.05
+  max_relative_rotation: 0.35
+  # false -> talk to NVIDIA's real PolicyServer over ZeroMQ/msgpack.
+  # true  -> the deterministic mock (pickle transport), which is what the test
+  #          suite exercises so the integration is verifiable without a GPU.
+  use_mock_server: false
+
+logging:
+  level: INFO
+  log_dir: logs
+  jsonl_filename: events.jsonl
+  console: true
+  log_images: false
+  image_log_every_n: 30
+  flush_every: 1
+
+scene:
+  add_ground_plane: true
+  add_table: true
+
+  # Explicit lighting. Isaac's implicit default light falls off sharply with
+  # distance -- measured here, the wrist camera renders correctly at 30 cm while
+  # the exterior camera at 1.5 m renders black. Perception needs deterministic
+  # illumination, so the lights are declared rather than inherited.
+  dome_light_intensity: 1000.0
+  distant_light_intensity: 1500.0
+  distant_light_angle: [315.0, 0.0, 0.0]
+  table_position: [0.5, 0.0, 0.2]
+  table_scale: [0.7, 1.0, 0.4]
+  # Must comfortably contain the home posture, or the arm starts on the boundary
+  # and the first backward motion breaches it. Measured: home puts the TCP at
+  # [0.230, 0.000, 0.620] -- only 30 mm inside the old x-min of 0.2, and 80 mm
+  # under the old z-max of 0.7.
+  workspace_min: [0.12, -0.55, 0.0]
+  workspace_max: [0.85, 0.55, 0.85]
+
+  # Spawned to create something to manipulate. Perception never reads these
+  # values -- they exist to build the world and to let tests compare against
+  # ground truth. Runtime code that consults this to find an object is a bug.
+  objects:
+    - name: red_block
+      kind: cuboid
+      position: [0.45, -0.15, 0.45]
+      scale: [0.05, 0.05, 0.05]
+      color: [0.85, 0.15, 0.15]
+      mass: 0.15
+      semantic_label: block
+
+    - name: blue_can
+      kind: cylinder
+      position: [0.50, 0.12, 0.46]
+      scale: [0.033, 0.033, 0.12]
+      color: [0.15, 0.30, 0.85]
+      mass: 0.20
+      semantic_label: can
+
+    - name: green_box
+      kind: cuboid
+      position: [0.62, 0.28, 0.44]
+      scale: [0.12, 0.12, 0.08]
+      color: [0.15, 0.65, 0.25]
+      mass: 0.40
+      semantic_label: box
+
+default_executor: classical
+executor_overrides: {}

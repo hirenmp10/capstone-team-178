@@ -1,0 +1,200 @@
+# Test configuration C: another significantly moved object layout
+# block at [0.50, -0.22, 0.45]
+# box at [0.40, 0.18, 0.44]
+# can at [0.55, 0.00, 0.46]
+
+simulation:
+  headless: true
+  physics_dt: 0.008333333
+  rendering_dt: 0.033333333
+  stage_units_in_meters: 1.0
+  renderer: RayTracedLighting
+  settle_steps: 60
+
+physics:
+  solver_position_iterations: 32
+  solver_velocity_iterations: 4
+  static_friction: 1.2
+  dynamic_friction: 1.1
+  restitution: 0.0
+  finger_static_friction: 1.6
+  finger_dynamic_friction: 1.5
+  contact_offset: 0.002
+  rest_offset: 0.0005
+  stabilization_threshold: 0.0
+  enable_ccd: true
+  sleep_threshold: 0.0
+  gpu_dynamics: false
+  max_depenetration_velocity: 1.0
+
+robot:
+  usd_subpath: /Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd
+  prim_path: /World/Franka
+  name: franka
+  base_position: [0.0, 0.0, 0.0]
+  base_quat: [1.0, 0.0, 0.0, 0.0]
+  arm_joint_names:
+    - panda_joint1
+    - panda_joint2
+    - panda_joint3
+    - panda_joint4
+    - panda_joint5
+    - panda_joint6
+    - panda_joint7
+  finger_joint_names: [panda_finger_joint1, panda_finger_joint2]
+  tcp_parent_prim: panda_hand
+  tcp_offset_from_hand: [0.0, 0.0, 0.1034]
+  left_finger_prim: panda_leftfinger
+  right_finger_prim: panda_rightfinger
+  home_joint_positions: [0.0, -1.16, 0.0, -2.3, 0.0, 1.6, 0.79]
+  gripper_open_width: 0.08
+  gripper_closed_width: 0.0
+  gripper_force: 40.0
+  gripper_speed: 0.05
+  joint_velocity_limit: 1.0
+  joint_position_tolerance: 0.01
+
+wrist_camera:
+  name: wrist_camera
+  prim_path: /World/Franka/panda_hand/wrist_camera
+  parent_prim: /World/Franka/panda_hand
+  resolution: [640, 480]
+  focal_length: 1.93
+  horizontal_aperture: 3.896
+  vertical_aperture: 2.453
+  clipping_range: [0.01, 3.0]
+  position: [0.05, 0.0, 0.02]
+  quat: [0.0, 0.0, 1.0, 0.0]
+  enable_depth: true
+  enable_segmentation: true
+
+exterior_camera:
+  name: exterior_camera
+  prim_path: /World/exterior_camera
+  parent_prim: ""
+  resolution: [640, 480]
+  focal_length: 2.4
+  horizontal_aperture: 3.896
+  vertical_aperture: 2.453
+  clipping_range: [0.05, 6.0]
+  position: [1.4, -0.8, 1.1]
+  look_at: [0.5, 0.0, 0.45]
+  up: [0.0, 0.0, 1.0]
+  enable_depth: true
+  enable_segmentation: true
+
+perception:
+  min_points_per_object: 60
+  min_confidence: 0.25
+  depth_min: 0.05
+  depth_max: 3.0
+  voxel_size: 0.004
+  outlier_std_ratio: 2.0
+  bbox_trim_percentile: 2.0
+  max_points_for_outlier_filter: 4000
+  track_match_distance: 0.06
+  track_max_age_steps: 600
+  ground_plane_z: 0.0
+  ground_clearance: 0.005
+  max_scene_graph_age_s: 1.0
+
+grasp:
+  num_orientation_samples: 16
+  approach_offset: 0.10
+  finger_width_margin: 0.010
+  max_grasp_width: 0.078
+  min_grasp_width: 0.005
+  top_grasp_bias: 0.6
+  collision_check_samples: 12
+  max_candidates: 64
+  min_score: 0.15
+  lift_height: 0.12
+  place_clearance: 0.02
+
+motion:
+  planner: rrt
+  max_planning_time_s: 5.0
+  interpolation_dt: 0.02
+  max_joint_velocity: 1.0
+  max_joint_acceleration: 2.0
+  collision_margin: 0.015
+  obstacle_inflation: 0.01
+  max_replan_attempts: 3
+  cartesian_step: 0.005
+  tracking_error_limit: 0.15
+  tracking_violation_steps: 12
+  stall_abort_steps: 400
+  ik_max_iterations: 150
+  ik_position_tolerance: 0.002
+  ik_orientation_tolerance: 0.02
+
+memory:
+  max_scene_history: 200
+  max_command_history: 100
+  pronoun_words: [it, that, this, them, the object]
+  reference_recency_weight: 0.7
+  persist_path: logs/memory_state_c.json
+
+gr00t:
+  enabled: false
+  host: 127.0.0.1
+  port: 5555
+  embodiment_tag: oxe_droid_relative_eef_relative_joint
+  model_path: nvidia/GR00T-N1.7-3B
+  action_horizon: 40
+  actions_executed_per_chunk: 8
+  observation_history: 16
+  exterior_camera_key: exterior_image_1_left
+  wrist_camera_key: wrist_image_left
+  image_size: [224, 224]
+  request_timeout_s: 30.0
+  max_relative_translation: 0.05
+  max_relative_rotation: 0.35
+  use_mock_server: false
+
+logging:
+  level: INFO
+  log_dir: logs
+  jsonl_filename: events_test_c.jsonl
+  console: true
+  log_images: false
+  image_log_every_n: 30
+  flush_every: 1
+
+scene:
+  add_ground_plane: true
+  add_table: true
+  dome_light_intensity: 1000.0
+  distant_light_intensity: 1500.0
+  distant_light_angle: [315.0, 0.0, 0.0]
+  table_position: [0.5, 0.0, 0.2]
+  table_scale: [0.7, 1.0, 0.4]
+  workspace_min: [0.12, -0.55, 0.0]
+  workspace_max: [0.85, 0.55, 0.85]
+  objects:
+    - name: red_block
+      kind: cuboid
+      position: [0.50, -0.22, 0.45]
+      scale: [0.05, 0.05, 0.05]
+      color: [0.85, 0.15, 0.15]
+      mass: 0.15
+      semantic_label: block
+
+    - name: blue_can
+      kind: cylinder
+      position: [0.55, 0.00, 0.46]
+      scale: [0.033, 0.033, 0.12]
+      color: [0.15, 0.30, 0.85]
+      mass: 0.20
+      semantic_label: can
+
+    - name: green_box
+      kind: cuboid
+      position: [0.40, 0.18, 0.44]
+      scale: [0.12, 0.12, 0.08]
+      color: [0.15, 0.65, 0.25]
+      mass: 0.40
+      semantic_label: box
+
+default_executor: classical
+executor_overrides: {}

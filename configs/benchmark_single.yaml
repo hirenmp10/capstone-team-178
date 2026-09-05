@@ -1,0 +1,32 @@
+# Single-object variant of the benchmark scene: a controlled experiment.
+#
+# Separates the two candidate causes of "no path to the pregrasp standoff":
+#
+#   1. Obstacle clutter -- nine perceived objects become nine inflated planner
+#      obstacles, against three in the default scene that works.
+#   2. Inner reach -- the table moved to x=0.45 to fix an outer-reach problem,
+#      and objects now sit at x = 0.26-0.52, some near robot_min_reach_m (0.40)
+#      where the arm must fold sharply and loses orientation freedom.
+#
+# Everything else -- room, lighting, table, physics, the object's own pose --
+# is inherited unchanged, so the ONLY difference from configs/benchmark.yaml is
+# that the other eight objects are absent.
+#
+# The cracker box is the probe because it fails with "no path" and sits close in
+# (x=0.298), so it is subject to both hypotheses at once:
+#
+#   * lifts here  -> clutter is the cause; the other objects were blocking it
+#   * still fails -> clutter is NOT the cause; it is kinematics/inner reach
+#
+# Run:
+#   ..\python.bat manipulation_framework\scripts\benchmark_manipulation.py \
+#       --config manipulation_framework/configs/benchmark_single.yaml
+
+extends: benchmark.yaml
+
+scene:
+  objects:
+    - name: cracker_box
+      kind: asset
+      asset: cracker_box
+      position: [0.298, -0.138, 0.509]

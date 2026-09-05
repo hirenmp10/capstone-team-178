@@ -1,0 +1,33 @@
+# Manipulation Framework (mfw) Dependencies
+# ===============================================
+
+# 1. Core Isaac Sim 5.1 Environment
+# Note: When running inside Isaac Sim 5.1 via python.bat, numpy and standard
+# scientific libraries are bundled. The packages below provide the configuration,
+# IPC, data serialization, and testing infrastructure:
+pyyaml>=6.0
+msgpack>=1.0.5
+msgpack-numpy>=0.4.8
+pyzmq>=25.1.0
+scipy>=1.10.0
+numpy>=1.24.0
+pytest>=7.0.0
+
+# 2. Resident LLM Worker Environment (Optional - Dedicated Python 3.11 venv)
+# Used by scripts/llm_worker.py for real Qwen 2.5-3B-Instruct intent parsing:
+# torch>=2.2.0
+# transformers>=4.40.0
+# accelerate>=0.28.0
+
+# 3. Voice / Speech Worker Environment (Optional - Dedicated Python 3.11 venv)
+# Used by scripts/speech_worker.py for microphone input and Whisper ASR:
+# sounddevice>=0.4.6
+# faster-whisper>=1.0.0
+
+# 4. NVIDIA GR00T N1.7 Server Environment (Optional - Python 3.12 venv)
+# Used by scripts/groot_server.py:
+# torch>=2.4.0
+# huggingface-hub>=0.24.0
+# msgpack>=1.0.5
+# msgpack-numpy>=0.4.8
+# pyzmq>=25.1.0

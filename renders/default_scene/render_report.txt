@@ -1,0 +1,12 @@
+perception confirmed 3 objects
+  block      conf=0.92 pts=  532 pos=[0.46, -0.15, 0.433] size_mm=[58.3, 49.8, 50.5]
+  can        conf=1.00 pts= 1202 pos=[0.515, 0.116, 0.472] size_mm=[69.2, 57.3, 125.4]
+  box        conf=0.88 pts= 1621 pos=[0.657, 0.317, 0.445] size_mm=[146.3, 123.4, 74.4]
+wrist_camera: rgb (480, 640, 3) -> wrist_camera_rgb.png
+wrist_camera: depth 0.038-1.378 m -> wrist_camera_depth.png
+wrist_camera: segmentation -> wrist_camera_segmentation.png  (4 labelled regions)
+exterior_camera: rgb (480, 640, 3) -> exterior_camera_rgb.png
+exterior_camera: depth 0.871-5.990 m -> exterior_camera_depth.png
+exterior_camera: segmentation -> exterior_camera_segmentation.png  (4 labelled regions)
+
+6 image(s) written to manipulation_framework\renders\default_scene

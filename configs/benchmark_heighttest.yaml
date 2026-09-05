@@ -1,0 +1,41 @@
+# Decisive test of the height hypothesis.
+#
+# Everything under 60 mm tall lifts; everything over 80 mm fails, at every
+# position tested. Clutter, inner reach and distance from base have all been
+# ruled out by experiment, so height is the last variable standing.
+#
+# This lays the cracker box on its side. Its upright extents are
+# 164 x 72 x 213 mm; a -90 degree rotation about X swaps Y and Z, so its
+# HEIGHT becomes 72 mm and its footprint 164 x 213 mm. Same object, same
+# position, same scene -- only the height changes, from "fails" territory to
+# just under the "lifts" boundary.
+#
+#   lifts here  -> height is causal. Prime suspect is the ordering of
+#                  planner.exclude_from_collision(target) against
+#                  update_collision_world() in mfw/skills/primitives.py:504 --
+#                  if the world is rebuilt after the exclusion, the target is
+#                  re-enabled as an obstacle and blocks its own descent
+#                  corridor, which penalises tall objects far more than flat.
+#   still fails -> height is NOT causal either, and the cracker box is simply
+#                  a bad object; retest with the soup can (102 mm) laid down.
+#
+# Note the quaternion is applied ON TOP of the asset's own upright_quat (the
+# YCB set is authored -Y up), so this is a rotation relative to standing
+# upright, which is what we want.
+#
+# Run:
+#   ..\python.bat manipulation_framework\scripts\benchmark_manipulation.py \
+#       --config manipulation_framework/configs/benchmark_heighttest.yaml
+
+extends: benchmark.yaml
+
+scene:
+  objects:
+    # -90 degrees about X, in (w, x, y, z). Tips the box onto its face.
+    # Spawn height is half the NEW height (72 mm) above the 0.40 m table top,
+    # plus the usual 2 mm clearance.
+    - name: cracker_box
+      kind: asset
+      asset: cracker_box
+      position: [0.298, -0.138, 0.438]
+      quat: [0.70710678, -0.70710678, 0.0, 0.0]

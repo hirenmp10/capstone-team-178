@@ -1,0 +1,202 @@
+# Office / robotics-lab benchmark scene.
+#
+# Inherits configs/default.yaml and restates only the differences, so the
+# physics, robot, camera and planner tuning stay in exactly one place. Lists
+# replace wholesale on merge, so `scene.objects` here fully supersedes the
+# three primitives in the base config rather than appending to them.
+#
+extends: default.yaml
+#
+# What makes this a benchmark rather than a demo:
+#
+#   * Real scanned meshes with measured masses, not coloured primitives. A
+#     policy that works on a 50 mm cube and fails on a banana has not been
+#     shown to work.
+#   * A spread of difficulty on purpose. A 15 g marker and a 895 g drill impose
+#     opposite demands on grip force; scissors are 14 mm thick where the mug is
+#     a handle-and-cavity problem. Success on a uniform object set does not
+#     generalise, and averaging over one is not a measurement.
+#   * Containers (bowl, bin) that are destinations but not targets, so
+#     "put the marker in the bowl" is expressible.
+#   * A room, furniture and clutter, so the exterior camera sees a scene with
+#     background structure rather than objects floating on grey.
+#
+# Run with:
+#   python scripts/run_assistant.py --config configs/benchmark.yaml --gui
+
+scene:
+  environment: office
+  # The office USD is authored around its own origin; the robot sits at the
+  # world origin, so the room is offset to put the workspace inside it rather
+  # than in a wall.
+  environment_position: [-2.0, -1.5, 0.0]
+
+  add_ground_plane: false   # the office USD brings its own floor
+  add_table: true
+  # Brought in from x=0.55 and shrunk from 0.80x1.20. A Franka on the floor
+  # reaching across a 0.8 m-deep table can only serve a narrow band of it:
+  # with the old table, the reachable strip was ~0.11 m2 against 0.17 m2 of
+  # object footprint, so no valid layout existed. At 0.45 the whole surface
+  # sits inside the arm's shell and all nine objects fit.
+  table_position: [0.45, 0.0, 0.20]
+  table_scale: [0.62, 1.00, 0.40]
+
+  # x-min lowered from 0.12: with the table at 0.45 a legitimate grasp on the
+  # near edge puts the TCP at x=0.118, and the old bound rejected it as a
+  # safety violation. The box is a clamp on stray targets, not a reach model
+  # -- robot_min_reach_m below is what keeps the arm off its own base.
+  workspace_min: [0.05, -0.55, 0.0]
+  workspace_max: [0.85, 0.55, 0.85]
+
+  # The box above clamps policy outputs. It is NOT a reach envelope -- its far
+  # corner is 1.27 m from the base, half a metre past anything a Franka can
+  # touch. The arm's real envelope is the shell below, and object placement is
+  # generated against it: the first benchmark layout had five of nine objects
+  # out of range, every one of which passed the box test and then failed with
+  # "no path to the pregrasp standoff".
+  robot_base: [0.0, 0.0, 0.0]
+  robot_reach_m: 0.78        # nominal Franka reach is 0.855; the last 55 mm is
+                             # a singular, fully-extended pose with no
+                             # orientation freedom, which is useless for grasping
+  robot_min_reach_m: 0.40    # inner dead zone: the arm cannot fold onto its base
+
+  # Lighting for an INDOOR scene.
+  #
+  # The dome and distant lights are switched off, not tuned down. They are a sky
+  # and a sun, and the office USD has a ceiling: measured here, sweeping the dome
+  # from 400 to 9000 moved mean image luminance by 15%, and turning both off made
+  # the scene *brighter* than leaving them on. They were pure render cost.
+  #
+  # Do not assume the room lights itself. The Isaac office ships 121 light prims
+  # with 5 enabled, and none of them fall on this table. Without the local light
+  # below, both camera images come back at ~24/255 mean luminance -- objects are
+  # black silhouettes. Physics and segmentation are unaffected, so every scene
+  # check still passes; what dies is colour naming ("the green box" stops
+  # resolving) and any policy that consumes pixels.
+  dome_light_intensity: 0.0
+  distant_light_intensity: 0.0
+  # 25k rather than 15k. At 15k the frame average was healthy (~145/255) but the
+  # dark objects sat right on the edge: the mug's converged median was [16,4,3],
+  # value 0.063 against the 0.06 cutoff below which dominant_color_name() gives
+  # up on hue and answers "black". A margin of three thousandths is not a margin.
+  workspace_light_intensity: 25000.0
+  workspace_light_height: 1.2
+  workspace_light_radius: 0.25
+
+  furniture:
+    # Behind and beside the robot: visible to the exterior camera, structurally
+    # part of the scene, and outside the arm's reach.
+    - name: shelf
+      asset: storage_cabinet
+      position: [-0.75, 0.60, 0.0]
+      quat: [0.7071, 0.0, 0.0, 0.7071]
+
+    - name: drawers
+      asset: drawer_cabinet
+      position: [0.55, 1.30, 0.0]
+      quat: [1.0, 0.0, 0.0, 0.0]
+
+    - name: chair
+      asset: office_chair
+      position: [1.55, -0.85, 0.0]
+      quat: [0.0, 0.0, 0.0, 1.0]
+      collision: false        # decor, unreachable: not worth planner cycles
+
+    - name: desk_plant
+      asset: succulent
+      position: [-0.55, -0.75, 0.0]
+      collision: false
+
+    # A destination for sorting tasks, on the floor beside the table.
+    - name: sorting_bin
+      asset: storage_bin
+      position: [0.55, -0.95, 0.0]
+
+  # Eight objects spanning the difficulty range. Positions are authored rather
+  # than sampled so the default run is reproducible; turn on randomization
+  # below to vary them.
+  objects:
+    # --- easy: convex, well-proportioned, forgiving ---
+    - name: soup_can
+      kind: asset
+      asset: tomato_soup_can
+      position: [0.262, -0.347, 0.453]
+
+    - name: mustard_bottle
+      kind: asset
+      asset: mustard_bottle
+      position: [0.260, 0.350, 0.498]
+
+    - name: cracker_box
+      kind: asset
+      asset: cracker_box
+      position: [0.298, -0.138, 0.509]
+
+    - name: foam_brick
+      kind: asset
+      asset: foam_brick
+      position: [0.522, -0.106, 0.428]
+
+    # --- medium: cavities and handles ---
+    - name: mug
+      kind: asset
+      asset: mug
+      position: [0.279, 0.184, 0.443]
+
+    - name: banana
+      kind: asset
+      asset: banana
+      position: [0.467, 0.320, 0.422]
+
+    # --- hard: extremes of mass and thickness ---
+    # Smallest object in the set, and the one at the edge of what the sensors
+    # can resolve: 19 mm across, it yielded 59 points from the exterior camera
+    # alone -- one under the 60-point detection minimum -- when it sat out at
+    # [0.36, 0.34]. Moved into the wrist camera's coverage so it is detectable.
+    # The threshold is left alone on purpose: it exists to reject segmentation
+    # noise, and lowering it to rescue one object would admit noise everywhere.
+    - name: marker
+      kind: asset
+      asset: large_marker
+      position: [0.380, -0.027, 0.463]
+
+    - name: drill
+      kind: asset
+      asset: power_drill
+      position: [0.486, 0.077, 0.496]
+
+    # --- destination, not a target ---
+    - name: bowl
+      kind: asset
+      asset: bowl
+      position: [0.467, -0.315, 0.430]
+
+  # Off by default: a debugging run must be reproducible, and a scene that
+  # quietly jitters makes every regression a fresh investigation. Enable it for
+  # training data or robustness measurement, and record the seed with the
+  # results -- a randomised run that cannot be replayed cannot be debugged.
+  randomization:
+    enabled: false
+    seed: 0
+    randomize_positions: true
+    randomize_yaw: true
+    randomize_lighting: false
+    randomize_object_set: false
+    position_jitter_m: 0.06
+    min_object_separation_m: 0.03
+
+# The exterior camera has to see a wider scene now that there is furniture and
+# a room behind the table, and it has to see the floor bin as well as the
+# table top.
+exterior_camera:
+  position: [1.40, -0.90, 1.20]
+  look_at: [0.45, 0.0, 0.45]
+  clipping_range: [0.05, 12.0]
+
+# Planner budget: left at the inherited defaults on purpose.
+#
+# Raising max_planning_time_s 5 -> 15 and max_replan_attempts 3 -> 6 was tried.
+# It found ZERO additional paths and doubled the runtime (the mustard bottle went
+# from 16.7 s to 32.6 s). RRT here is not returning poor paths that more search
+# would improve -- it is returning none at all, which is a different problem and
+# is not solved by more time.

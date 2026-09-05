@@ -1,0 +1,308 @@
+# Asset catalogue for the manipulation benchmark environment.
+#
+# Every object the robot can encounter is declared here, never in code. Adding an
+# object is a YAML edit; the scene builder, domain randomiser and validation
+# harness all read this file.
+#
+# SOURCING AND SUBSTITUTIONS
+# --------------------------
+# All manipulable objects come from the YCB benchmark set shipped with Isaac Sim
+# (/Isaac/Props/YCB). YCB is the standard object set for manipulation research --
+# it is what Open X-Embodiment, BEHAVIOR and most grasping papers evaluate on, so
+# results here are comparable with published work.
+#
+# Branded items in the original request (Bisleri, Coca-Cola, Pepsi, Red Bull) are
+# NOT fabricated. Creating fake branded textures would be trademark infringement
+# and the assets are not available under a usable licence. Each is substituted
+# with a real scanned object of similar geometry, and the substitution is recorded
+# in `substitutes:` so the mapping is explicit rather than silently assumed.
+#
+# MASSES
+# ------
+# `mass_kg` values are the YCB benchmark's published object masses where known.
+# Four objects (cracker_box, sugar_box, tomato_soup_can, mustard_bottle) also ship
+# an *_Physics variant with mass and colliders already authored; for those,
+# `has_physics: true` and the USD's own values are trusted over ours.
+#
+# DIMENSIONS
+# ----------
+# `size_m` is the mesh's own axis-aligned bounding extent, MEASURED from the
+# actual USD (see scripts/measure_assets.py), not copied from the YCB spec. The
+# two differ, and where they differ the measurement wins:
+#
+#   * The published figure is often a nominal cross-section. The YCB banana is
+#     listed at 36 mm wide; the scanned mesh's bounding box is 74 mm, because a
+#     banana is curved and its box has to contain the curve.
+#   * The Isaac assets are not always the same variant as the published entry --
+#     the large clamp measures 165 x 122 mm against a published 165 x 213 mm.
+#
+# Extents are given in the UPRIGHT frame, i.e. after `upright_quat` is applied.
+# The YCB assets are authored with up along -Y and Isaac's world is Z-up, so the
+# raw mesh bounds have height on Y. Recording raw bounds here would mean every
+# consumer had to remember to swap axes, and the ones that forgot would be
+# silently wrong about which dimension the gripper has to span.
+
+# ----------------------------------------------------------------------
+# Manipulable objects
+# ----------------------------------------------------------------------
+objects:
+  # --- cans (substitutes for branded soda cans) ---
+  - name: master_chef_can
+    usd: /Isaac/Props/YCB/Axis_Aligned/002_master_chef_can.usd
+    category: can
+    semantic: can
+    mass_kg: 0.414
+    size_m: [0.102, 0.102, 0.140]
+    graspable: true
+    grasp_axis: vertical      # tall cylinder: grip across the diameter
+    substitutes: "generic soda can (Coca-Cola / Pepsi / Red Bull not licensable)"
+    notes: >
+      graspable in principle, but its 102 mm diameter exceeds the Franka's 80 mm
+      finger span, so registry.graspable(0.08) correctly excludes it. Kept in the
+      catalogue as a negative case and for wider-gripper embodiments -- the
+      `graspable` flag says "is this a manipulation target at all", while fitting
+      the hand is an embodiment question answered by fits_gripper().
+
+  - name: tomato_soup_can
+    usd: /Isaac/Props/YCB/Axis_Aligned_Physics/005_tomato_soup_can.usd
+    category: can
+    semantic: can
+    mass_kg: 0.349
+    size_m: [0.068, 0.068, 0.102]
+    graspable: true
+    grasp_axis: vertical
+    has_physics: true
+
+  - name: tuna_fish_can
+    usd: /Isaac/Props/YCB/Axis_Aligned/007_tuna_fish_can.usd
+    category: can
+    semantic: can
+    mass_kg: 0.171
+    size_m: [0.086, 0.086, 0.034]
+    graspable: true
+    grasp_axis: vertical
+
+  - name: potted_meat_can
+    usd: /Isaac/Props/YCB/Axis_Aligned/010_potted_meat_can.usd
+    category: can
+    semantic: can
+    mass_kg: 0.370
+    size_m: [0.102, 0.058, 0.084]
+    graspable: true
+
+  # --- bottles (substitutes for branded water bottles) ---
+  - name: mustard_bottle
+    usd: /Isaac/Props/YCB/Axis_Aligned_Physics/006_mustard_bottle.usd
+    category: bottle
+    semantic: bottle
+    mass_kg: 0.603
+    size_m: [0.096, 0.058, 0.191]
+    graspable: true
+    grasp_axis: vertical
+    has_physics: true
+    substitutes: "500 ml water bottle (Bisleri not licensable); similar height and grip diameter"
+
+  - name: bleach_cleanser
+    usd: /Isaac/Props/YCB/Axis_Aligned/021_bleach_cleanser.usd
+    category: bottle
+    semantic: bottle
+    mass_kg: 1.131
+    size_m: [0.102, 0.068, 0.251]
+    graspable: true
+    grasp_axis: vertical
+    substitutes: "1 L bottle; heavy, useful for testing grasp force limits"
+
+  # --- boxes (substitute for cardboard box / parcel / tissue box) ---
+  - name: cracker_box
+    usd: /Isaac/Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd
+    category: box
+    semantic: box
+    mass_kg: 0.411
+    size_m: [0.164, 0.072, 0.213]
+    graspable: true
+    has_physics: true
+    substitutes: "cardboard box / tissue box"
+
+  - name: sugar_box
+    usd: /Isaac/Props/YCB/Axis_Aligned_Physics/004_sugar_box.usd
+    category: box
+    semantic: box
+    mass_kg: 0.514
+    size_m: [0.093, 0.045, 0.176]
+    graspable: true
+    has_physics: true
+
+  - name: pudding_box
+    usd: /Isaac/Props/YCB/Axis_Aligned/008_pudding_box.usd
+    category: box
+    semantic: box
+    mass_kg: 0.187
+    size_m: [0.114, 0.038, 0.090]
+    graspable: true
+
+  - name: gelatin_box
+    usd: /Isaac/Props/YCB/Axis_Aligned/009_gelatin_box.usd
+    category: box
+    semantic: box
+    mass_kg: 0.097
+    size_m: [0.089, 0.030, 0.073]
+    graspable: true
+
+  # --- kitchenware ---
+  - name: mug
+    usd: /Isaac/Props/YCB/Axis_Aligned/025_mug.usd
+    category: mug
+    semantic: mug
+    mass_kg: 0.118
+    size_m: [0.117, 0.093, 0.081]
+    graspable: true
+    substitutes: "ceramic coffee mug"
+
+  - name: bowl
+    usd: /Isaac/Props/YCB/Axis_Aligned/024_bowl.usd
+    category: bowl
+    semantic: bowl
+    mass_kg: 0.147
+    size_m: [0.161, 0.162, 0.055]
+    graspable: false          # 159 mm rim exceeds the 80 mm gripper span
+    container: true           # valid destination for "put it in the bowl"
+
+  - name: pitcher
+    usd: /Isaac/Props/YCB/Axis_Aligned/019_pitcher_base.usd
+    category: pitcher
+    semantic: pitcher
+    mass_kg: 0.178
+    size_m: [0.189, 0.133, 0.242]
+    graspable: false          # too wide across; handle grasping is future work
+    container: true
+
+  # --- food ---
+  - name: banana
+    usd: /Isaac/Props/YCB/Axis_Aligned/011_banana.usd
+    category: food
+    semantic: banana
+    mass_kg: 0.066
+    size_m: [0.197, 0.074, 0.039]
+    graspable: true
+    notes: >
+      Irregular and curved -- the hardest geometry here for grasp synthesis, and
+      the object that exposed a bug in the scene validator rather than in itself.
+      It spawns level, rolls about ten degrees about its long axis to find a
+      stable resting angle, and then holds that pose exactly. Its collider is
+      fine: the convex-decomposition default is correct here, and both an SDF
+      collider and a shrink-wrapped decomposition were tried and made no
+      difference, because the collider was never the problem.
+
+  # --- tools and small objects ---
+  - name: large_marker
+    usd: /Isaac/Props/YCB/Axis_Aligned/040_large_marker.usd
+    category: tool
+    semantic: marker
+    mass_kg: 0.015
+    size_m: [0.019, 0.019, 0.121]
+    graspable: true
+
+  - name: scissors
+    usd: /Isaac/Props/YCB/Axis_Aligned/037_scissors.usd
+    category: tool
+    semantic: scissors
+    mass_kg: 0.082
+    size_m: [0.091, 0.017, 0.197]
+    graspable: true
+    collision_approximation: sdf
+    notes: >
+      Thin and flat -- tests whether the fingers can close on a low profile.
+      A convex decomposition welds the two blades into one lump at 14 mm
+      thickness, so this asset needs an SDF collider to keep them separate.
+
+  - name: power_drill
+    usd: /Isaac/Props/YCB/Axis_Aligned/035_power_drill.usd
+    category: tool
+    semantic: drill
+    mass_kg: 0.895
+    size_m: [0.184, 0.057, 0.187]
+    graspable: true
+    notes: "heaviest graspable item; tests grip force under load"
+
+  - name: large_clamp
+    usd: /Isaac/Props/YCB/Axis_Aligned/051_large_clamp.usd
+    category: tool
+    semantic: clamp
+    mass_kg: 0.125
+    size_m: [0.165, 0.036, 0.122]
+    graspable: true
+
+  # --- blocks ---
+  - name: wood_block
+    usd: /Isaac/Props/YCB/Axis_Aligned/036_wood_block.usd
+    category: block
+    semantic: block
+    mass_kg: 0.729
+    size_m: [0.090, 0.091, 0.206]
+    graspable: true
+
+  - name: foam_brick
+    usd: /Isaac/Props/YCB/Axis_Aligned/061_foam_brick.usd
+    category: block
+    semantic: brick
+    mass_kg: 0.028
+    size_m: [0.078, 0.053, 0.051]
+    graspable: true
+    notes: "very light -- a grasp that works here may still slip on heavy items"
+
+# ----------------------------------------------------------------------
+# Furniture and fixtures. Static: they define the workspace, not the task.
+# ----------------------------------------------------------------------
+furniture:
+  - name: work_table
+    usd: /NVIDIA/Assets/ArchVis/Commercial/Tables/OakTableLarge.usd
+    semantic: table
+    role: primary_surface
+
+  - name: side_table
+    usd: /NVIDIA/Assets/ArchVis/Commercial/Tables/OakTableSmall.usd
+    semantic: table
+    role: secondary_surface
+
+  - name: office_chair
+    usd: /NVIDIA/Assets/ArchVis/Commercial/Seating/Reidmeyer.usd
+    semantic: chair
+    role: decor
+
+  - name: storage_cabinet
+    usd: /NVIDIA/Assets/ArchVis/Commercial/Storage/WhiteHome01.usd
+    semantic: cabinet
+    role: storage
+
+  - name: drawer_cabinet
+    usd: /Isaac/Props/Sektion_Cabinet/sektion_cabinet_instanceable.usd
+    semantic: cabinet
+    role: storage
+    notes: "has articulated drawers -- the asset for a future 'open the drawer' skill"
+
+  - name: storage_bin
+    usd: /Isaac/Props/KLT_Bin/small_KLT.usd
+    semantic: bin
+    role: container
+    notes: "valid destination for sorting tasks"
+
+  - name: plant
+    usd: /NVIDIA/Assets/ArchVis/Residential/Plants/Plant_01.usd
+    semantic: plant
+    role: decor
+
+  - name: succulent
+    usd: /NVIDIA/Assets/ArchVis/Residential/Plants/Plant_Succulent_01.usd
+    semantic: plant
+    role: decor
+
+# ----------------------------------------------------------------------
+# Environments
+# ----------------------------------------------------------------------
+environments:
+  office:
+    usd: /Isaac/Environments/Office/office.usd
+    notes: "full office interior: walls, floor, ceiling, windows, PBR materials"
+  simple_room:
+    usd: /Isaac/Environments/Simple_Room/simple_room.usd
+    notes: "smaller room; faster to load, useful for iteration"

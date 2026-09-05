@@ -1,0 +1,28 @@
+# Controlled test of the inner-reach hypothesis.
+#
+# The two objects that lift in the benchmark scene (foam_brick x=0.522,
+# banana x=0.467) are the two FURTHEST from the robot base. Everything that
+# fails sits closer in, at x = 0.26-0.30, near robot_min_reach_m (0.40) where
+# the arm must fold sharply and loses orientation freedom.
+#
+# This moves the cracker box -- a reliable failure at x=0.298 -- out to x=0.52,
+# where the foam brick works. Nothing else changes: same object, same scene,
+# same everything.
+#
+#   lifts here   -> inner reach confirmed; the fix is to re-place the objects
+#                   into the outer band, and the table move to x=0.45 (my own
+#                   earlier fix for OUTER reach) overcorrected
+#   still fails  -> reach is not the cause either, and the object itself is
+#
+# Run:
+#   ..\python.bat manipulation_framework\scripts\benchmark_manipulation.py \
+#       --config manipulation_framework/configs/benchmark_reachtest.yaml
+
+extends: benchmark.yaml
+
+scene:
+  objects:
+    - name: cracker_box
+      kind: asset
+      asset: cracker_box
+      position: [0.520, -0.100, 0.509]

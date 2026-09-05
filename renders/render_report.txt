@@ -1,0 +1,18 @@
+perception confirmed 9 objects
+  can        conf=0.91 pts=  608 pos=[0.387, -0.258, 0.454] size_mm=[67.0, 65.0, 95.4]
+  brick      conf=0.98 pts=  570 pos=[0.403, 0.019, 0.43] size_mm=[90.5, 49.4, 53.1]
+  bottle     conf=0.97 pts=  864 pos=[0.458, 0.194, 0.498] size_mm=[94.8, 31.9, 173.5]
+  marker     conf=0.47 pts=  127 pos=[0.489, 0.273, 0.464] size_mm=[19.4, 6.5, 111.9]
+  bowl       conf=0.90 pts= 1390 pos=[0.584, -0.457, 0.431] size_mm=[171.3, 145.7, 53.1]
+  mug        conf=0.97 pts= 1295 pos=[0.622, -0.1, 0.463] size_mm=[95.8, 81.4, 80.4]
+  banana     conf=1.00 pts=  773 pos=[0.693, 0.057, 0.444] size_mm=[195.8, 59.7, 37.6]
+  drill      conf=0.88 pts= 1407 pos=[0.716, -0.325, 0.499] size_mm=[176.7, 42.7, 176.2]
+  box        conf=0.92 pts= 2571 pos=[0.725, 0.312, 0.513] size_mm=[187.1, 58.7, 202.3]
+wrist_camera: rgb (480, 640, 3) -> wrist_camera_rgb.png
+wrist_camera: depth 0.038-1.378 m -> wrist_camera_depth.png
+wrist_camera: segmentation -> wrist_camera_segmentation.png  (9 labelled regions)
+exterior_camera: rgb (480, 640, 3) -> exterior_camera_rgb.png
+exterior_camera: depth 0.515-4.970 m -> exterior_camera_depth.png
+exterior_camera: segmentation -> exterior_camera_segmentation.png  (15 labelled regions)
+
+6 image(s) written to C:\isaac-sim-standalone-5.1.0-windows-x86_64\manipulation_framework\renders
