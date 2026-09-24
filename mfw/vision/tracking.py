@@ -22,8 +22,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mfw.core.types import ObjectHypothesis
+from mfw.vision.geometry import is_chromatic_color
 
-__all__ = ["Track", "ObjectTracker"]
+__all__ = ["Track", "ObjectTracker", "COLOR_CHANGE_CONFIRMATIONS"]
+
+#: Consecutive agreeing readings needed before an object's reported colour
+#: changes to an *achromatic* name (black/grey/white). A change to a hue is
+#: taken at once; see :meth:`ObjectTracker._update_color`.
+COLOR_CHANGE_CONFIRMATIONS = 3
 
 
 @dataclass
@@ -36,6 +42,18 @@ class Track:
     misses: int = 0
     first_seen_step: int = 0
     position_history: list[NDArray[np.float64]] = field(default_factory=list)
+    color: str = ""
+    """The colour this track reports. Held across frames, unlike the pose:
+    an object does not change colour, but a single rendered frame can lose it."""
+    last_observed_color: str = ""
+    """What the most recent frame measured, before the hold was applied."""
+    pending_color: str = ""
+    pending_count: int = 0
+
+    @property
+    def color_settled(self) -> bool:
+        """Whether the reported colour is known and the latest frame agreed with it."""
+        return bool(self.color) and self.last_observed_color == self.color
 
     @property
     def is_confirmed(self) -> bool:
@@ -82,6 +100,15 @@ class ObjectTracker:
             if track.is_confirmed
         }
 
+    def colors_settled(self) -> bool:
+        """Whether every confirmed track reports a colour its latest frame agreed with.
+
+        True for an empty scene: there is nothing left to wait for.
+        """
+        return all(
+            track.color_settled for track in self._tracks.values() if track.is_confirmed
+        )
+
     def update(
         self, detections: list[ObjectHypothesis], step_index: int
     ) -> dict[str, ObjectHypothesis]:
@@ -103,6 +130,7 @@ class ObjectTracker:
             # would arrive at a stale pose.
             detection.track_id = track_id
             track.hypothesis = detection
+            self._update_color(track, detection)
             track.hits += 1
             track.misses = 0
             track.position_history.append(detection.pose.position.copy())
@@ -170,12 +198,68 @@ class ObjectTracker:
     def _spawn_track(self, detection: ObjectHypothesis, step_index: int) -> None:
         track_id = f"{self._id_prefix}_{next(self._counter):03d}"
         detection.track_id = track_id
+        observed = _observed_color(detection)
         self._tracks[track_id] = Track(
             track_id=track_id,
             hypothesis=detection,
             first_seen_step=step_index,
             position_history=[detection.pose.position.copy()],
+            color=observed,
+            last_observed_color=observed,
         )
+
+    @staticmethod
+    def _update_color(track: Track, detection: ObjectHypothesis) -> None:
+        """Decide the colour a re-observed track reports, and write it back.
+
+        Pose is replaced every frame (see :meth:`update`); colour is not,
+        because the two fail differently. A stale pose sends the arm to the
+        wrong place, so it must follow the latest frame. A colour is a fixed
+        property of the object, and the renderer loses it in exactly one
+        direction: an unwritten RGB buffer, a material still compiling, an
+        unlit frame or a shadow all drive pixels toward black/grey and never
+        toward a saturated hue. Replacing blindly is how a run that had just
+        reported "red block, blue can, green box" answered the operator's first
+        "what do you see" with "black block, black can, black box".
+
+        So:
+
+        * an empty reading ("no colour information") never overwrites a known
+          colour;
+        * a hue replaces whatever was there immediately -- it cannot be an
+          artefact of darkness, and it corrects an early wrong "black";
+        * an achromatic name replaces a different reported colour only after
+          :data:`COLOR_CHANGE_CONFIRMATIONS` consecutive frames agree, so a
+          genuinely black object still ends up "black" (it never produces a hue,
+          so it is black from its first lit frame) while one dark frame cannot
+          repaint a red block.
+
+        Only the ``"color"`` attribute is touched, and only for detections that
+        carry one; ``"color_observed"`` records the raw reading when the hold
+        overrides it, so the event log still shows what the frame measured.
+        """
+        if "color" not in detection.attributes:
+            return
+        observed = _observed_color(detection)
+        track.last_observed_color = observed
+
+        if not observed or observed == track.color:
+            track.pending_color, track.pending_count = "", 0
+        elif not track.color or is_chromatic_color(observed):
+            track.color = observed
+            track.pending_color, track.pending_count = "", 0
+        else:
+            if observed == track.pending_color:
+                track.pending_count += 1
+            else:
+                track.pending_color, track.pending_count = observed, 1
+            if track.pending_count >= COLOR_CHANGE_CONFIRMATIONS:
+                track.color = observed
+                track.pending_color, track.pending_count = "", 0
+
+        if observed != track.color:
+            detection.attributes["color_observed"] = observed
+        detection.attributes["color"] = track.color
 
     def _associate(
         self, detections: list[ObjectHypothesis]
@@ -201,6 +285,10 @@ class ObjectTracker:
         matches = {track_ids[i]: j for i, j in assignment.items()}
         unmatched = [j for j in range(len(detections)) if j not in set(assignment.values())]
         return matches, unmatched
+
+
+def _observed_color(detection: ObjectHypothesis) -> str:
+    return str(detection.attributes.get("color", "") or "").strip().lower()
 
 
 def _labels_match(

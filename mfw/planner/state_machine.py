@@ -5,8 +5,19 @@ Pure stdlib. This module must never import Isaac Sim.
     IDLE -> WAIT_FOR_COMMAND -> PARSE -> OBSERVE -> PLAN -> EXECUTE
          -> VERIFY -> COMPLETE -> WAIT_FOR_COMMAND
 
-with recovery ``FAILED -> REPLAN -> OBSERVE`` and a ``CLARIFY`` branch for
-ambiguous references.
+with recovery ``FAILED -> REPLAN -> OBSERVE``, a ``CLARIFY`` branch for
+ambiguous references (from PARSE or EXECUTE, straight back to waiting: the
+question goes to the operator and the answer arrives as a new command), and
+``EXECUTE -> ABORTED`` for a safety violation.
+
+Recovery policy (audit 2026-09-24, previously BROKEN -- an ambiguous "can" was
+retried three times and never asked about, a missing teapot was retried three
+times):
+
+    AmbiguousReference -> CLARIFY, no retry, options offered
+    ObjectNotFound     -> FAILED, no retry (the object is not there)
+    SafetyViolation    -> ABORTED, never retried
+    PlanningError / other PerceptionError -> REPLAN, up to the configured limit
 
 **Atomicity is a property of the graph.** ``COMPLETE`` has exactly one outgoing
 edge, back to ``WAIT_FOR_COMMAND``. There is no transition from the completion of
@@ -31,7 +42,7 @@ from mfw.core.errors import (
     PlanningError,
     SafetyViolation,
 )
-from mfw.core.types import SkillResult, SkillStatus
+from mfw.core.types import SkillStatus
 from mfw.utils.logging import get_logger
 
 __all__ = ["State", "StateMachine", "Transition"]
@@ -63,7 +74,9 @@ TRANSITIONS: dict[State, tuple[State, ...]] = {
     State.CLARIFY: (State.WAIT_FOR_COMMAND,),
     State.OBSERVE: (State.PLAN, State.FAILED),
     State.PLAN: (State.EXECUTE, State.FAILED),
-    State.EXECUTE: (State.VERIFY, State.FAILED, State.ABORTED),
+    # EXECUTE -> CLARIFY: the skill is where a referent is grounded against a
+    # fresh observation, so that is where "which one?" is discovered.
+    State.EXECUTE: (State.VERIFY, State.FAILED, State.ABORTED, State.CLARIFY),
     State.VERIFY: (State.COMPLETE, State.FAILED),
     State.COMPLETE: (State.WAIT_FOR_COMMAND,),
     State.FAILED: (State.REPLAN, State.WAIT_FOR_COMMAND),

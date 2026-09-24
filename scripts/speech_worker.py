@@ -27,6 +27,14 @@ Launch with a system Python, not ``python.bat``:
     python scripts/speech_worker.py --asr canary --device cuda
     python scripts/speech_worker.py --asr parakeet --serve --host 0.0.0.0
     python scripts/speech_worker.py --stdin            # typed lines, no audio
+    python scripts/speech_worker.py --asr whisper --model small.en --wav cmd.wav
+
+``--wav`` is the offline audio path: it transcribes one or more WAV files with
+the chosen engine and exits, so the ASR half of the voice pipeline can be run
+end to end without a microphone (``scripts/tts_to_wav.py`` synthesises a command
+WAV with Windows SAPI). Before it existed the only microphone-free mode was
+``--stdin``, which echoes typed text and never touches an ASR engine -- so no
+run, and no test, had ever pushed audio through a model.
 """
 
 from __future__ import annotations
@@ -391,6 +399,89 @@ def build_engine(
 # ----------------------------------------------------------------------
 # capture loops
 # ----------------------------------------------------------------------
+
+
+def load_wav(path: str | Path):
+    """Read a PCM WAV file as float32 mono at :data:`SAMPLE_RATE`.
+
+    Every engine here takes 16 kHz mono float32 in [-1, 1]; a SAPI or phone
+    recording is typically 22.05/44.1 kHz and may be stereo. Channels are
+    averaged and the signal is resampled by linear interpolation -- adequate for
+    speech (the energy of interest sits well below the 8 kHz Nyquist limit) and
+    free of any dependency beyond NumPy, so the loader is testable without an
+    ASR stack. 8-bit (unsigned), 16-, 24- and 32-bit PCM are accepted;
+    compressed WAV variants (float, ADPCM) are rejected by :mod:`wave` itself.
+    """
+    import numpy as np
+
+    path = Path(path)
+    try:
+        with wave.open(str(path), "rb") as handle:
+            channels = handle.getnchannels()
+            width = handle.getsampwidth()
+            rate = handle.getframerate()
+            raw = handle.readframes(handle.getnframes())
+    except (wave.Error, EOFError) as exc:
+        raise ValueError(f"{path} is not a PCM WAV file: {exc}") from exc
+
+    if width == 1:
+        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif width == 2:
+        data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif width == 3:
+        triples = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        values = triples[:, 0] | (triples[:, 1] << 8) | (triples[:, 2] << 16)
+        values = np.where(values >= 1 << 23, values - (1 << 24), values)
+        data = values.astype(np.float32) / float(1 << 23)
+    elif width == 4:
+        data = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"{path}: unsupported sample width {width} bytes")
+
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1)
+
+    if rate != SAMPLE_RATE and data.size:
+        duration = data.size / rate
+        count = max(1, int(round(duration * SAMPLE_RATE)))
+        source_t = np.arange(data.size) / rate
+        target_t = np.arange(count) / SAMPLE_RATE
+        data = np.interp(target_t, source_t, data)
+
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def run_wav_mode(
+    paths: list[str],
+    asr: str,
+    model_name: str,
+    device: str,
+    model_dir: str | None = None,
+) -> int:
+    """Transcribe WAV files through the real engine and emit protocol lines.
+
+    Emits ``{"event": "file", ...}`` before each file and the usual transcript
+    lines after it, so the output can be fed straight to anything that reads the
+    live protocol. Returns 2 if a file is missing or unreadable (checked before
+    the model loads, because loading Canary costs ~35 s).
+    """
+    audio = []
+    for name in paths:
+        try:
+            audio.append((name, load_wav(name)))
+        except (OSError, ValueError) as exc:
+            log(f"cannot read {name}: {exc}")
+            return 2
+
+    engine = build_engine(asr, model_name, device, model_dir)
+    for name, samples in audio:
+        emit_event("file", path=str(name), seconds=round(len(samples) / SAMPLE_RATE, 2))
+        results = engine.transcribe(samples)
+        if not results:
+            emit_event("empty")
+        for text, confidence in results:
+            emit(text, confidence)
+    return 0
 
 
 def run_stdin_mode() -> int:
@@ -773,6 +864,66 @@ def _capture_loop(sd, np, engine, chunk_seconds: float, silence_threshold: float
             emit_event("error", message=f"{type(exc).__name__}: {exc}")
 
 
+#: Exit status when the serve port is already taken (distinct from 2, which
+#: means a missing dependency or bad input).
+EXIT_PORT_IN_USE = 3
+
+
+class PortInUseError(OSError):
+    """The ``--serve`` port is held by another process."""
+
+
+def port_in_use_message(host: str, port: int, exc: BaseException) -> str:
+    """Why a second speech server must not start, and what to do instead."""
+    return (
+        f"speech server NOT started: {host}:{port} is already in use ({exc}).\n"
+        "Another speech server is probably running already -- possibly a duplicate\n"
+        "spawned by a venv launcher stub, which previously loaded a SECOND Canary\n"
+        "(~5.5 GB more VRAM) and took the microphone away from the process that\n"
+        "was actually serving transcripts.\n"
+        "  - to use the running server: run_assistant.py --voice --voice-server "
+        f"{host}:{port}\n"
+        f"  - to find the owner:        netstat -ano | findstr :{port}   (Windows)\n"
+        f"                              ss -ltnp | grep :{port}           (Linux)\n"
+        "  - or pick another port with --port N.\n"
+        "Nothing was loaded and the microphone was not opened."
+    )
+
+
+def bind_server_socket(host: str, port: int):
+    """Bind (but do not yet listen on) the ``--serve`` port, exclusively.
+
+    Called BEFORE the model loads and before any microphone handling, so a
+    duplicate process fails in milliseconds instead of loading a second model
+    and opening the same microphone. Listening starts only once the model is
+    resident (:func:`serve_forever`): a bound, non-listening port refuses
+    connections, so a client's "is it up?" probe keeps meaning "ready".
+
+    Windows: ``SO_REUSEADDR`` there lets a second socket bind a port another
+    socket already holds -- exactly what must not happen -- so the socket asks
+    for ``SO_EXCLUSIVEADDRUSE`` instead. POSIX: ``SO_REUSEADDR`` only permits
+    re-binding over TIME_WAIT leftovers of a previous run; a live listener
+    still refuses the bind (and ``listen`` refuses the rare both-bound race).
+
+    Raises :class:`PortInUseError` with an operator-facing message.
+    """
+    import socket
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if sys.platform == "win32":
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                server.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        else:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+    except OSError as exc:
+        server.close()
+        raise PortInUseError(port_in_use_message(host, port, exc)) from exc
+    return server
+
+
 def serve_forever(
     host: str,
     port: int,
@@ -782,6 +933,7 @@ def serve_forever(
     chunk_seconds: float,
     silence_threshold: float,
     model_dir: str | None = None,
+    server_socket=None,
 ) -> int:
     """Load the model once and serve transcripts to clients over TCP.
 
@@ -794,26 +946,42 @@ def serve_forever(
     So: load once here, then every assistant launch attaches in milliseconds. The
     microphone is a single exclusive device, so one client is served at a time;
     when it disconnects the loop returns to waiting with the model still warm.
+
+    ``server_socket`` is the port :func:`main` already bound (see
+    :func:`bind_server_socket`); when omitted it is bound here, still before
+    the model loads.
     """
     global _SINK
 
-    import socket
+    server = server_socket
+    if server is None:
+        try:
+            server = bind_server_socket(host, port)
+        except PortInUseError as exc:
+            log(str(exc))
+            return EXIT_PORT_IN_USE
 
     try:
         import numpy as np
         import sounddevice as sd
     except ImportError as exc:
+        server.close()
         log(f"audio dependencies missing: {exc}")
         return 2
 
-    log(f"loading {asr} model (one time)...")
-    engine = build_engine(asr, model_name, device, model_dir)
-    log("model resident - clients now attach instantly")
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(1)
+    try:
+        log(f"port {host}:{port} reserved; loading {asr} model (one time)...")
+        engine = build_engine(asr, model_name, device, model_dir)
+        log("model resident - clients now attach instantly")
+        try:
+            server.listen(1)
+        except OSError as exc:
+            server.close()
+            log(port_in_use_message(host, port, exc))
+            return EXIT_PORT_IN_USE
+    except BaseException:
+        server.close()
+        raise
     log(f"speech server listening on {host}:{port} (Ctrl+C to stop)")
 
     try:
@@ -877,6 +1045,14 @@ def main(argv: list[str] | None = None) -> int:
         help="read typed lines instead of audio (pipeline test mode)",
     )
     parser.add_argument(
+        "--wav",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="transcribe this WAV file (repeatable) with --asr and exit; no microphone "
+        "needed. Any PCM rate/channel count is converted to 16 kHz mono",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="stay resident and serve clients over TCP, so the model loads once",
@@ -902,11 +1078,42 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_mics:
         return list_microphones()
 
+    # Before any microphone handling: offline files need no audio device.
+    if args.wav:
+        return run_wav_mode(args.wav, args.asr, args.model, args.device, args.model_dir)
+
     # Before --mic validation: the whole point is to find a working index when
     # the one you picked is silent.
     if args.scan_mics:
         return scan_microphones()
 
+    # --serve: claim the port FIRST -- before sounddevice, the --mic check, the
+    # model load and the microphone. A duplicate process (a venv launcher stub
+    # once produced two) must fail here in milliseconds, not load a second
+    # Canary and steal the microphone from the process that serves clients.
+    server_socket = None
+    serving = args.serve and not (args.stdin or args.check_mic)
+    if serving:
+        try:
+            server_socket = bind_server_socket(args.host, args.port)
+        except PortInUseError as exc:
+            log(str(exc))
+            return EXIT_PORT_IN_USE
+
+    try:
+        return _run_selected_mode(args, server_socket)
+    finally:
+        if server_socket is not None:
+            # serve_forever closes it on every path; this covers the modes that
+            # return before reaching it (a bad --mic, missing sounddevice).
+            try:
+                server_socket.close()
+            except OSError:
+                pass
+
+
+def _run_selected_mode(args, server_socket) -> int:
+    """Everything after argument parsing and the --serve port claim."""
     if args.mic is not None:
         import sounddevice as sd
 
@@ -958,6 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
             args.chunk_seconds,
             args.silence_threshold,
             args.model_dir,
+            server_socket=server_socket,
         )
     return run_microphone_mode(
         args.asr,

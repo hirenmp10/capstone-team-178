@@ -29,3 +29,30 @@ Thumbs.db
 
 # Generated camera captures (scripts/capture_grasp.py, render_cameras.py)
 renders/
+# NOTE: 20 renders/default_scene/*.png files predate this rule and are still
+# tracked; ignoring does not untrack. `git rm -r --cached renders/` if unwanted.
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Scratch and generated outputs
+*.bak
+*.tmp
+*.points.csv
+*.wav
+/scratch/
+/tmp/
+
+# Model weights and exported engines (live in the HF cache / ~/.cache/mfw)
+*.onnx
+*.engine
+*.gguf
+*.safetensors
+*.pt
+*.pth
+/models/
+
+# Local agent / editor state
+.claude/

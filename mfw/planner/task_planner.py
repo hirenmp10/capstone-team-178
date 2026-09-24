@@ -11,6 +11,17 @@ The internal stages of a skill (observe, plan grasp, approach, close, verify,
 lift) are the *action graph* for that command. They are steps within one atomic
 action, not separate commands, and they are reported as such so the operator can
 see what the robot decided.
+
+Recovery policy is decided by the *kind* of failure (``recovery_for``), never by
+retrying blindly. The audit of 2026-09-24 measured the old behaviour: an
+ambiguous "can" (two in view) was retried three times and the operator was
+never asked which one; "pick up the teapot" was retried three times against an
+object that does not exist. Both arrived as a FAILED ``SkillResult`` because
+``Skill.execute`` converts every non-safety ``MfwError`` into a result, so the
+planner's exception branches were unreachable. Reference failures are now
+recognised on both paths: raised, or reported by a skill result (its
+``data["error_type"]``, or the ``"<ErrorClass>: ..."`` prefix that
+``Skill.execute`` writes).
 """
 
 from __future__ import annotations
@@ -19,12 +30,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from mfw.core.errors import AmbiguousReference, MfwError, SafetyViolation
+from mfw.core.errors import AmbiguousReference, MfwError, ObjectNotFound, SafetyViolation
 from mfw.core.interfaces import IIntentParser, ISkillExecutor
 from mfw.core.types import SkillResult, SkillStatus
 from mfw.language.intent_parser import UnparsedCommand
 from mfw.memory.working_memory import CommandRecord, WorkingMemory
-from mfw.planner.state_machine import State, StateMachine, recovery_for, status_to_state
+from mfw.planner.state_machine import State, StateMachine, recovery_for
 from mfw.utils.logging import EventLogger, get_logger
 
 __all__ = ["TaskPlanner", "CommandOutcome", "ACTION_GRAPHS"]
@@ -85,6 +96,14 @@ class CommandOutcome:
     message: str = ""
     needs_clarification: bool = False
     clarification_options: tuple[str, ...] = ()
+    clarification_track_ids: tuple[str, ...] = ()
+    """Index-aligned with ``clarification_options`` when known: the object each
+    option names, so the answer can be re-run against exactly that object."""
+    clarification_phrase: str = ""
+    """The referent that was ambiguous, as the command spelled it ("object")."""
+    remaining_clauses: tuple[str, ...] = ()
+    """Clauses of the same utterance not yet run because this one stopped
+    (set by the Assistant for conjoined and move-X-to-Y commands)."""
     action_graph: tuple[str, ...] = ()
     state_trace: list[dict[str, Any]] = field(default_factory=list)
     attempts: int = 0
@@ -102,6 +121,8 @@ class CommandOutcome:
             "message": self.message,
             "needs_clarification": self.needs_clarification,
             "clarification_options": list(self.clarification_options),
+            "clarification_track_ids": list(self.clarification_track_ids),
+            "remaining_clauses": list(self.remaining_clauses),
             "attempts": self.attempts,
             "duration_s": self.duration_s,
             "result": self.result.to_log() if self.result else None,
@@ -197,6 +218,20 @@ class TaskPlanner:
                     outcome.state_trace = self.machine.trace()[trace_start:]
                     return outcome
 
+                reference_error = _reference_error(result)
+                if reference_error == "AmbiguousReference":
+                    return self._clarify(
+                        outcome, intent, trace_start, reason="ambiguous reference",
+                        candidates=tuple(result.data.get("candidates") or ()),
+                        track_ids=tuple(result.data.get("track_ids") or ()),
+                    )
+                if reference_error == "ObjectNotFound":
+                    # Nothing to retry against: the object is not in view.
+                    self.machine.to(State.FAILED, "object not found")
+                    self.machine.to(State.WAIT_FOR_COMMAND, "ready")
+                    outcome.state_trace = self.machine.trace()[trace_start:]
+                    return outcome
+
                 if result.status is SkillStatus.ABORTED:
                     self.machine.to(State.ABORTED, "aborted")
                     self.machine.to(State.WAIT_FOR_COMMAND, "ready")
@@ -205,7 +240,12 @@ class TaskPlanner:
 
                 # INFEASIBLE is a considered refusal, not bad luck: retrying an
                 # object that is too wide for the gripper cannot help.
-                if result.status is SkillStatus.INFEASIBLE or attempt >= max_attempts:
+                # A skill that has already changed the world irreversibly (a
+                # Place that released the object, then measured a miss) says
+                # retryable=False: a retry could only answer "not holding
+                # anything" and replace the measured failure.
+                not_retryable = isinstance(result.data, dict) and result.data.get("retryable") is False
+                if result.status is SkillStatus.INFEASIBLE or not_retryable or attempt >= max_attempts:
                     self.machine.to(State.FAILED, result.status.value)
                     self.machine.to(State.WAIT_FOR_COMMAND, "ready")
                     outcome.state_trace = self.machine.trace()[trace_start:]
@@ -215,18 +255,28 @@ class TaskPlanner:
                 self.machine.to(State.REPLAN, f"attempt {attempt + 1}")
 
             except SafetyViolation as exc:
-                # Never retried, and never swallowed.
+                # Never retried, and never swallowed. EXECUTE -> ABORTED is the
+                # graph's own word for it; the trace used to say FAILED.
                 outcome.message = f"safety violation: {exc}"
+                if self.machine.can(State.ABORTED):
+                    self.machine.to(State.ABORTED, "safety violation")
                 self.machine.reset_to_waiting("safety violation")
                 outcome.state_trace = self.machine.trace()[trace_start:]
                 _log.error("Safety violation handling %r: %s", outcome.utterance, exc)
                 return outcome
 
             except AmbiguousReference as exc:
-                outcome.needs_clarification = True
                 outcome.message = str(exc)
-                outcome.clarification_options = self._clarification_options(intent)
-                self.machine.reset_to_waiting("ambiguous reference")
+                return self._clarify(
+                    outcome, intent, trace_start, reason="ambiguous reference",
+                    candidates=exc.candidates, track_ids=exc.track_ids,
+                    phrase=exc.phrase,
+                )
+
+            except ObjectNotFound as exc:
+                outcome.message = f"{type(exc).__name__}: {exc}"
+                self.machine.to(State.FAILED, "object not found")
+                self.machine.to(State.WAIT_FOR_COMMAND, "ready")
                 outcome.state_trace = self.machine.trace()[trace_start:]
                 return outcome
 
@@ -285,8 +335,73 @@ class TaskPlanner:
         if track_id:
             self.memory.note_reference(str(track_id))
 
+    def _clarify(
+        self,
+        outcome: CommandOutcome,
+        intent: Any,
+        trace_start: int,
+        *,
+        reason: str,
+        candidates: tuple[str, ...] = (),
+        track_ids: tuple[str, ...] = (),
+        phrase: str | None = None,
+    ) -> CommandOutcome:
+        """EXECUTE -> CLARIFY -> WAIT with the options to offer. Never retried.
+
+        Options come from the exception when it carried them; otherwise they are
+        recomputed by grounding the same phrase against the scene the skill just
+        observed, so the question always names real, distinguishable objects.
+        """
+        outcome.needs_clarification = True
+        target = str(intent.params.get("target") or "")
+        outcome.clarification_phrase = phrase or target
+        if not candidates or not track_ids:
+            candidates, track_ids = self._ground_candidates(target)
+        if not candidates:
+            candidates = self._clarification_options(intent)
+            track_ids = ()
+        outcome.clarification_options = tuple(candidates)
+        outcome.clarification_track_ids = tuple(track_ids)
+        if not outcome.message:
+            outcome.message = f"{target!r} is ambiguous"
+        self.machine.to(State.CLARIFY, reason)
+        self.machine.to(State.WAIT_FOR_COMMAND, "awaiting clarification")
+        outcome.state_trace = self.machine.trace()[trace_start:]
+        return outcome
+
+    def _ground_candidates(self, phrase: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Descriptions and track ids ``phrase`` could mean in the current scene."""
+        from mfw.language.grounding import resolve_reference
+
+        scene = self.memory.current_scene
+        if not phrase or scene is None:
+            return (), ()
+        try:
+            resolve_reference(phrase, scene, memory=self.memory, robot_xy=self._robot_xy())
+        except AmbiguousReference as exc:
+            return exc.candidates, exc.track_ids
+        except MfwError:
+            return (), ()
+        return (), ()
+
+    def _robot_xy(self) -> tuple[float, float]:
+        robot = getattr(self.config, "robot", None)
+        base = getattr(robot, "base_position", (0.0, 0.0, 0.0))
+        return float(base[0]), float(base[1])
+
+    def preview(self, utterance: str) -> Any | None:
+        """Parse ``utterance`` without executing it or touching the state machine.
+
+        ``None`` when it does not parse. Used to decide, before anything moves,
+        whether a spoken command needs confirming.
+        """
+        try:
+            return self.parser.parse(utterance, self._context())
+        except UnparsedCommand:
+            return None
+
     def _clarification_options(self, intent: Any) -> tuple[str, ...]:
-        """Candidate objects to offer when a reference is ambiguous."""
+        """Candidate objects to offer when a reference is ambiguous (legacy form)."""
         target = intent.params.get("target")
         if not target:
             return ()
@@ -320,3 +435,26 @@ class TaskPlanner:
     def _emit(self, outcome: CommandOutcome) -> None:
         if self.events is not None:
             self.events.emit("planner.command", outcome.to_log())
+
+
+_REFERENCE_ERRORS = ("AmbiguousReference", "ObjectNotFound")
+
+
+def _reference_error(result: SkillResult) -> str | None:
+    """Which reference failure, if any, a non-successful skill result reports.
+
+    ``Skill.execute`` turns a raised ``AmbiguousReference``/``ObjectNotFound``
+    into a FAILED result whose message is ``"<ErrorClass>: <text>"`` -- written
+    by code, not prose, so it is a stable marker. ``data["error_type"]`` is
+    preferred when a skill supplies it.
+    """
+    if result.status is SkillStatus.SUCCESS:
+        return None
+    declared = result.data.get("error_type") if isinstance(result.data, dict) else None
+    if declared in _REFERENCE_ERRORS:
+        return str(declared)
+    message = result.message or ""
+    for name in _REFERENCE_ERRORS:
+        if message.startswith(f"{name}:"):
+            return name
+    return None

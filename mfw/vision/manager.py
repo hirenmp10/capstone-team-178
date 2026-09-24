@@ -45,15 +45,18 @@ from mfw.utils import transforms as tf
 from mfw.utils.logging import EventLogger, get_logger
 from mfw.vision.camera import deproject_to_point_cloud
 from mfw.vision.geometry import (
+    UNLIT_FRAME_VALUE,
     dominant_color_name,
     fit_oriented_bbox,
+    frame_brightness,
+    is_unlit_frame,
     remove_statistical_outliers,
     voxel_downsample,
 )
 from mfw.vision.scene_graph import build_scene_graph
 from mfw.vision.tracking import ObjectTracker
 
-__all__ = ["VisionManager"]
+__all__ = ["VisionManager", "object_color_signature"]
 
 _log = get_logger("vision.manager")
 
@@ -61,6 +64,42 @@ _log = get_logger("vision.manager")
 _NON_OBJECT_LABELS = {"BACKGROUND", "UNLABELLED", "UNLABELED", ""}
 # Prims that are scene furniture rather than manipulable objects.
 _SUPPORT_LABELS = {"table", "ground", "groundplane", "defaultgroundplane"}
+# Every manipulable object is spawned under this scope.
+_OBJECT_SCOPE = "/World/objects/"
+
+
+def object_color_signature(frame: CameraFrame) -> dict[str, NDArray[np.float64]] | None:
+    """Mean RGB of each object's pixels in one frame, keyed by prim path.
+
+    What start-up warm-up polls to decide that object colours have stopped
+    changing. Per object rather than per frame, because the objects are a few
+    percent of the image: a block going from unrendered black to red moves the
+    frame mean by a couple of levels, which is inside render noise, while its
+    own mean moves by a hundred.
+
+    Returns ``None`` for a frame with no usable colour (unlit, or no RGB), so
+    such a frame can never count as settled. A frame with no object pixels (no
+    segmentation, or nothing in view) falls back to the whole-frame mean under
+    the key ``""``.
+    """
+    rgb = frame.rgb
+    if rgb is None or np.asarray(rgb).size == 0 or is_unlit_frame(rgb):
+        return None
+    pixels = np.asarray(rgb)[..., :3].astype(np.float64)
+
+    signature: dict[str, NDArray[np.float64]] = {}
+    seg = frame.segmentation
+    if seg is not None and np.asarray(seg).shape[:2] == pixels.shape[:2]:
+        seg = np.asarray(seg)
+        for seg_id, prim in frame.seg_id_to_prim.items():
+            if not str(prim).startswith(_OBJECT_SCOPE):
+                continue
+            mask = seg == int(seg_id)
+            if np.any(mask):
+                signature[str(prim)] = pixels[mask].mean(axis=0)
+    if not signature:
+        signature[""] = pixels.reshape(-1, 3).mean(axis=0)
+    return signature
 
 
 class VisionManager(IPerception):
@@ -86,6 +125,8 @@ class VisionManager(IPerception):
             max_age_steps=config.track_max_age_steps,
         )
         self._last_scene: SceneGraph | None = None
+        # Per-camera frame brightness from the latest capture; see _capture_all.
+        self._frame_brightness: dict[str, float] = {}
         # Height of the surface objects rest on. Defaults to the configured
         # ground plane, which is right only when they are on the floor.
         self._support_height = (
@@ -123,6 +164,12 @@ class VisionManager(IPerception):
                     "cameras": sorted(frames),
                     "raw_instances": len(instance_clouds),
                     "detections": len(detections),
+                    # Evidence for the colour path: a camera listed as unlit
+                    # contributed geometry but no colour to this observation.
+                    "rgb_brightness": {
+                        name: round(value, 1) for name, value in self._frame_brightness.items()
+                    },
+                    "unlit_cameras": self._unlit_cameras(),
                     "scene": scene.to_log(),
                 },
             )
@@ -136,6 +183,15 @@ class VisionManager(IPerception):
 
     def last_scene_graph(self) -> SceneGraph | None:
         return self._last_scene
+
+    def colors_settled(self) -> bool:
+        """Whether every confirmed object reports a colour the latest frame agreed with.
+
+        Start-up priming polls this so the operator's first "what do you see"
+        is answered from colours that have been measured, not from a frame the
+        renderer had not finished. See :meth:`ObjectTracker.colors_settled`.
+        """
+        return self._tracker.colors_settled()
 
     def require_fresh_scene(self) -> SceneGraph:
         """Return a scene graph, re-observing if the cached one is stale.
@@ -186,7 +242,29 @@ class VisionManager(IPerception):
                 _log.warning("Camera %s failed to capture: %s", name, exc)
         if not frames:
             raise PerceptionError("No camera produced a frame; perception is blind")
+
+        # Measured once here and consulted by _accumulate_instances. A camera
+        # whose RGB is unlit still contributes geometry -- depth and
+        # segmentation do not depend on the colour buffer -- but its pixels
+        # must not vote on colour, or an unwritten buffer names every object
+        # it sees "black".
+        self._frame_brightness = {
+            name: frame_brightness(frame.rgb) for name, frame in frames.items()
+        }
+        unlit = self._unlit_cameras()
+        if unlit:
+            _log.info(
+                "Camera(s) %s returned an unlit RGB frame (bright end %s); "
+                "their colour is ignored for this observation",
+                ", ".join(unlit),
+                ", ".join(f"{self._frame_brightness[n]:.0f}" for n in unlit),
+            )
         return frames
+
+    def _unlit_cameras(self) -> list[str]:
+        return sorted(
+            name for name, value in self._frame_brightness.items() if value <= UNLIT_FRAME_VALUE
+        )
 
     def _accumulate_instances(
         self, frames: dict[str, CameraFrame]
@@ -212,6 +290,12 @@ class VisionManager(IPerception):
         for name, frame in frames.items():
             if frame.depth is None or frame.segmentation is None:
                 continue
+            brightness = self._frame_brightness.get(name)
+            color_usable = (
+                not is_unlit_frame(frame.rgb)
+                if brightness is None
+                else brightness > UNLIT_FRAME_VALUE
+            )
 
             cloud = deproject_to_point_cloud(frame, self.config, to_world=True)
             if len(cloud) == 0 or cloud.seg_ids is None:
@@ -238,7 +322,7 @@ class VisionManager(IPerception):
                 # Colour is what lets an operator say "the green box" rather than
                 # having to know the class vocabulary. Collected here because this
                 # is the only place per-point RGB is still aligned with the mask.
-                if cloud.colors is not None:
+                if cloud.colors is not None and color_usable:
                     entry["colors"].append(cloud.colors[mask])
 
         return instances
@@ -254,7 +338,7 @@ class VisionManager(IPerception):
             return True
         if label.strip().lower() in _SUPPORT_LABELS:
             return True
-        if prim_path and not prim_path.startswith("/World/objects/"):
+        if prim_path and not prim_path.startswith(_OBJECT_SCOPE):
             # Robot links and scene furniture live outside the objects scope.
             return True
         return False

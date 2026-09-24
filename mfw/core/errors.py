@@ -54,14 +54,51 @@ class ObjectNotFound(PerceptionError):
 
     Expected and non-fatal: objects may legitimately be absent, occluded, or
     removed. The correct response is to report to the user and WAIT.
+
+    ``phrase`` and ``visible`` are optional structured context (the referent
+    that failed, and descriptions such as ``"red block"`` of what *is* in
+    view). Keyword-only with defaults, so ``ObjectNotFound("no teapot")`` keeps
+    working everywhere it is already raised.
     """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        phrase: str | None = None,
+        visible: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.phrase = phrase
+        self.visible: tuple[str, ...] = tuple(visible)
 
 
 class AmbiguousReference(PerceptionError):
     """A phrase matched several objects and cannot be resolved.
 
     Recovery: ask the user which one, never guess.
+
+    ``candidates`` are human descriptions ("red block on the left") and
+    ``track_ids`` the objects they name, index-aligned, so the question the
+    planner asks and the answer it re-runs with refer to the same objects.
+    Both default to empty: the one-argument form raised by older code still
+    works, and the planner falls back to listing candidates itself.
     """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        phrase: str | None = None,
+        candidates: tuple[str, ...] | list[str] = (),
+        track_ids: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        super().__init__(message)
+        if track_ids and candidates and len(track_ids) != len(candidates):
+            raise ValueError("candidates and track_ids must be index-aligned")
+        self.phrase = phrase
+        self.candidates: tuple[str, ...] = tuple(candidates)
+        self.track_ids: tuple[str, ...] = tuple(track_ids)
 
 
 class KinematicsError(MfwError):

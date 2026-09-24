@@ -196,7 +196,11 @@ memory:
   persist_path: logs/memory_state.json
 
 gr00t:
-  # Disabled until a checkpoint and a 3.12 server are actually in place.
+  # Disabled. The checkpoint IS downloaded (HF cache: nvidia/GR00T-N1.7-3B plus
+  # its Cosmos-Reason2-2B backbone), but scripts/groot_server.py has never
+  # completed a live inference on this machine, the bridge has been validated
+  # only against fakes and the mock (tests/test_gr00t_zmq.py), and the hardware
+  # lane excludes GR00T. `run_assistant.py --groot` turns it on for a run.
   # The classical backend is fully functional without this.
   enabled: false
   host: 127.0.0.1
@@ -212,9 +216,11 @@ gr00t:
   request_timeout_s: 30.0    # a 3B VLA forward pass is not instant
   max_relative_translation: 0.05
   max_relative_rotation: 0.35
-  # false -> talk to NVIDIA's real PolicyServer over ZeroMQ/msgpack.
-  # true  -> the deterministic mock (pickle transport), which is what the test
-  #          suite exercises so the integration is verifiable without a GPU.
+  # false -> talk to NVIDIA's real PolicyServer over ZeroMQ/msgpack (set
+  #          MFW_GR00T_API_TOKEN if the server was started with --api-token).
+  # true  -> the deterministic mock (pickle transport). The test suite
+  #          exercises both: the mock over pickle, and the ZMQ client against an
+  #          in-thread server speaking NVIDIA's protocol -- neither loads a model.
   use_mock_server: false
 
 logging:

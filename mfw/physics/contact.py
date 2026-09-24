@@ -63,6 +63,65 @@ pixel boxes the detector already reports:
     the verdict is *unknown*. Anything that is not seen and not explained
     this way is *unknown*, which is reported as not holding -- and the skill
     then keeps the jaw closed rather than dropping a possibly held object.
+
+What bbox growth alone could not tell apart (re-review, perception lens)
+------------------------------------------------------------------------
+The discriminator used to be the growth of the box *diagonal*. Three things
+grow a diagonal without any lift, and each read ``carried``:
+
+* **A spin.** A closing jaw that catches a 140 x 19 mm marker off-centre spins
+  it 15-45 degrees in place; the axis-aligned box of the rotated marker has a
+  longer diagonal (x1.06-1.13 against a required x1.0565), memory recorded a
+  hold, and Place then carried an empty jaw and reported success.
+* **Jitter.** A detector box 6 % larger than the last one, on a marker that
+  never moved, passed the nadir threshold.
+* **A box that takes in the fingers** hovering over a marker left behind.
+
+A lift scales the box *isotropically* -- both axes by about the same factor,
+the one the camera model predicts for each -- and, for any camera that is not
+looking straight down the lift, moves its centre by the predicted parallax.
+A rotation or an absorbed jaw changes the box's *shape* (the short axis of a
+spun marker grows 1.5-4x while the long one barely moves); jitter changes
+neither shape nor centre. So the verdict now needs, besides growth measured
+on the box *area* (``area_scale``, the geometric mean of the two axis
+scales, which a long thin box cannot inflate through one axis):
+
+(d) **Shape**: each axis grew as predicted for that axis (``axis_scale`` vs
+    ``expected_axis_scale``, within 5 % or 4 px, whichever is larger).
+(e) **Centroid**: when the camera model predicts a centre shift of at least
+    6 px, the observed shift matches it (within 6 px or 35 %); otherwise the
+    centroid is uninformative and says nothing either way.
+(f) **Orientation**: the pose estimator's yaw did not change or turn
+    ambiguous between the two boxes.
+(g) Growth of at least **three quarters** of the predicted growth (it was
+    half): 6 % jitter against an 11 % prediction no longer passes.
+
+A box that grew but fails (d)-(f) is ``reshaped`` (rotated, merged with the
+jaw, or noise) -- or ``knocked`` when it also slid across the table: not
+holding either way. A box that *shrank* below 80 % on either axis is
+a partial detection -- a jaw splitting the marker and the detector boxing one
+end -- and is ``unknown``, never "knocked, moved 94 mm".
+
+**Without a measured camera pose the verdict is never ``carried``.** On the
+nadir hardware camera a missed marker lies straight under the lifted jaw, so
+the tool-in-box and on-prediction tests cannot fail, and growth alone is what
+the review showed jitter and a merged jaw can fake. Evidence that passes
+(d)/(f)/(g) there is reported as ``unknown`` -- the box grew like a lift, but a
+spin or jitter cannot be ruled out -- which the skill treats as not holding
+and answers by keeping the jaw closed. Measure the camera pose
+(``exterior_camera.pose_measured``) to get a ``carried`` verdict on hardware.
+The fake lane's camera is exact and measured.
+
+Measured with the scripted detector through the production estimator (7
+workspace positions, 30 draws each, uniform per-edge box jitter on both the
+pre-descent and post-lift boxes): no missed marker read ``carried`` at +-1, 2
+or 3 px on either measured camera, while real carries were confirmed 96 / 82 /
+68 % (oblique 1920x1080) and 81 / 68 / 51 % (nadir 640x480, where the
+marker's short axis is only ~20 px). An unconfirmed real carry leaves the jaw
+closed for a person to check -- the safe side. Persistence across frames and a
+lateral wiggle test (move the TCP sideways and see whether the object
+follows) would discriminate further; both need the skill to take more
+observations and are not here.
 """
 
 from __future__ import annotations
@@ -71,6 +130,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from numpy.typing import NDArray
 
 from mfw.core.types import ObjectHypothesis, Pose, SceneGraph
 from mfw.utils.logging import get_logger
@@ -82,11 +142,24 @@ _log = get_logger("physics.contact")
 _MIN_PIXEL_GROWTH = 0.04
 """Linear bbox growth (fraction) below which a "rise" is detector jitter. A
 marker 140 px long jitters by 2-3 px on OWL-ViT; 4 % is 5-6 px."""
-_GROWTH_FRACTION_REQUIRED = 0.5
-"""Share of the *expected* growth the object must show. Half, because the fake
-world and a real grasp both lift the object slightly more or less than the
-commanded height (grasped below centre, table flex), and the point is to
-separate ~10 % from ~0 %, not to measure the lift."""
+_GROWTH_FRACTION_REQUIRED = 0.75
+"""Share of the *expected* growth the object must show. It was half, which let
+6 % of detector jitter pass against an 11 % prediction (re-review). Three
+quarters still leaves room for the object being lifted slightly less than
+commanded (grasped below centre, table flex); real carries measured 97-104 %
+of the prediction on every camera."""
+_SHAPE_REL_TOL = 0.05
+"""Per-axis tolerance, relative, between observed and predicted axis growth."""
+_SHAPE_PX_TOL = 4.0
+"""Per-axis tolerance in pixels of the pre-descent box: a 20 px short axis
+cannot be measured to better than a pixel or two per edge, on both boxes. A
+spun marker's short axis grows by 12 px or more even at 5 degrees."""
+_CENTROID_MIN_SHIFT_PX = 6.0
+"""Predicted centre shifts smaller than this say nothing (near-nadir lifts)."""
+_CENTROID_TOL_PX = 6.0
+_CENTROID_TOL_FRACTION = 0.35
+_SHRUNK_SCALE = 0.8
+"""An axis that shrank below this share is a partial detection, not evidence."""
 _PREDICTION_TOLERANCE_M = 0.03
 """How far the observed table-plane estimate may sit from the one a carried
 object would produce. Absorbs the few millimetres of grasp-height error the
@@ -135,6 +208,10 @@ class LiftPrediction:
     """Pixel box of the gripper/wrist footprint above the TCP: the occluder."""
     model_available: bool = False
     """Whether a measured pinhole model produced the pixel predictions."""
+    rest_bbox_px: BoxPx | None = None
+    """Pixel box of the object's 3-D box *at rest*, from the same model: with
+    ``predicted_bbox_px`` it gives the growth predicted per image axis and
+    the centre shift the lift should produce."""
 
     def to_log(self) -> dict[str, Any]:
         """JSON-safe dict for the ``pick.verification`` event."""
@@ -142,6 +219,7 @@ class LiftPrediction:
             "expected_pixel_scale": self.expected_pixel_scale,
             "predicted_xy": None if self.predicted_xy is None else list(self.predicted_xy),
             "predicted_bbox_px": None if self.predicted_bbox_px is None else list(self.predicted_bbox_px),
+            "rest_bbox_px": None if self.rest_bbox_px is None else list(self.rest_bbox_px),
             "tcp_px": None if self.tcp_px is None else list(self.tcp_px),
             "arm_bbox_px": None if self.arm_bbox_px is None else list(self.arm_bbox_px),
             "model_available": self.model_available,
@@ -204,7 +282,20 @@ class GraspEvidence:
     """Whether a measured camera model backed the pixel predictions."""
     verdict: str = ""
     """Feedback-less outcome: ``carried``, ``occluded``, ``resting``,
-    ``knocked`` or ``unknown``. Empty on the feedback lane."""
+    ``knocked``, ``reshaped`` or ``unknown``. Empty on the feedback lane."""
+    area_scale: float | None = None
+    """Post-lift / pre-descent growth of the box area, as a linear factor
+    (geometric mean of the two axis scales)."""
+    axis_scale: tuple[float, float] | None = None
+    """``(width, height)`` growth of the pixel box."""
+    expected_axis_scale: tuple[float, float] | None = None
+    """The per-axis growth a lift should produce."""
+    shape_consistent: bool | None = None
+    """Both axes grew as predicted (``None``: not evaluated)."""
+    centroid_consistent: bool | None = None
+    """The box centre moved as the lift predicts (``None``: uninformative or no model)."""
+    yaw_changed: bool | None = None
+    """The estimator's yaw changed or turned ambiguous between the two boxes."""
 
     @property
     def holding(self) -> bool:
@@ -241,6 +332,24 @@ class GraspEvidence:
         return self.fingers_stalled and self.object_tracked and self.width_plausible
 
     def to_log(self) -> dict[str, Any]:
+        record = self._base_log()
+        if not self.gripper_feedback:
+            # Feedback-less fields only: the sim lane's record stays as it was.
+            record.update(
+                {
+                    "area_scale": self.area_scale,
+                    "axis_scale": None if self.axis_scale is None else list(self.axis_scale),
+                    "expected_axis_scale": (
+                        None if self.expected_axis_scale is None else list(self.expected_axis_scale)
+                    ),
+                    "shape_consistent": self.shape_consistent,
+                    "centroid_consistent": self.centroid_consistent,
+                    "yaw_changed": self.yaw_changed,
+                }
+            )
+        return record
+
+    def _base_log(self) -> dict[str, Any]:
         return {
             "holding": self.holding,
             "fingers_stalled": self.fingers_stalled,
@@ -299,11 +408,30 @@ class GraspEvidence:
         scale = "" if self.pixel_scale is None else f"bbox x{self.pixel_scale:.2f}"
         verdict = self.verdict or ("carried" if self.pixel_grew else "occluded" if self.occluded_by_arm else "unknown")
         if verdict == "carried":
-            growth = f"bbox grew {(self.pixel_scale or 1.0) * 100 - 100:.0f} %"
+            growth = f"bbox grew {(self.area_scale or self.pixel_scale or 1.0) * 100 - 100:.0f} % on both axes"
             if self.expected_pixel_scale:
                 growth += f" (expected ~{self.expected_pixel_scale * 100 - 100:.0f} % for the lift)"
             tool = "; the tool projects inside its box" if self.tcp_in_object_box else ""
-            return f"holding (no gripper feedback): the object rose with the jaw ({growth}{tool})"
+            moved = "; its centre moved as the lift predicts" if self.centroid_consistent else ""
+            return f"holding (no gripper feedback): the object rose with the jaw ({growth}{tool}{moved})"
+        if verdict == "reshaped":
+            why = []
+            if self.shape_consistent is False and self.axis_scale is not None:
+                sx, sy = self.axis_scale
+                why.append(f"its box changed shape (x{sx:.2f} wide, x{sy:.2f} tall)")
+            if self.centroid_consistent is False:
+                why.append("its centre did not move the way a lifted object's does")
+            if self.yaw_changed:
+                why.append("its orientation changed")
+            if self.tcp_in_object_box is False:
+                why.append("the tool does not project inside it")
+            if self.on_prediction is False:
+                why.append("it is not where a carried object would appear")
+            detail = "; ".join(why) or "it does not look like a lift"
+            return (
+                f"cannot confirm the grasp: the object's box grew but not the way a lift makes it "
+                f"grow ({detail}) -- spun by the jaw, merged with the fingers, or detector noise: not carried"
+            )
         if verdict == "occluded":
             return (
                 "holding (no gripper feedback, inferred): the object was seen before the "
@@ -320,6 +448,17 @@ class GraspEvidence:
                 "after the lift: not carried"
             )
         # unknown
+        if self.object_visible and self.axis_scale is not None and min(self.axis_scale) < _SHRUNK_SCALE:
+            return (
+                f"cannot confirm the grasp: the object's box shrank ({scale}), which is a partial "
+                "detection (the jaw hiding part of it), not evidence either way; look at the gripper"
+            )
+        if self.object_visible and self.visible_before and not self.model_available and self.area_scale is not None:
+            return (
+                f"cannot confirm the grasp: the object's box grew like a lift ({scale}), but "
+                "exterior_camera.pose_measured is false, so a jaw that spun the object or detector "
+                "jitter cannot be ruled out. Measure the camera pose, or look at the gripper"
+            )
         if self.object_visible:
             return (
                 "cannot confirm the grasp: the object is seen now but was not detected in the "
@@ -379,6 +518,31 @@ def _point_in_box(point: Sequence[float], box: BoxPx, margin: float) -> bool:
     return box[0] - pad_u <= u <= box[2] + pad_u and box[1] - pad_v <= v <= box[3] + pad_v
 
 
+def _size(box: BoxPx) -> tuple[float, float]:
+    return (box[2] - box[0], box[3] - box[1])
+
+
+def _centre(box: BoxPx) -> NDArray[np.float64]:
+    return np.array([(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0], dtype=np.float64)
+
+
+def _yaw_changed(before: ObjectHypothesis | None, after: ObjectHypothesis | None) -> bool | None:
+    """Whether the pose estimator's orientation evidence changed between the boxes."""
+    if before is None or after is None:
+        return None
+    b_attr = before.attributes if isinstance(before.attributes, Mapping) else {}
+    a_attr = after.attributes if isinstance(after.attributes, Mapping) else {}
+    if "yaw_ambiguous" not in b_attr or "yaw_ambiguous" not in a_attr:
+        return None
+    if bool(a_attr.get("yaw_ambiguous")) and not bool(b_attr.get("yaw_ambiguous")):
+        return True
+    b_yaw, a_yaw = b_attr.get("yaw_rad"), a_attr.get("yaw_rad")
+    if b_yaw is None or a_yaw is None or bool(b_attr.get("yaw_ambiguous")):
+        return False
+    diff = abs((float(a_yaw) - float(b_yaw) + np.pi / 2.0) % np.pi - np.pi / 2.0)
+    return bool(diff > np.radians(10.0))
+
+
 def _covered_fraction(inner: BoxPx, cover: BoxPx) -> float:
     """Share of ``inner``'s area that ``cover`` overlaps."""
     w = max(0.0, min(inner[2], cover[2]) - max(inner[0], cover[0]))
@@ -401,6 +565,12 @@ def _feedbackless_fields(
     after_box = _bbox_px(after) if object_visible else None
     fields: dict[str, Any] = {
         "visible_before": visible_before,
+        "area_scale": None,
+        "axis_scale": None,
+        "expected_axis_scale": None,
+        "shape_consistent": None,
+        "centroid_consistent": None,
+        "yaw_changed": None,
         "pixel_scale": None,
         "expected_pixel_scale": pred.expected_pixel_scale,
         "pixel_grew": False,
@@ -434,11 +604,30 @@ def _feedbackless_fields(
         return fields
     scale = _diagonal(after_box) / max(_diagonal(before_box), 1e-9)
     fields["pixel_scale"] = scale
-    expected = pred.expected_pixel_scale
+    (bw, bh), (aw, ah) = _size(before_box), _size(after_box)
+    sx, sy = aw / max(bw, 1e-9), ah / max(bh, 1e-9)
+    area_scale = float(np.sqrt(sx * sy))
+    fields["axis_scale"] = (float(sx), float(sy))
+    fields["area_scale"] = area_scale
+
+    # Predicted growth per axis: from the model's rest and carried boxes when
+    # it exists, else the nadir approximation for both axes.
+    expected_axes: tuple[float, float] | None = None
+    if pred.model_available and pred.predicted_bbox_px is not None and pred.rest_bbox_px is not None:
+        (rw, rh), (cw, ch) = _size(pred.rest_bbox_px), _size(pred.predicted_bbox_px)
+        if rw > 0.0 and rh > 0.0:
+            expected_axes = (cw / rw, ch / rh)
+    elif pred.expected_pixel_scale is not None:
+        expected_axes = (float(pred.expected_pixel_scale), float(pred.expected_pixel_scale))
+    fields["expected_axis_scale"] = expected_axes
+    expected_area = (
+        float(np.sqrt(expected_axes[0] * expected_axes[1])) if expected_axes is not None else pred.expected_pixel_scale
+    )
     required = _MIN_PIXEL_GROWTH
-    if expected is not None and expected > 1.0:
-        required = max(_MIN_PIXEL_GROWTH, _GROWTH_FRACTION_REQUIRED * (expected - 1.0))
-    fields["pixel_grew"] = (scale - 1.0) >= required
+    if expected_area is not None and expected_area > 1.0:
+        required = max(_MIN_PIXEL_GROWTH, _GROWTH_FRACTION_REQUIRED * (expected_area - 1.0))
+    fields["pixel_grew"] = (area_scale - 1.0) >= required
+
     if pred.tcp_px is not None:
         fields["tcp_in_object_box"] = _point_in_box(pred.tcp_px, after_box, _TCP_BOX_MARGIN_PX)
     if pred.predicted_xy is not None:
@@ -446,17 +635,48 @@ def _feedbackless_fields(
         fields["predicted_offset"] = offset
         fields["on_prediction"] = offset <= _PREDICTION_TOLERANCE_M
 
-    carried = (
-        fields["pixel_grew"]
+    if min(sx, sy) < _SHRUNK_SCALE:
+        # A partial detection: the jaw hides part of the object and the
+        # detector boxed what was left. Not "knocked", not "resting".
+        fields["verdict"] = "unknown"
+        return fields
+
+    if expected_axes is not None:
+        ok = True
+        for observed, predicted, before_px in ((sx, expected_axes[0], bw), (sy, expected_axes[1], bh)):
+            tolerance = max(_SHAPE_REL_TOL, _SHAPE_PX_TOL / max(before_px, 1e-9))
+            if abs(observed / max(predicted, 1e-9) - 1.0) > tolerance:
+                ok = False
+        fields["shape_consistent"] = ok
+    if pred.model_available and pred.predicted_bbox_px is not None and pred.rest_bbox_px is not None:
+        shift_expected = _centre(pred.predicted_bbox_px) - _centre(pred.rest_bbox_px)
+        magnitude = float(np.linalg.norm(shift_expected))
+        if magnitude >= _CENTROID_MIN_SHIFT_PX:
+            shift_observed = _centre(after_box) - _centre(before_box)
+            miss = float(np.linalg.norm(shift_observed - shift_expected))
+            fields["centroid_consistent"] = miss <= max(_CENTROID_TOL_PX, _CENTROID_TOL_FRACTION * magnitude)
+    fields["yaw_changed"] = _yaw_changed(before, after)
+
+    if not fields["pixel_grew"]:
+        fields["verdict"] = "knocked" if object_displaced else "resting"
+        return fields
+    consistent = (
+        fields["shape_consistent"] is not False
+        and fields["centroid_consistent"] is not False
+        and fields["yaw_changed"] is not True
         and fields["tcp_in_object_box"] is not False
         and fields["on_prediction"] is not False
     )
-    if carried:
-        fields["verdict"] = "carried"
-    elif object_displaced:
-        fields["verdict"] = "knocked"
+    if not consistent:
+        # Grew, but not as a lift grows it. Slid across the table as well:
+        # knocked; in place: spun, merged with the jaw, or noise.
+        fields["verdict"] = "knocked" if object_displaced else "reshaped"
+    elif not pred.model_available:
+        # Growth, shape and orientation look like a lift, but nothing here can
+        # rule out a spin or jitter (see the module docstring): conservative.
+        fields["verdict"] = "unknown"
     else:
-        fields["verdict"] = "resting"
+        fields["verdict"] = "carried"
     return fields
 
 
@@ -494,10 +714,11 @@ def verify_grasp(
     frames and a threshold hugging a real case would flip with that noise.
 
     ``gripper_feedback=False`` switches the verdict to the pixel evidence
-    described in the module docstring: bbox growth between the ``bbox_px``
-    attributes of the pre-descent and post-lift hypotheses, agreement with
-    ``lift_prediction`` when a camera model produced one, and arm occlusion
-    for an object that is no longer seen. ``scene_before`` must then be the
+    described in the module docstring: isotropic bbox growth between the
+    ``bbox_px`` attributes of the pre-descent and post-lift hypotheses, the
+    centre shift and agreement with ``lift_prediction`` when a camera model
+    produced one (without one the verdict is never ``carried``), and arm
+    occlusion for an object that is no longer seen. ``scene_before`` must then be the
     observation taken *before* the descent (the object still in view), and an
     object is *visible* in a scene when its ``last_seen_step`` is that
     observation's own step, so a track the tracker merely kept alive does not

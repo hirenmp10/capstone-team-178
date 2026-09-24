@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import queue
 from dataclasses import dataclass
 from pathlib import Path
@@ -245,7 +246,22 @@ class TcpSpeechRecognizer(_JsonLineRecognizer):
     The model stays loaded in that process, so attaching costs milliseconds
     instead of the ~39 s a cold ``SALM.from_pretrained`` takes. Same protocol as
     the subprocess transport, so nothing downstream changes.
+
+    **A dropped server is an error, not silence.** The reader thread used to
+    exit quietly on EOF, leaving ``listen(None)`` -- which is how
+    ``VoiceCommandLoop.run`` calls it -- blocked on an empty queue forever:
+    measured, the voice loop was still waiting 5 s after the server closed, with
+    the reader thread dead and nothing on screen. Now the reader records the
+    disconnect, ``listen`` delivers anything that arrived before it, then tries
+    ``reconnect_attempts`` fresh connections (the server returns to
+    ``accept()`` with the model still warm when a client drops, so a transient
+    network blip heals) and raises :class:`SpeechError` with the reason and a
+    restart hint if none succeeds.
     """
+
+    #: How often a blocking ``listen`` re-checks for a disconnect. Bounds the
+    #: time between the server dying and the operator being told.
+    _POLL_S = 0.25
 
     def __init__(
         self,
@@ -254,17 +270,32 @@ class TcpSpeechRecognizer(_JsonLineRecognizer):
         queue_size: int = 16,
         source: str = "speech-server",
         connect_timeout_s: float = 10.0,
+        reconnect_attempts: int = 3,
+        reconnect_backoff_s: float = 1.0,
     ) -> None:
         super().__init__(queue_size=queue_size, source=source)
         self.host = host
         self.port = port
         self.connect_timeout_s = connect_timeout_s
+        self.reconnect_attempts = max(0, int(reconnect_attempts))
+        self.reconnect_backoff_s = max(0.0, float(reconnect_backoff_s))
         self._sock: socket.socket | None = None
         self._reader: threading.Thread | None = None
+        self._disconnected = threading.Event()
+        self._disconnect_reason = ""
+
+    @property
+    def connected(self) -> bool:
+        """Whether a live connection to the server is open."""
+        return self._sock is not None and not self._disconnected.is_set()
 
     def start(self) -> None:
         if self._sock is not None:
             return
+        self._stop.clear()
+        self._connect()
+
+    def _connect(self) -> None:
         try:
             sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout_s)
         except OSError as exc:
@@ -279,17 +310,19 @@ class TcpSpeechRecognizer(_JsonLineRecognizer):
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock = sock
-        self._stop.clear()
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._disconnect_reason = ""
+        self._disconnected.clear()
+        self._reader = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
         self._reader.start()
 
-    def _read_loop(self) -> None:
-        assert self._sock is not None
+    def _read_loop(self, sock: socket.socket) -> None:
         buffer = ""
+        reason = "the server closed the connection"
         while not self._stop.is_set():
             try:
-                chunk = self._sock.recv(65536)
-            except OSError:
+                chunk = sock.recv(65536)
+            except OSError as exc:
+                reason = f"connection error: {exc}"
                 break
             if not chunk:
                 break
@@ -300,14 +333,82 @@ class TcpSpeechRecognizer(_JsonLineRecognizer):
                 line, buffer = buffer.split("\n", 1)
                 self._handle_line(line)
 
-    def stop(self) -> None:
-        self._stop.set()
+        if not self._stop.is_set():
+            # Signal, do not just return: a silent exit is what left the voice
+            # loop blocked forever.
+            self._disconnect_reason = reason
+            self._disconnected.set()
+            _log.warning("Speech server %s:%d disconnected: %s", self.host, self.port, reason)
+
+    def listen(self, timeout_s: float | None = None) -> Transcript | None:
+        """Next transcript; ``None`` on timeout; :class:`SpeechError` if the server is gone."""
+        if self._sock is None and not self._disconnected.is_set():
+            self.start()
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            # Deliver whatever arrived before a disconnect first: the last
+            # thing said may be the command the operator is waiting on.
+            try:
+                return self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            if self._disconnected.is_set():
+                self._recover()
+                continue
+            wait = self._POLL_S
+            if deadline is not None:
+                wait = min(wait, deadline - time.monotonic())
+                if wait <= 0:
+                    return None
+            try:
+                return self._queue.get(timeout=wait)
+            except queue.Empty:
+                continue
+
+    def _recover(self) -> None:
+        """Reconnect after a disconnect, or raise with an actionable message."""
+        reason = self._disconnect_reason or "the connection dropped"
+        self._close_socket()
+        last_error: Exception | None = None
+        for attempt in range(1, self.reconnect_attempts + 1):
+            if self._stop.is_set():
+                break
+            time.sleep(self.reconnect_backoff_s * attempt)
+            try:
+                self._connect()
+            except SpeechError as exc:
+                last_error = exc
+                continue
+            _log.warning(
+                "Reconnected to the speech server at %s:%d (attempt %d) after: %s",
+                self.host, self.port, attempt, reason,
+            )
+            if self.on_event is not None:
+                try:
+                    self.on_event("reconnected", {"event": "reconnected", "reason": reason})
+                except Exception:  # pragma: no cover - callback is caller code
+                    _log.debug("on_event callback raised", exc_info=True)
+            return
+
+        detail = f"; last attempt: {last_error}".split("\n")[0] if last_error else ""
+        raise SpeechError(
+            f"lost the speech server at {self.host}:{self.port} ({reason}) and could not "
+            f"reconnect after {self.reconnect_attempts} attempt(s){detail}.\n"
+            "Restart it in its own terminal, then relaunch the assistant:\n"
+            "    <voice-python> scripts/speech_worker.py --serve --asr canary --device cuda"
+        )
+
+    def _close_socket(self) -> None:
         if self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
             self._sock = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._close_socket()
 
 
 class WhisperSubprocessRecognizer(ISpeechRecognizer):

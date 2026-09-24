@@ -378,7 +378,18 @@ class PerceptionConfig:
     max_scene_graph_age_s: float = 1.0
 
     support_constrained_height: bool = False
-    """Derive an object's height from the support surface instead of the points.
+    """**NOT IMPLEMENTED -- must stay false; ``validate`` rejects true.**
+
+    No code reads this field (``git log -S`` shows it has existed only as this
+    declaration since the initial commit), yet HANDOFF.md described it as a
+    working option "left in behind" the flag. A flag that silently does nothing
+    is worse than no flag, so enabling it is now a configuration error instead
+    of a no-op. It is kept, rather than deleted, so existing configs that spell
+    out ``false`` still load. The design notes below describe the intended
+    behaviour, and the measurements quoted in them are not reproducible from
+    this repository's code.
+
+    Intended: derive an object's height from the support surface instead of the points.
 
     A single view sees an object's top face and little of its sides, so it
     under-measures height -- the YCB mustard bottle's 191 mm read as 156 mm.
@@ -434,6 +445,12 @@ class PerceptionConfig:
             raise ConfigError(
                 f"perception.bbox_trim_percentile must be in [0, 50), got {self.bbox_trim_percentile}"
             )
+        if self.support_constrained_height:
+            raise ConfigError(
+                "perception.support_constrained_height is not implemented: nothing in the "
+                "vision pipeline reads it, so enabling it would silently change nothing. "
+                "Remove the key or set it to false."
+            )
 
 
 @dataclass(frozen=True)
@@ -469,8 +486,17 @@ class GraspConfig:
     pixel growth and the lift prediction in mfw.physics.contact. Perception
     noise after homography is around a centimetre; three keeps a stationary
     object from being called knocked."""
+    place_tolerance_m: float = 0.05
+    """How far (metres, horizontally) a re-observed object may settle from the
+    release target for Place to report success, for relations other than
+    ``in``/``on`` (those are judged by the destination's footprint). Before
+    this check Place reported "placed" for a can that settled 350 mm from the
+    green box (Isaac run 2026-09-24); a miss is now FAILED with the measured
+    distance. Read by :mod:`mfw.skills.primitives` (``DEFAULT_PLACE_TOLERANCE_M``)."""
 
     def validate(self) -> None:
+        if not self.place_tolerance_m > 0.0:
+            raise ConfigError("grasp.place_tolerance_m must be > 0")
         if self.max_grasp_width <= self.min_grasp_width:
             raise ConfigError("grasp.max_grasp_width must exceed min_grasp_width")
         if self.approach_offset <= 0.0:
@@ -606,9 +632,13 @@ class Gr00tConfig:
     image_size: tuple[int, int] = (224, 224)
     request_timeout_s: float = 10.0
     max_relative_translation: float = 0.05
-    """Safety clamp on a single predicted EEF delta, metres."""
+    """Largest TCP move one executed action may command, metres (the distance
+    from the current TCP for absolute actions, the delta itself otherwise).
+    Larger steps are scaled down, not rejected. The z floor of the envelope is
+    the table top plus a clearance (``ActionSafetyFilter``), not the workspace
+    box's z-min."""
     max_relative_rotation: float = 0.35
-    """Safety clamp on a single predicted EEF delta, radians."""
+    """Largest wrist rotation one executed action may command, radians."""
     actions_are_absolute: bool = True
     """Whether the policy returns world-frame poses rather than deltas.
 
@@ -618,9 +648,18 @@ class Gr00tConfig:
     relative to absolute during postprocessing, so ``get_action`` returns absolute
     poses. Measured: with the TCP at [0.45, 0, 0.45], action[0] was
     [0.457, -0.006, 0.443], an 11 mm move. Read as a delta it became 0.61 m and
-    was clamped every time."""
+    was clamped every time. (That measurement is recorded here and in the tests;
+    no log of the run that produced it survives in ``logs/``, and no live
+    inference has run in this framework since -- treat it as NVIDIA's documented
+    processor behaviour rather than a re-verified result.)
+
+    ``MockPolicy`` honours this flag too, and the pickle client refuses a mock
+    whose representation differs."""
     use_mock_server: bool = True
-    """Run against a deterministic mock until a real checkpoint is available."""
+    """Default ``True`` keeps a config with no ``gr00t`` section off the real
+    transport; ``configs/default.yaml`` sets ``false`` (ZeroMQ to
+    ``scripts/groot_server.py``). The checkpoint is downloaded; what has never
+    happened is a live inference through this framework."""
 
     def validate(self) -> None:
         if not 1 <= self.port <= 65535:
@@ -1046,6 +1085,18 @@ class HardwareConfig:
     grasp_pitch_angles_deg: tuple[float, ...] = (90.0, 75.0, 60.0)
     """Approach pitches to try, most vertical first. 90 is straight down; the
     shallower ones buy reach at the workspace edge."""
+    grasp_close_margin_m: float = 0.004
+    """Metres the jaw is commanded past the planned grasp width so it squeezes.
+    An MG90S stalls against the object and draws current for as long as the
+    squeeze lasts; measure the stall current on the bench and lower this
+    (likely 1-2 mm) rather than raise it. Read by
+    :class:`mfw.hardware.controller.RemoteController` (``GRASP_CLOSE_MARGIN_M``)."""
+    heartbeat_s: float = 1.0
+    """Period of the laptop's ``get_state`` heartbeat to ``robot_server``. The
+    server detaches the arm after ``host_timeout_s`` (default 5 s) with no
+    request, so a dead laptop cannot leave the servos holding; the heartbeat
+    keeps an idle but alive laptop attached. Must stay well under the server's
+    bound (validated < 2.5 s, half of the default)."""
 
     ARM_BRIDGES = ("uno_serial", "pca9685", "fake")
     PIXEL_ANCHORS = ("bottom_center", "center")
@@ -1064,6 +1115,13 @@ class HardwareConfig:
                 raise ConfigError(f"hardware.{name} must be > 0")
         if self.settle_steps_after_motion < 0:
             raise ConfigError("hardware.settle_steps_after_motion must be >= 0")
+        if not self.grasp_close_margin_m >= 0.0:
+            raise ConfigError("hardware.grasp_close_margin_m must be >= 0")
+        if not 0.0 < self.heartbeat_s < 2.5:
+            raise ConfigError(
+                "hardware.heartbeat_s must be in (0, 2.5) s: robot_server relaxes the arm "
+                "after host_timeout_s (default 5 s) without a request"
+            )
         self.arm.validate()
         for label, size in self.object_sizes.items():
             if len(size) != 3 or any(s <= 0.0 for s in size):
