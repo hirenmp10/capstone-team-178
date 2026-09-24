@@ -8,7 +8,7 @@ on Windows and takes the simulator with it, and torch has no business sharing a
 process with the renderer. A crash here costs one transcription instead of the
 session.
 
-Two engines, same output protocol, chosen with ``--asr``:
+Three engines, same output protocol, chosen with ``--asr``:
 
 * ``whisper``  -- faster-whisper. Light, CPU-friendly, returns a per-segment
   confidence that the caller's low-confidence gate can act on.
@@ -16,11 +16,16 @@ Two engines, same output protocol, chosen with ``--asr``:
   Substantially more accurate, needs a GPU and the NeMo toolkit from git trunk.
   It exposes **no per-utterance confidence**, so it reports a fixed 1.0 and the
   caller's confidence gate is effectively inert -- see ``CANARY_CONFIDENCE``.
+* ``parakeet`` -- NVIDIA Parakeet-TDT-0.6B-v2, INT8, through sherpa-onnx on the
+  CPU. This is the engine that runs on the Jetson Orin Nano (1-1.5 GB RSS where
+  Canary needs > 8 GB) at a published +0.09 pp WER cost, and it is the only one
+  of the three that can report a real per-utterance confidence.
 
 Launch with a system Python, not ``python.bat``:
 
     python scripts/speech_worker.py --asr whisper --model base.en
     python scripts/speech_worker.py --asr canary --device cuda
+    python scripts/speech_worker.py --asr parakeet --serve --host 0.0.0.0
     python scripts/speech_worker.py --stdin            # typed lines, no audio
 """
 
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import tempfile
 import wave
@@ -40,6 +46,23 @@ SAMPLE_RATE = 16000
 #: not a measurement -- but it does mean the caller's low-confidence gate cannot
 #: filter Canary output. Use --asr whisper if that gate matters to you.
 CANARY_CONFIDENCE = 1.0
+
+#: The k2-fsa release asset for Parakeet. sherpa-onnx ships the NeMo transducer
+#: pre-exported and INT8-quantised, so nothing is converted locally -- the four
+#: files below are the whole model. Kept under the user's cache rather than the
+#: repo because the archive is ~600 MB.
+PARAKEET_MODEL_NAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+PARAKEET_RELEASE_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    f"{PARAKEET_MODEL_NAME}.tar.bz2"
+)
+PARAKEET_DEFAULT_MODEL_DIR = Path.home() / ".cache" / "mfw" / PARAKEET_MODEL_NAME
+PARAKEET_REQUIRED_FILES = (
+    "encoder.int8.onnx",
+    "decoder.int8.onnx",
+    "joiner.int8.onnx",
+    "tokens.txt",
+)
 
 
 #: Where protocol lines go. Replaced by :func:`serve_forever` with a socket
@@ -232,11 +255,136 @@ class CanaryEngine:
         return [(text, CANARY_CONFIDENCE)] if text else []
 
 
-def build_engine(asr: str, model: str, device: str):
+class ParakeetEngine:
+    """NVIDIA Parakeet-TDT-0.6B-v2 (INT8) via sherpa-onnx's offline transducer.
+
+    Chosen for the Jetson: Canary cannot be quantised for it and does not fit in
+    8 GB, whereas this model runs on four Cortex-A78 cores at a real-time factor
+    around 0.09 (published for the A76) -- 0.3-1.6 s per spoken command -- inside
+    1-1.5 GB. The published accuracy cost against Canary is +0.09 pp WER on
+    LibriSpeech, which is far below the noise a cheap USB microphone adds.
+
+    Confidence: a transducer emits a log-probability per token, and sherpa-onnx
+    exposes them on the result as ``ys_log_probs`` in recent builds. When present,
+    ``exp(mean)`` gives a 0-1 figure the caller's low-confidence gate can act on
+    -- which Canary never offered. Whether the installed binding exposes it is
+    checked at runtime rather than assumed; if it does not, 1.0 is reported, and
+    that constant is documented as such rather than dressed up as a measurement.
+
+    No model is downloaded here. Loading a model is the operator's decision on a
+    board with a 7.6 GB budget, and an unexpected 600 MB fetch inside a service
+    start is exactly the kind of surprise that makes a demo fail.
+    """
+
+    name = "parakeet"
+
+    def __init__(
+        self,
+        model_dir: str | Path | None = None,
+        num_threads: int = 4,
+        provider: str = "cpu",
+    ) -> None:
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise SystemExit(
+                "sherpa-onnx is not installed in this interpreter, so Parakeet cannot load.\n"
+                f"  {exc}\n\n"
+                "Install it into THIS interpreter (it is a small CPU-only wheel):\n"
+                "    python -m pip install sherpa-onnx\n\n"
+                "Or use another engine:  --asr whisper"
+            ) from exc
+
+        self.model_dir = Path(model_dir or PARAKEET_DEFAULT_MODEL_DIR).expanduser()
+        missing = [name for name in PARAKEET_REQUIRED_FILES if not (self.model_dir / name).is_file()]
+        if missing:
+            raise SystemExit(
+                f"Parakeet model files missing from {self.model_dir}: {', '.join(missing)}\n\n"
+                + self.download_hint(self.model_dir)
+            )
+
+        log(
+            f"loading {PARAKEET_MODEL_NAME} from {self.model_dir} "
+            f"(threads={num_threads}, provider={provider})..."
+        )
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=str(self.model_dir / "encoder.int8.onnx"),
+            decoder=str(self.model_dir / "decoder.int8.onnx"),
+            joiner=str(self.model_dir / "joiner.int8.onnx"),
+            tokens=str(self.model_dir / "tokens.txt"),
+            num_threads=num_threads,
+            sample_rate=SAMPLE_RATE,
+            feature_dim=80,
+            decoding_method="greedy_search",
+            model_type="nemo_transducer",
+            provider=provider,
+        )
+        log(f"parakeet ready (provider={provider}, threads={num_threads})")
+
+    @staticmethod
+    def download_hint(model_dir: str | Path | None = None) -> str:
+        """How to fetch the model by hand. Nothing here downloads anything."""
+        target = Path(model_dir or PARAKEET_DEFAULT_MODEL_DIR).expanduser()
+        return (
+            f"Download the k2-fsa release asset {PARAKEET_MODEL_NAME}.tar.bz2 and unpack\n"
+            f"it so that {target} contains {', '.join(PARAKEET_REQUIRED_FILES)}:\n"
+            f"    mkdir -p {target.parent}\n"
+            f"    curl -L -o {PARAKEET_MODEL_NAME}.tar.bz2 {PARAKEET_RELEASE_URL}\n"
+            f"    tar xjf {PARAKEET_MODEL_NAME}.tar.bz2 -C {target.parent}\n"
+            "Or point --model-dir at an existing copy."
+        )
+
+    def transcribe(self, samples) -> list[tuple[str, float]]:
+        """Decode one float32, 16 kHz, mono utterance."""
+        import numpy as np
+
+        samples = np.ascontiguousarray(normalise_audio(np, samples), dtype=np.float32)
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, samples)
+        self._recognizer.decode_stream(stream)
+        result = stream.result
+
+        text = (result.text or "").strip()
+        if not text:
+            return []
+        return [(text, self.confidence_of(result))]
+
+    @staticmethod
+    def confidence_of(result) -> float:
+        """``exp(mean(ys_log_probs))`` when the binding exposes it, else 1.0.
+
+        Clamped to [0, 1] so a binding that reports linear probabilities under the
+        same name cannot produce a confidence above one.
+        """
+        log_probs = getattr(result, "ys_log_probs", None)
+        if log_probs is None:
+            return 1.0
+        values = [float(v) for v in log_probs]
+        if not values:
+            return 1.0
+        return float(min(1.0, max(0.0, math.exp(sum(values) / len(values)))))
+
+
+def build_engine(
+    asr: str,
+    model: str = "base.en",
+    device: str = "cpu",
+    model_dir: str | Path | None = None,
+):
+    """Construct the engine named by ``--asr``.
+
+    ``model`` is whisper's size name; ``model_dir`` is Parakeet's export folder;
+    ``device`` is honoured by whisper and Canary and selects Parakeet's
+    onnxruntime provider (``cuda`` only if a GPU build of sherpa-onnx is installed
+    -- the CPU build is the one measured for the Jetson budget).
+    """
     if asr == "whisper":
         return WhisperEngine(model, device)
     if asr == "canary":
         return CanaryEngine(device)
+    if asr == "parakeet":
+        provider = "cuda" if device == "cuda" else "cpu"
+        return ParakeetEngine(model_dir=model_dir, num_threads=4, provider=provider)
     raise SystemExit(f"unknown ASR engine {asr!r}")
 
 
@@ -528,7 +676,12 @@ def record_utterance(
 
 
 def run_microphone_mode(
-    asr: str, model_name: str, device: str, chunk_seconds: float, silence_threshold: float
+    asr: str,
+    model_name: str,
+    device: str,
+    chunk_seconds: float,
+    silence_threshold: float,
+    model_dir: str | None = None,
 ) -> int:
     try:
         import numpy as np
@@ -543,7 +696,7 @@ def run_microphone_mode(
         return 2
 
     emit_event("loading", engine=asr)
-    engine = build_engine(asr, model_name, device)
+    engine = build_engine(asr, model_name, device, model_dir)
 
     # The operator's cue that the microphone is genuinely live.
     emit_event("ready", engine=asr, chunk_seconds=chunk_seconds, warm=False)
@@ -628,6 +781,7 @@ def serve_forever(
     device: str,
     chunk_seconds: float,
     silence_threshold: float,
+    model_dir: str | None = None,
 ) -> int:
     """Load the model once and serve transcripts to clients over TCP.
 
@@ -653,7 +807,7 @@ def serve_forever(
         return 2
 
     log(f"loading {asr} model (one time)...")
-    engine = build_engine(asr, model_name, device)
+    engine = build_engine(asr, model_name, device, model_dir)
     log("model resident - clients now attach instantly")
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -697,8 +851,16 @@ def serve_forever(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Speech recognition worker")
-    parser.add_argument("--asr", default="whisper", choices=["whisper", "canary"])
-    parser.add_argument("--model", default="base.en", help="whisper model (ignored for canary)")
+    parser.add_argument("--asr", default="whisper", choices=["whisper", "canary", "parakeet"])
+    parser.add_argument(
+        "--model", default="base.en", help="whisper model (ignored for canary/parakeet)"
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=None,
+        help="parakeet only: folder holding the sherpa-onnx export "
+        f"(default {PARAKEET_DEFAULT_MODEL_DIR}); never downloaded automatically",
+    )
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--chunk-seconds", type=float, default=4.0)
     parser.add_argument(
@@ -795,9 +957,15 @@ def main(argv: list[str] | None = None) -> int:
             args.device,
             args.chunk_seconds,
             args.silence_threshold,
+            args.model_dir,
         )
     return run_microphone_mode(
-        args.asr, args.model, args.device, args.chunk_seconds, args.silence_threshold
+        args.asr,
+        args.model,
+        args.device,
+        args.chunk_seconds,
+        args.silence_threshold,
+        args.model_dir,
     )
 
 

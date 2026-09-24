@@ -32,7 +32,7 @@ from mfw.core.types import Frame, JointState, Pose, SceneGraph, Trajectory
 from mfw.motion.trajectory import densify_path, max_joint_step, time_parameterise
 from mfw.utils.logging import EventLogger, get_logger
 
-__all__ = ["LulaMotionPlanner"]
+__all__ = ["LulaMotionPlanner", "interpolate_pose"]
 
 _log = get_logger("motion.planner")
 
@@ -361,7 +361,7 @@ class LulaMotionPlanner(IMotionPlanner):
 
         for i in range(1, steps + 1):
             fraction = i / steps
-            waypoint_pose = _interpolate_pose(current_pose, goal_pose, fraction)
+            waypoint_pose = interpolate_pose(current_pose, goal_pose, fraction)
             solution = self._robot.inverse_kinematics(waypoint_pose, seed=seed)
             if solution is None:
                 self._emit(
@@ -475,8 +475,11 @@ class LulaMotionPlanner(IMotionPlanner):
             self._events.emit(event, payload)
 
 
-def _interpolate_pose(start: Pose, end: Pose, fraction: float) -> Pose:
+def interpolate_pose(start: Pose, end: Pose, fraction: float) -> Pose:
     """Linear position interpolation with SLERP orientation.
+
+    Public because it is Isaac-free and the hardware lane's Cartesian planner
+    steps along the same line; two copies of a SLERP would drift apart.
 
     SLERP rather than component-wise quaternion lerp: a naive lerp does not
     travel at constant angular rate and can pass through a non-unit quaternion,
@@ -506,3 +509,7 @@ def _interpolate_pose(start: Pose, end: Pose, fraction: float) -> Pose:
         )
 
     return Pose(position, quat / np.linalg.norm(quat), Frame.WORLD)
+
+
+# Former private name, kept so nothing that imported it breaks.
+_interpolate_pose = interpolate_pose

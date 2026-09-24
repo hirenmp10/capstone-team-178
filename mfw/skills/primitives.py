@@ -346,6 +346,19 @@ class GoHome(Skill):
 
     skill_name = "go_home"
 
+    #: Retreats tried, in order, when the arm cannot plan home from where it
+    #: stands. Straight up first: it is the shortest escape and the one that
+    #: works after an ordinary pick. Then higher. Then up-and-back, which is
+    #: what frees the arm when the table edge rather than the height is what
+    #: blocks the local configuration space -- the case a pure lift cannot fix,
+    #: and the one that left the arm stranded after a place.
+    _RETREAT_OFFSETS = (
+        np.array([0.0, 0.0, 0.15]),
+        np.array([0.0, 0.0, 0.25]),
+        np.array([-0.10, 0.0, 0.20]),
+        np.array([-0.18, 0.0, 0.10]),
+    )
+
     def _run(self, params: dict[str, Any]) -> SkillResult:
         home = np.asarray(self.ctx.config.robot.home_joint_positions, dtype=np.float64)
         scene = self.ctx.vision.require_fresh_scene()
@@ -354,37 +367,78 @@ class GoHome(Skill):
         robot = self.ctx.robot
 
         trajectory = planner.plan_to_joint(robot.get_state().joint_state, home, scene)
-
         if trajectory is None:
-            # Commonly the arm has just finished a pick or place and is sitting
-            # low, close to the workspace, where much of the local configuration
-            # space is blocked and RRT rejects the start state outright. Lifting
-            # clear first turns an impossible query into an easy one, and is the
-            # same recovery Place uses for its transit.
-            lifted = Pose(
-                _clamp_to_workspace(
-                    self.ctx, robot.tcp_pose().position + np.array([0.0, 0.0, 0.15])
-                ),
-                robot.tcp_pose().quat,
-                Frame.WORLD,
-            )
-            retreat = planner.plan_cartesian_line(robot.get_state().joint_state, lifted, scene)
-            if retreat is not None and controller.follow_trajectory(retreat):
-                _log.debug("Lifted clear of the workspace; replanning the path home")
-                scene = self.ctx.vision.require_fresh_scene()
-                trajectory = planner.plan_to_joint(
-                    robot.get_state().joint_state, home, scene
-                )
+            trajectory = self._escape_then_plan_home(home)
 
         if trajectory is None:
             return self._infeasible(
-                "no collision-free path home, even after lifting clear of the workspace"
+                "no collision-free path home after "
+                f"{len(self._RETREAT_OFFSETS)} retreat attempts"
             )
         if not controller.follow_trajectory(trajectory):
             return self._fail("motion home aborted")
 
         error = float(np.max(np.abs(robot.get_arm_joint_positions() - home)))
         return self._ok(f"at home posture (max joint error {error:.3f} rad)")
+
+    def _escape_then_plan_home(self, home: NDArray[np.float64]) -> Any:
+        """Retreat out of the blocked region, then re-plan the path home.
+
+        Why a ladder rather than one lift. After a pick or place the arm sits
+        low and close to the table, where enough of the local configuration
+        space is blocked that RRT rejects the start state outright -- and a
+        rejected *start* cannot be rescued by re-seeding the tree, only by
+        moving somewhere else first. The previous version tried exactly one
+        +150 mm lift and, if that single straight line had no IK solution, gave
+        up: measured after a place, that left the arm stranded with "no
+        collision-free path home" and only a restart to recover from.
+
+        Each offset is attempted twice, straight line first. ``plan_cartesian_line``
+        is preferred because it is short and predictable, but it solves IK at
+        every waypoint and fails outright when any one of them has no solution.
+        RRT can still route around that, so the same target is retried with
+        ``plan_with_retries`` -- which also varies the IK branch, the fix that
+        made the pregrasp reachable.
+
+        Retreats accumulate: a partial escape that does not yet free the arm
+        still leaves it somewhere better for the next offset to work from.
+        """
+        planner = self.ctx.planner
+        controller = self.ctx.controller
+        robot = self.ctx.robot
+
+        for index, offset in enumerate(self._RETREAT_OFFSETS, start=1):
+            tcp = robot.tcp_pose()
+            target = Pose(
+                _clamp_to_workspace(self.ctx, tcp.position + offset),
+                tcp.quat,
+                Frame.WORLD,
+            )
+            scene = self.ctx.vision.require_fresh_scene()
+
+            retreat = planner.plan_cartesian_line(
+                robot.get_state().joint_state, target, scene
+            )
+            if retreat is None:
+                retreat = planner.plan_with_retries(
+                    robot.get_state().joint_state, target, scene
+                )
+            if retreat is None:
+                _log.debug("Retreat %d: no motion to %s", index, offset.tolist())
+                continue
+            if not controller.follow_trajectory(retreat):
+                _log.debug("Retreat %d aborted mid-motion", index)
+                continue
+
+            scene = self.ctx.vision.require_fresh_scene()
+            trajectory = planner.plan_to_joint(
+                robot.get_state().joint_state, home, scene
+            )
+            if trajectory is not None:
+                _log.info("Path home found after retreat %d %s", index, offset.tolist())
+                return trajectory
+
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -453,6 +507,19 @@ class Pick(Skill):
             return "already holding something; place or release it first"
         return None
 
+    def _generate(self, obj: Any, scene: Any) -> list[Any]:
+        """Grasp candidates for ``obj``, from the injected generator when there is one.
+
+        The sim lane leaves ``ctx.grasp_generator`` unset and keeps the direct
+        OBB synthesis. The hardware lane injects a top-down generator: its
+        perception has no depth, so the "box" is a size-table entry, and a
+        jaw with no wrist roll cannot meet an arbitrary box axis anyway.
+        """
+        generator = getattr(self.ctx, "grasp_generator", None)
+        if generator is not None:
+            return list(generator.generate(scene, obj.track_id))
+        return generate_grasp_candidates(obj, self.ctx.config.grasp)
+
     def _run(self, params: dict[str, Any]) -> SkillResult:
         # 1. Perceive. Never act on a remembered pose.
         self.ctx.sim.render_step(2)
@@ -461,7 +528,30 @@ class Pick(Skill):
         obj = scene.objects[track_id]
 
         # 2. Synthesise and rank grasps from the perceived geometry.
-        candidates = generate_grasp_candidates(obj, self.ctx.config.grasp)
+        candidates = self._generate(obj, scene)
+        hardware_generator = getattr(self.ctx, "grasp_generator", None) is not None
+        narrow_enough = float(np.min(obj.bbox.extents[:2])) <= self.ctx.config.grasp.max_grasp_width
+        if hardware_generator and narrow_enough and (getattr(obj, "attributes", None) or {}).get("yaw_ambiguous"):
+            # Depthless perception only (the sim lane never sets it): the pixel
+            # box fits neither the along-X nor the across orientation well
+            # enough, so both the centre and the chord the candidates were
+            # checked against are guesses. A wrong one closes the jaw on air,
+            # or drives the fingers onto the body.
+            return self._infeasible(
+                f"cannot tell precisely which way the {obj.label} is lying (the camera sees it "
+                "at an angle), so the jaw could miss it; turn it to point straight at the "
+                "arm's base and ask again"
+            )
+        if not candidates and hardware_generator and narrow_enough:
+            # Hardware lane: the jaw cannot rotate about the tool axis, so an
+            # object narrow enough overall can still be too wide *across the
+            # jaw* the way it is lying. Saying "19 mm, the gripper spans 35 mm"
+            # there is a contradiction the student cannot act on.
+            return self._infeasible(
+                f"the {obj.label} is narrow enough ({np.min(obj.bbox.extents[:2]) * 1000:.0f} mm) "
+                "but not lying the way this jaw closes (it cannot rotate); turn it to point "
+                "straight at the arm's base and ask again"
+            )
         if not candidates:
             return self._infeasible(
                 f"{obj.label!r} is {np.min(obj.bbox.extents) * 1000:.0f} mm at its narrowest; "
@@ -514,7 +604,7 @@ class Pick(Skill):
                         f"{last_error} (and {obj.label!r} is no longer visible to retry)"
                     )
 
-                regenerated = generate_grasp_candidates(moved, self.ctx.config.grasp)
+                regenerated = self._generate(moved, fresh)
                 reranked = self.ctx.grasp_scorer.score(
                     regenerated, fresh, self.ctx.robot.get_state()
                 )
@@ -528,6 +618,21 @@ class Pick(Skill):
             outcome = self._attempt_grasp(grasp, obj, scene)
             if outcome.ok:
                 return outcome
+            if not self.ctx.config.robot.gripper_feedback and (
+                outcome.data.get("verification_failed") or outcome.data.get("jaw_closed")
+            ):
+                # Without gripper feedback the verdict comes from pixels and can
+                # be wrong in either direction, and the jaw is closed at lift
+                # height. A retry would open it there -- dropping the object if
+                # it *is* held -- and its own failure would then replace this
+                # message with an unrelated one (review F1/F3). Stop here: the
+                # verifier's reason is the answer, and a human decides.
+                return self._infeasible(
+                    f"{outcome.message}. The jaw is left closed in case "
+                    f"{obj.label!r} is held: look at the gripper, then say 'open the gripper' "
+                    "to release it",
+                    **outcome.data,
+                )
             last_error = outcome.message
 
         return self._fail(f"all grasp attempts failed: {last_error}")
@@ -594,6 +699,42 @@ class Pick(Skill):
             _log.info("Re-centred the grasp by %.1f mm from the standoff view", shift * 1000.0)
         return Pose(corrected, grasp.pose.quat, Frame.WORLD)
 
+    def _reference_view(self, track_id: str, planning_scene: Any) -> Any:
+        """The pre-descent scene the feedback-less verdict compares against.
+
+        Observed now, from the standoff, before the jaw descends. If the arm
+        at the standoff already hides the target, the scene the grasp was
+        planned from (taken before the arm moved over it) is used instead,
+        provided the target was actually detected in it. Either way the
+        verifier checks the target was seen *in that very observation*, so a
+        track the tracker merely kept alive never becomes a reference.
+        """
+        try:
+            view = self.ctx.vision.observe()
+        except Exception as exc:  # noqa: BLE001 - fall back to the planning view
+            _log.warning("Pre-descent observation failed (%s); using the planning view", exc)
+            return planning_scene
+        target = view.get(track_id)
+        if target is not None and target.last_seen_step >= view.step_index:
+            return view
+        planned = planning_scene.get(track_id)
+        if planned is not None and planned.last_seen_step >= planning_scene.step_index:
+            _log.info("Target hidden from the standoff; the planning view is the pre-descent reference")
+            return planning_scene
+        return view
+
+    def _lift_prediction(self, scene_before: Any, track_id: str) -> Any:
+        """What the target should look like now if it is held (``None``: no predictor)."""
+        predictor = getattr(self.ctx.vision, "predict_lift", None)
+        target = scene_before.get(track_id) if scene_before is not None else None
+        if predictor is None or target is None:
+            return None
+        try:
+            return predictor(target, self.ctx.robot.tcp_pose())
+        except Exception as exc:  # noqa: BLE001 - verdict falls back to bare pixel growth
+            _log.warning("Lift prediction failed (%s); verifying from pixel growth alone", exc)
+            return None
+
     def _attempt_grasp(self, grasp: Any, obj: Any, scene: Any) -> SkillResult:
         planner = self.ctx.planner
         controller = self.ctx.controller
@@ -612,6 +753,18 @@ class Pick(Skill):
                 return self._fail("no path to the pregrasp standoff")
             if not controller.follow_trajectory(approach_plan):
                 return self._fail("motion to the pregrasp standoff aborted")
+
+            feedback = bool(self.ctx.config.robot.gripper_feedback)
+            before_descent = None
+            if not feedback:
+                # Without gripper feedback the verdict compares the object's
+                # pixel box before and after. Observed after the descent, the
+                # arm is parked over the object and a small one is already
+                # hidden -- its later absence then proves nothing (review:
+                # "before scene observed with the arm over the object"). So
+                # the reference is taken here, from the standoff, and the sim
+                # lane keeps its post-descent observation below.
+                before_descent = self._reference_view(grasp.target_track_id, scene)
 
             # 4b. Re-observe from the standoff and re-centre the grasp.
             #
@@ -635,9 +788,12 @@ class Pick(Skill):
             # *where* the fingers close without changing *how* is the whole
             # point.
             grasp_pose = grasp.pose
-            recentred = self._recentre_from_standoff(grasp)
-            if recentred is not None:
-                grasp_pose = recentred
+            if self.ctx.config.grasp.recentre_from_standoff:
+                # Off on the hardware lane: one fixed overhead camera sees
+                # the same thing from the standoff as it did before.
+                recentred = self._recentre_from_standoff(grasp)
+                if recentred is not None:
+                    grasp_pose = recentred
 
             # 5. Straight-line approach. A curved path would sweep the fingers
             #    sideways through the object.
@@ -649,9 +805,17 @@ class Pick(Skill):
             if not controller.follow_trajectory(descent):
                 return self._fail("approach aborted")
 
-            scene_before_lift = self.ctx.vision.observe()
+            if feedback:
+                scene_before_lift = self.ctx.vision.observe()
+            else:
+                scene_before_lift = before_descent
 
-            # 6. Force-limited close. Real contact, real friction.
+            # 6. Force-limited close. Real contact, real friction. A controller
+            #    that can close to a width (hobby servos, no force limit) is
+            #    told the chord the candidate was checked against, so the jaw
+            #    squeezes the object instead of stalling against it.
+            if hasattr(self.ctx.controller, "set_grasp_width"):
+                self.ctx.controller.set_grasp_width(grasp.width)
             closed_width = controller.close_gripper_blocking()
 
             # 7. Lift straight up, re-asserting the grip every step. Without
@@ -676,11 +840,20 @@ class Pick(Skill):
                 return True
 
             if not controller.follow_trajectory(lift, on_step=hold_grip):
-                return self._fail("lift aborted")
+                if feedback:
+                    return self._fail("lift aborted")
+                # Stopped part-way up with the jaw closed on whatever it
+                # holds: the retry's open would drop it (see _run).
+                return self._fail("lift aborted", jaw_closed=True)
 
             # 8. Verify from evidence, not from having issued the commands.
             self.ctx.sim.render_step(3)
             scene_after = self.ctx.vision.observe()
+            extra: dict[str, Any] = {}
+            prediction = None
+            if not feedback:
+                prediction = self._lift_prediction(scene_before_lift, grasp.target_track_id)
+                extra["lift_prediction"] = prediction
             evidence = verify_grasp(
                 robot=robot,
                 scene_before=scene_before_lift,
@@ -688,11 +861,23 @@ class Pick(Skill):
                 track_id=grasp.target_track_id,
                 closed_width=self.ctx.config.robot.gripper_closed_width,
                 expected_height_gain=lift_height,
+                gripper_feedback=self.ctx.config.robot.gripper_feedback,
+                min_displacement=self.ctx.config.grasp.verify_min_displacement,
+                **extra,
             )
-            self.ctx.emit("pick.verification", {"target": grasp.target_track_id, **evidence.to_log()})
+            payload = {"target": grasp.target_track_id, **evidence.to_log()}
+            if not feedback:
+                payload["before_view"] = "planning" if scene_before_lift is scene else "standoff"
+            if prediction is not None:
+                payload["lift_prediction"] = prediction.to_log()
+            self.ctx.emit("pick.verification", payload)
 
             if not evidence.holding:
-                return self._fail(evidence.reason())
+                if feedback:
+                    return self._fail(evidence.reason())
+                return self._fail(
+                    evidence.reason(), verification_failed=True, evidence=evidence.to_log()
+                )
 
             if self.ctx.memory is not None:
                 self.ctx.memory.set_held_object(grasp.target_track_id)
@@ -873,18 +1058,36 @@ class Place(Skill):
             self.ctx.sim.render_step(3)
             after = self.ctx.vision.observe()
             placed = after.get(held_id)
+            if self.ctx.config.robot.gripper_feedback:
+                settled = (
+                    float(np.linalg.norm(placed.pose.position - release_pose.position))
+                    if placed is not None
+                    else float("inf")
+                )
+                return self._ok(
+                    f"placed at {description}"
+                    + (f" (settled {settled * 1000:.0f} mm from the target)" if placed else ""),
+                    track_id=held_id,
+                    release_position=release_pose.position.tolist(),
+                    settled_offset=settled,
+                )
+
+            # Depthless lane: the estimator pins every object's z to the table
+            # (support + half its size-table height), so a marker placed in a
+            # bowl reads ~70 mm "below" a release height of 0.08 m -- a vertical
+            # miss that never happened. Only the table-plane offset is measured.
             settled = (
-                float(np.linalg.norm(placed.pose.position - release_pose.position))
+                float(np.linalg.norm(placed.pose.position[:2] - release_pose.position[:2]))
                 if placed is not None
                 else float("inf")
             )
-
             return self._ok(
                 f"placed at {description}"
-                + (f" (settled {settled * 1000:.0f} mm from the target)" if placed else ""),
+                + (f" (settled {settled * 1000:.0f} mm from the target, horizontally)" if placed else ""),
                 track_id=held_id,
                 release_position=release_pose.position.tolist(),
                 settled_offset=settled,
+                settled_offset_axes="xy",
             )
         finally:
             planner.include_in_collision(held_id)
@@ -937,20 +1140,117 @@ class Place(Skill):
                         top + clearance + 0.03,
                     ]
                 )
+            # Aim the OBJECT at the destination, not the hand.
+            #
+            # Everything above positions the TCP over the destination's centre,
+            # which is only the same thing when the object sits exactly at the
+            # fingertips. It does not. Measured while held, the marker's centre
+            # is 22-26 mm from the TCP, and because a 118 mm marker is gripped
+            # near one end that offset is mostly sideways. Put the hand over the
+            # middle of a 172 mm bowl and the marker itself hangs over the rim,
+            # which is where it lands.
+            #
+            # Compensating means the release point is wherever the hand has to
+            # be for the *object* to end up on target. Only XY is corrected: the
+            # height already comes from the destination's own surface, and the
+            # perceived z of a gripper-occluded object is not worth trusting.
+            position = self._aim_object_not_hand(position, scene, held_id)
             return Pose(position, current_quat, Frame.WORLD), (
                 f"{relation} {destination.label!r}"
             )
 
-        # No destination given: put it down where it is, on the support surface.
-        current = self.ctx.robot.tcp_pose()
+        # No destination given: put it back where it was picked up.
+        #
+        # Releasing at the hand's current XY looks equivalent and is not. The
+        # hand is wherever the last command left it -- after "move up 10 cm" it
+        # has also drifted a centimetre or two sideways, and after a re-centred
+        # grasp it is offset from the object's origin. Measured on the mug: the
+        # release landed far enough off that the mug rolled out of the scene
+        # entirely and knocked the bottle flat on its way, turning one
+        # successful pick into two displaced objects and a "success" log.
+        #
+        # The pick origin is recovered from the scene memory snapshotted when
+        # the object was grasped, so "place it" is the inverse of "pick it up".
+        # Height still comes from the support surface rather than the recorded
+        # centre: perception measures a held object through a partly occluding
+        # gripper, and trusting that z would release it into the table.
+        origin_xy: NDArray[np.float64] | None = None
+        picked_from = (
+            self.ctx.memory.scene_at_pick() if self.ctx.memory is not None else None
+        )
+        if picked_from is not None:
+            resting = picked_from.get(held_id)
+            if resting is not None:
+                origin_xy = np.asarray(resting.bbox.center.position[:2], dtype=np.float64)
+
+        if origin_xy is None:
+            # No usable snapshot (picked before the first observe, or the track
+            # was lost). The hand's position is a worse answer, but it is the
+            # only one left, and refusing to place would strand the object.
+            origin_xy = np.asarray(self.ctx.robot.tcp_pose().position[:2], dtype=np.float64)
+            where = "the current position"
+        else:
+            where = "where it was picked up"
+
         position = np.array(
             [
-                current.position[0],
-                current.position[1],
+                origin_xy[0],
+                origin_xy[1],
                 self.ctx.support_height + clearance + self._held_half_height(scene, held_id),
             ]
         )
-        return Pose(position, current_quat, Frame.WORLD), "the current position"
+        return Pose(position, current_quat, Frame.WORLD), where
+
+    #: Ignore a compensation larger than this. The held object's pose comes from
+    #: perception looking past a gripper that occludes it, so a bad frame can
+    #: put its "centre" somewhere absurd. Beyond this the offset is not a grasp
+    #: offset, it is a mis-detection, and shifting the release by it would throw
+    #: the object further than doing nothing at all.
+    _MAX_AIM_CORRECTION_M = 0.12
+
+    def _aim_object_not_hand(
+        self, position: NDArray[np.float64], scene: Any, held_id: str
+    ) -> NDArray[np.float64]:
+        """Shift a destination so the held object, not the TCP, lands on it.
+
+        Not on the depthless lane (``robot.gripper_feedback`` false): there
+        the held object's perceived centre is the table-plane point its
+        *lifted* box maps to, parallax-shifted 7-29 mm from where it really
+        hangs, so the "offset" is a camera artefact. Measured on the honest
+        fake lane: a marker held dead centre read 28 mm off, the release was
+        moved 28 mm the wrong way and the lowering had no plan. The top-down
+        grasp there is aimed at the object's centre, so no correction is the
+        better estimate.
+        """
+        if not self.ctx.config.robot.gripper_feedback:
+            return position
+        held = scene.get(held_id)
+        if held is None:
+            return position
+
+        tcp = self.ctx.robot.tcp_pose()
+        offset = np.asarray(held.bbox.center.position, dtype=np.float64)[:2] - np.asarray(
+            tcp.position, dtype=np.float64
+        )[:2]
+
+        magnitude = float(np.linalg.norm(offset))
+        if magnitude > self._MAX_AIM_CORRECTION_M:
+            _log.debug(
+                "Ignoring %.0f mm aim correction for %s: larger than a plausible "
+                "grasp offset, so the held pose is probably a mis-detection",
+                magnitude * 1000.0,
+                held_id,
+            )
+            return position
+
+        corrected = np.array(position, dtype=np.float64)
+        corrected[:2] -= offset
+        if magnitude > 0.005:
+            _log.info(
+                "Aim corrected by %.0f mm so the object lands on target, not the hand",
+                magnitude * 1000.0,
+            )
+        return corrected
 
     def _held_half_height(self, scene: Any, held_id: str, fallback: float = 0.03) -> float:
         """Half the height of the held object, from perception.

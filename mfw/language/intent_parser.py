@@ -192,11 +192,52 @@ class RuleBasedIntentParser(IIntentParser):
             return Intent("stop", {}, 1.0)
         return None
 
+    #: "drop" followed by a destination ("drop it in the bowl") is a place, not a
+    #: gripper release. This matcher runs before ``_match_place`` -- deliberately,
+    #: so a bare "drop it" stays the instant, plan-free release it should be -- so
+    #: it has to step aside itself when a relation phrase follows the verb.
+    #:
+    #: The relation must be followed by a word that names something. "drop it in"
+    #: / "drop in" (a trailing preposition, no object named) is still the instant
+    #: release: without a destination there is nothing to plan, and a ``place``
+    #: with empty params would carry the object back to its pick origin instead
+    #: of opening the jaw where the operator is pointing. The same goes for a
+    #: tail made only of words the robot cannot resolve to an object (review
+    #: finding F4): articles ("drop it in the"), deictics ("drop it in there"
+    #: points at the table), politeness ("drop it in please"), and the "top"/"of"
+    #: left over when "on top of" is cut short ("drop it on top"), and pronouns
+    #: ("drop it in it", "drop it on that one", "drop it in them"): a pronoun
+    #: names no destination, and ``place`` would hand memory a referent that
+    #: usually resolves to the held object itself. A stacked relation word
+    #: ("drop it on in it") names nothing either. Every one of those released
+    #: the gripper before phase 9 and still does.
+    _DROP_RELATION = re.compile(
+        r"\bdrop\b.*?\b(?:on top of|next to|in|inside|into|on|onto|beside|near)\b(?P<tail>.*)$"
+    )
+    _NOT_A_TARGET = frozenset(
+        {"the", "a", "an", "that", "this", "my", "there", "here", "please", "now", "top", "of"}
+    ) | frozenset(_PRONOUNS) | frozenset(word for phrase in _RELATION_WORDS for word in phrase.split())
+
+    @classmethod
+    def _drop_names_a_destination(cls, text: str) -> bool:
+        """True when a "drop" utterance names somewhere to put the object.
+
+        The words after the first relation phrase must include at least one that
+        is not an article, deictic, politeness, pronoun or "top of" fragment; only
+        then is there a destination for ``_match_place`` to resolve.
+        """
+        match = cls._DROP_RELATION.search(text)
+        if match is None:
+            return False
+        return any(word not in cls._NOT_A_TARGET for word in match.group("tail").split())
+
     def _match_gripper(self, text: str) -> Intent | None:
         # "open"/"close" alone are unambiguous in a manipulation context, but
         # must not fire on "open the box", which is not a gripper command.
-        if re.search(r"\b(open|release|let go|drop)\b", text) and not re.search(
-            r"\bopen (the )?(box|door|lid|drawer)\b", text
+        if (
+            re.search(r"\b(open|release|let go|drop)\b", text)
+            and not re.search(r"\bopen (the )?(box|door|lid|drawer)\b", text)
+            and not self._drop_names_a_destination(text)
         ):
             return Intent("open_gripper", {}, 1.0)
         if re.search(r"\b(close|grip|squeeze|clamp)\b", text) and "gripper" in text:
@@ -224,6 +265,29 @@ class RuleBasedIntentParser(IIntentParser):
         r"\bdescribe (?:the )?(?:scene|table|objects?)\b",
         r"\bwhat(?: objects?)? (?:are )?(?:present|visible|available)\b",
         r"^(?:observe|look|scan the table)$",
+        # Hardware-lane additions (phase 9). Every changed row is pinned
+        # one-for-one in tests/test_hardware_language.py::HARDWARE_MAPPINGS and
+        # every unchanged boundary row in its RESTORED table; extend those tables
+        # when you extend this tuple.
+        #
+        #   phrase                           was (pick verb "take")   now
+        #   "take a picture|photo|snapshot"  pick "picture"           observe
+        #   "... of <anything>"              pick "picture of ..."    observe
+        #   "... please" / "... now"         pick "picture"           observe
+        #   "take a picture frame"           pick "picture frame"     pick "picture frame"
+        #   "take a look" (no "at")          pick "look"              observe
+        #   "take a look at X"               look_at X                look_at X
+        #
+        # "take a picture" is a request to perceive, not to pick up an object
+        # called "picture"; it must be claimed here, before the pick matcher sees
+        # "take". The noun must END the request (allowing only the politeness
+        # filler "please"/"now" after it) or be followed by "of": anything else
+        # after it is an object name -- "take a picture frame" is a pick of the
+        # frame, and the pattern must not swallow it.
+        r"\btake a (?:picture|photo|snapshot)(?: of\b|(?: please| now)*$)",
+        # "take a look" with no object is the same request; "take a look at X" is
+        # left for the look_at matcher.
+        r"\btake a look\b(?! at\b)",
     )
 
     def _match_observe(self, text: str) -> Intent | None:
@@ -244,7 +308,21 @@ class RuleBasedIntentParser(IIntentParser):
         return None
 
     def _match_wait(self, text: str) -> Intent | None:
-        if re.search(r"\b(wait|hold on|pause|stay)\b", text):
+        # "hold" is deliberately not matched alone: "hold the can" is not a wait.
+        #
+        # Hardware-lane vocabulary (phase 9), pinned one-for-one in
+        # tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+        #
+        #   phrase               was        now    why
+        #   "hold still"         UNPARSED   wait   what a student says to a moving arm
+        #   "hold there"         UNPARSED   wait   same
+        #   "hold position"      place {}   wait   "position" is a place verb; a place
+        #                                          with no destination would carry the
+        #                                          object back to its pick origin
+        #   "stand by"/"standby" UNPARSED   wait   same request as "wait"
+        #
+        # "hold on" and "stay" already mapped to wait before phase 9.
+        if re.search(r"\b(wait|hold (?:on|still|there|position)|stand ?by|pause|stay)\b", text):
             seconds = self._find_number(text)
             return Intent("wait", {"duration": seconds if seconds is not None else 1.0}, 1.0)
         return None
@@ -277,7 +355,9 @@ class RuleBasedIntentParser(IIntentParser):
         return None
 
     def _match_place(self, text: str) -> Intent | None:
-        if not re.search(r"\b(place|put|set|drop off|position)\b", text):
+        # "drop" reaches here only with a destination; ``_match_gripper`` has
+        # already claimed the bare form.
+        if not re.search(r"\b(place|put|set|drop off|drop|position)\b", text):
             return None
 
         params: dict[str, Any] = {}
@@ -414,9 +494,12 @@ JSON:"""
 
         try:
             raw = self._complete(prompt)
-            print(f"  [QWEN INFERENCE RAW] {raw.strip()}")
+            _log.info("LLM intent raw response: %s", raw.strip())
             intent = self._parse_response(raw)
-            print(f"  [QWEN PARSED INTENT] skill='{intent.skill}', params={intent.params}, confidence={intent.confidence}")
+            _log.info(
+                "LLM intent parsed: skill=%r params=%r confidence=%.2f",
+                intent.skill, intent.params, intent.confidence,
+            )
         except Exception as exc:
             # Degrade to the grammar rather than refusing: a model outage should
             # not stop the robot understanding "stop".

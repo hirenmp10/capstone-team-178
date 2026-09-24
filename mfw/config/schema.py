@@ -15,6 +15,7 @@ the simulator.
 
 from __future__ import annotations
 
+import collections.abc as _abc
 import dataclasses
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ __all__ = [
     "SceneFurnitureConfig",
     "RandomizationConfig",
     "SceneConfig",
+    "HardwareArmConfig",
+    "HardwareConfig",
     "FrameworkConfig",
     "load_config",
     "ConfigError",
@@ -171,8 +174,39 @@ class RobotConfig:
     """Filled from the Isaac install at load time if left empty."""
     lula_urdf: str = ""
 
+    kinematics: str = "lula"
+    """Which kinematics model the arm is driven through.
+
+    ``lula`` is the Isaac/Lula solver the Franka sim lane uses and needs a
+    6+ DoF arm. ``planar_4dof`` is the closed-form model for the hardware lane's
+    hobby arm: base yaw plus three coplanar pitch joints, which is exactly four
+    joints and no more. The DoF check below keys off this field because the
+    "at least 6 DoF" rule that protects the sim lane would otherwise reject
+    every real arm this project owns."""
+    gripper_feedback: bool = True
+    """Whether the gripper can report its actual opening.
+
+    True for the Franka, whose finger joints are read back. False for PWM
+    hobby servos, which have no position feedback at all: a "closed" command
+    tells you nothing about whether anything is between the jaws. Skills use
+    this to switch grasp verification from gripper-width evidence to
+    perception-based evidence (the object is no longer where it was)."""
+
+    KINEMATICS_MODELS = ("lula", "planar_4dof")
+
     def validate(self) -> None:
-        if len(self.arm_joint_names) < 6:
+        if self.kinematics not in self.KINEMATICS_MODELS:
+            raise ConfigError(
+                f"robot.kinematics must be one of {list(self.KINEMATICS_MODELS)}, "
+                f"got {self.kinematics!r}"
+            )
+        if self.kinematics == "planar_4dof":
+            if len(self.arm_joint_names) != 4:
+                raise ConfigError(
+                    f"robot.arm_joint_names has {len(self.arm_joint_names)} entries; "
+                    "the planar_4dof model is exactly 4 joints (base yaw + 3 pitch)"
+                )
+        elif len(self.arm_joint_names) < 6:
             raise ConfigError(
                 f"robot.arm_joint_names has {len(self.arm_joint_names)} entries; "
                 "a manipulator needs at least 6 DoF"
@@ -213,6 +247,43 @@ class CameraConfig:
     enable_depth: bool = True
     enable_segmentation: bool = True
 
+    enabled: bool = True
+    """False leaves this camera out of the runtime entirely. The hardware lane
+    has no wrist camera; the sim lane always has both."""
+    source: str = ""
+    """Device of a *real* camera (``/dev/video0``, an index, an RTSP URL).
+    Ignored in sim, where ``prim_path`` is the source. Informational on the
+    laptop -- the frame grabber runs on whichever host owns the USB port."""
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    """Measured pixel intrinsics. Zero means "derive from focal_length and the
+    apertures", which is right for Isaac cameras (their lens *is* those
+    parameters) and wrong for a webcam, whose mm apertures nobody knows. Real
+    cameras set ``fx``; ``fy`` falls back to ``fx`` and ``cx``/``cy`` to the
+    image centre when left at zero."""
+    distortion: tuple[float, ...] = ()
+    """OpenCV distortion coefficients ``(k1, k2, p1, p2[, k3[, k4, k5, k6]])``.
+    Empty means an ideal pinhole, which is what every sim camera is."""
+    homography: tuple[float, ...] = ()
+    """Row-major 3x3 pixel -> table-plane (x, y) map for an overhead camera
+    with no depth. Empty means "not calibrated"; the hardware runtime refuses
+    to build without one rather than guessing, because an uncalibrated
+    homography places every object at a plausible-looking wrong spot."""
+    pose_measured: bool = False
+    """Whether ``position``, ``look_at``, ``up`` and ``fx``/``fy``/``cx``/``cy``
+    were *measured* for this camera (checkerboard intrinsics plus a taped or
+    PnP-fitted pose), as opposed to being the placeholders a config ships
+    with. The depthless estimator only runs its pinhole anchor refinement and
+    the lift-prediction evidence when this is true: measured against an exact
+    homography, a placeholder pose 10 cm off turned into a 100 mm object
+    error in every estimate, worse than doing nothing. False keeps the
+    first-order half-footprint step only, which needs just the image-down
+    direction on the table to be right (checkable by eye from one frame)."""
+
+    DISTORTION_LENGTHS = (0, 4, 5, 8)
+
     def resolved_quat(self) -> tuple[float, float, float, float]:
         """Orientation to apply, honouring ``look_at`` when present."""
         if self.look_at is None:
@@ -220,6 +291,26 @@ class CameraConfig:
         from mfw.utils.transforms import look_at_quat  # local: avoid an import cycle
 
         return tuple(float(v) for v in look_at_quat(self.position, self.look_at, self.up))  # type: ignore[return-value]
+
+    def pixel_intrinsics(self) -> tuple[float, float, float, float]:
+        """Pinhole intrinsics ``(fx, fy, cx, cy)`` in pixels.
+
+        Measured values win when ``fx`` is set. Otherwise this is the exact
+        derivation :meth:`mfw.vision.camera.Camera.get_intrinsics` uses: fx from
+        the horizontal aperture and fy from the *vertical* aperture, separately.
+        The default apertures do not match the 4:3 resolution, so fx != fy --
+        that is not a bug. Forcing fy = fx was measured to add up to 43 mm of
+        vertical error to reconstructions that had been within 5 mm.
+        """
+        width, height = (int(v) for v in self.resolution)
+        if self.fx > 0.0:
+            fy = self.fy if self.fy > 0.0 else self.fx
+            cx = self.cx if self.cx > 0.0 else width / 2.0
+            cy = self.cy if self.cy > 0.0 else height / 2.0
+            return (float(self.fx), float(fy), float(cx), float(cy))
+        fx = self.focal_length * width / self.horizontal_aperture
+        fy = self.focal_length * height / self.vertical_aperture
+        return (float(fx), float(fy), width / 2.0, height / 2.0)
 
     def validate(self) -> None:
         w, h = self.resolution
@@ -232,6 +323,21 @@ class CameraConfig:
             )
         if self.focal_length <= 0.0 or self.horizontal_aperture <= 0.0:
             raise ConfigError(f"camera[{self.name}] focal_length and horizontal_aperture must be > 0")
+        if self.vertical_aperture <= 0.0:
+            raise ConfigError(f"camera[{self.name}].vertical_aperture must be > 0")
+        for name in ("fx", "fy", "cx", "cy"):
+            if getattr(self, name) < 0.0:
+                raise ConfigError(f"camera[{self.name}].{name} must be >= 0 (0 = derive)")
+        if len(self.distortion) not in self.DISTORTION_LENGTHS:
+            raise ConfigError(
+                f"camera[{self.name}].distortion must have {list(self.DISTORTION_LENGTHS)} "
+                f"coefficients (OpenCV layout), got {len(self.distortion)}"
+            )
+        if len(self.homography) not in (0, 9):
+            raise ConfigError(
+                f"camera[{self.name}].homography must be empty or a row-major 3x3 "
+                f"(9 numbers), got {len(self.homography)}"
+            )
         if self.look_at is not None:
             import math
 
@@ -350,6 +456,19 @@ class GraspConfig:
     """How far to lift after closing, metres."""
     place_clearance: float = 0.02
     """Gap above the destination surface at release, metres."""
+    recentre_from_standoff: bool = True
+    """Re-observe from the pre-grasp standoff and correct the grasp before the
+    final descent. Worth it with a wrist camera looking at the object; pointless
+    with a single fixed overhead camera, where the standoff view is the same
+    view that produced the estimate."""
+    verify_min_displacement: float = 0.03
+    """Metres a non-rising object must have slid from its pre-grasp table pose
+    for a feedback-less verdict to call it 'knocked' rather than 'resting'.
+    It is not evidence of a carry: a lifted object's homography position
+    shifts only 7-29 mm by parallax (review F1), so carries are judged from
+    pixel growth and the lift prediction in mfw.physics.contact. Perception
+    noise after homography is around a centimetre; three keeps a stationary
+    object from being called knocked."""
 
     def validate(self) -> None:
         if self.max_grasp_width <= self.min_grasp_width:
@@ -358,6 +477,8 @@ class GraspConfig:
             raise ConfigError("grasp.approach_offset must be > 0")
         if self.num_orientation_samples < 1:
             raise ConfigError("grasp.num_orientation_samples must be >= 1")
+        if self.verify_min_displacement <= 0.0:
+            raise ConfigError("grasp.verify_min_displacement must be > 0")
 
 
 @dataclass(frozen=True)
@@ -365,7 +486,11 @@ class MotionConfig:
     """Online motion planning. No prerecorded trajectories anywhere."""
 
     planner: str = "rrt"
-    """``rrt`` for global collision-aware planning, ``rmpflow`` for reactive control."""
+    """``rrt`` for global collision-aware planning, ``rmpflow`` for reactive
+    control, ``joint_space`` for the hardware lane's straight-line joint
+    interpolation through a transit height (no collision world exists there)."""
+
+    PLANNERS = ("rrt", "rmpflow", "joint_space")
     max_planning_time_s: float = 5.0
     interpolation_dt: float = 0.02
     max_joint_velocity: float = 1.0
@@ -428,8 +553,10 @@ class MotionConfig:
     ik_orientation_tolerance: float = 0.02
 
     def validate(self) -> None:
-        if self.planner not in ("rrt", "rmpflow"):
-            raise ConfigError(f"motion.planner must be 'rrt' or 'rmpflow', got {self.planner!r}")
+        if self.planner not in self.PLANNERS:
+            raise ConfigError(
+                f"motion.planner must be one of {list(self.PLANNERS)}, got {self.planner!r}"
+            )
         if self.max_planning_time_s <= 0.0:
             raise ConfigError("motion.max_planning_time_s must be > 0")
         if self.cartesian_step <= 0.0:
@@ -794,6 +921,178 @@ class SceneConfig:
             )
 
 
+@dataclass(frozen=True)
+class HardwareArmConfig:
+    """Geometry of the hardware lane's planar hobby arm.
+
+    Base yaw, then shoulder / elbow / wrist pitch in one vertical plane, then a
+    fixed tool. Every length here is *measured on the assembled arm* -- the
+    defaults are placeholders sized to a ~28 cm-reach PLA kit so the fake lane
+    has something to run against, and nothing in them should be trusted on real
+    metal. The kinematics module owns the conventions (which way positive pitch
+    goes, where zero is); this dataclass only carries the numbers.
+    """
+
+    base_height: float = 0.07
+    """Table plane to the shoulder pitch axis, metres, along the yaw axis."""
+    shoulder_offset: float = 0.0
+    """Horizontal offset of the shoulder axis from the yaw axis, metres. Zero
+    for a kit whose shoulder servo sits directly on the turntable."""
+    upper_arm: float = 0.105
+    """Shoulder axis to elbow axis, metres."""
+    forearm: float = 0.10
+    """Elbow axis to wrist axis, metres."""
+    tool: float = 0.09
+    """Wrist axis to the jaw midpoint (the TCP), metres. Mirrors
+    ``robot.tcp_offset_from_hand[2]`` on the hardware config."""
+    joint_lower: tuple[float, float, float, float] = (-1.5708, -0.5236, -1.5708, -1.5708)
+    joint_upper: tuple[float, float, float, float] = (1.5708, 1.5708, 1.5708, 1.5708)
+    """Radians, in joint order ``(base_yaw, shoulder, elbow, wrist)``. These
+    are *kinematic* limits for the planner; the per-servo pulse end-stops live
+    in the Jetson's calibration file and are clamped again there."""
+    elbow_up: bool = True
+    """Preferred IK branch. The fallback branch is tried when this one is out
+    of limits, so this is a preference rather than a constraint."""
+    jaw_axis: str = "tangential"
+    """Which way the fixed (no wrist roll) jaws close, relative to the ray from
+    the base to the object: ``tangential`` closes across it, ``radial`` closes
+    along it. Set by how the gripper is bolted to the wrist."""
+    transit_height: float = 0.15
+    """Floor of the TCP transit height, metres above the table. The joint-space
+    planner raises it per plan to clear the tallest perceived obstacle plus
+    inflation, held-object hang-down and tilted-finger dip (review GEO-4); 0.10
+    sat exactly at the 0.10 m bin's height, so no crossing of it could plan."""
+
+    JAW_AXES = ("tangential", "radial")
+
+    def validate(self) -> None:
+        for name in ("base_height", "upper_arm", "forearm", "tool"):
+            if getattr(self, name) <= 0.0:
+                raise ConfigError(f"hardware.arm.{name} must be > 0")
+        if self.shoulder_offset < 0.0:
+            raise ConfigError("hardware.arm.shoulder_offset must be >= 0")
+        if len(self.joint_lower) != 4 or len(self.joint_upper) != 4:
+            raise ConfigError(
+                "hardware.arm.joint_lower/joint_upper must each have 4 entries "
+                f"(yaw, shoulder, elbow, wrist), got {len(self.joint_lower)}/{len(self.joint_upper)}"
+            )
+        for i, (lo, hi) in enumerate(zip(self.joint_lower, self.joint_upper)):
+            if lo >= hi:
+                raise ConfigError(
+                    f"hardware.arm joint {i}: joint_lower ({lo}) must be < joint_upper ({hi})"
+                )
+        if self.jaw_axis not in self.JAW_AXES:
+            raise ConfigError(
+                f"hardware.arm.jaw_axis must be one of {list(self.JAW_AXES)}, got {self.jaw_axis!r}"
+            )
+        if self.transit_height <= 0.0:
+            raise ConfigError("hardware.arm.transit_height must be > 0")
+
+
+@dataclass(frozen=True)
+class HardwareConfig:
+    """The hardware lane: a Jetson-hosted arm bridge and detector, driven from mfw.
+
+    Only read when ``backend == "hardware"``. Every host/port pair here is the
+    whole migration story -- a service moves between the laptop and the Jetson
+    by editing an address, never code. Sizes and thresholds exist because the
+    overhead camera has no depth: object height and extents cannot be measured,
+    so they are looked up per label.
+    """
+
+    jetson_host: str = "127.0.0.1"
+    jetson_port: int = 5560
+    """``jetson/robot_server.py`` (ZMQ REP, msgpack)."""
+    detector_host: str = "127.0.0.1"
+    detector_port: int = 5558
+    """Detector service (TCP newline-JSON). Same protocol whether NanoOWL on the
+    Jetson or Florence-2 on the laptop is answering."""
+    arm_bridge: str = "uno_serial"
+    """How the Jetson reaches the servos: ``uno_serial`` (Arduino USB-CDC,
+    default), ``pca9685`` (I2C, for a CH340 Uno clone JetPack 6 cannot see),
+    or ``fake`` (in-process driver for tests and the day-0 e2e run)."""
+    request_timeout_s: float = 5.0
+    """Round-trip budget for a non-motion RPC."""
+    trajectory_timeout_margin_s: float = 5.0
+    """Added to a chunk's own duration to form its RPC timeout, so a slow
+    Uno frame or Wi-Fi jitter does not abort a motion that is still running."""
+    trajectory_chunk_s: float = 1.0
+    """Seconds of trajectory shipped per ``follow_trajectory`` call. Smaller
+    means more chances for ``on_step`` (and an abort) between chunks; larger
+    means fewer round trips over a jittery link."""
+    settle_steps_after_motion: int = 24
+    """Clock steps to wait after a motion before trusting perception. PLA links
+    ring for a moment after a stop; a frame grabbed mid-ring smears the bbox."""
+    fake_clock: bool = False
+    """Advance ``WallClock`` virtually instead of sleeping. Tests only."""
+    arm: HardwareArmConfig = field(default_factory=HardwareArmConfig)
+    object_sizes: Mapping[str, tuple[float, float, float]] = field(default_factory=dict)
+    """Per-label ``(x, y, z)`` extents, metres, standing in for the depth the
+    camera does not have. z sets the grasp height; the larger of x/y (after
+    the jaw-axis choice) sets the grasp width."""
+    default_object_size: tuple[float, float, float] = (0.04, 0.04, 0.04)
+    """Used for a detected label with no ``object_sizes`` entry."""
+    labels: tuple[str, ...] = ()
+    """Vocabulary sent to the detector on every observe. Empty means "whatever
+    the detector defaults to", which is not what you want in a demo."""
+    detection_min_score: float = 0.1
+    pixel_anchor: str = "bottom_center"
+    """Which bbox point the homography is applied to. ``bottom_center`` is
+    where the object meets the table for a camera that is not perfectly
+    overhead; ``center`` for a truly nadir view."""
+    workspace_margin_xy: float = 0.03
+    """Detections this far outside ``scene.workspace_min/max`` in XY are
+    dropped as background rather than reported as unreachable objects."""
+    grasp_pitch_angles_deg: tuple[float, ...] = (90.0, 75.0, 60.0)
+    """Approach pitches to try, most vertical first. 90 is straight down; the
+    shallower ones buy reach at the workspace edge."""
+
+    ARM_BRIDGES = ("uno_serial", "pca9685", "fake")
+    PIXEL_ANCHORS = ("bottom_center", "center")
+
+    def validate(self) -> None:
+        for name in ("jetson_port", "detector_port"):
+            port = getattr(self, name)
+            if not 1 <= port <= 65535:
+                raise ConfigError(f"hardware.{name} out of range: {port}")
+        if self.arm_bridge not in self.ARM_BRIDGES:
+            raise ConfigError(
+                f"hardware.arm_bridge must be one of {list(self.ARM_BRIDGES)}, got {self.arm_bridge!r}"
+            )
+        for name in ("request_timeout_s", "trajectory_timeout_margin_s", "trajectory_chunk_s"):
+            if getattr(self, name) <= 0.0:
+                raise ConfigError(f"hardware.{name} must be > 0")
+        if self.settle_steps_after_motion < 0:
+            raise ConfigError("hardware.settle_steps_after_motion must be >= 0")
+        self.arm.validate()
+        for label, size in self.object_sizes.items():
+            if len(size) != 3 or any(s <= 0.0 for s in size):
+                raise ConfigError(
+                    f"hardware.object_sizes[{label!r}] must be a positive (x, y, z) triple, got {size}"
+                )
+        if len(self.default_object_size) != 3 or any(s <= 0.0 for s in self.default_object_size):
+            raise ConfigError(
+                f"hardware.default_object_size must be a positive (x, y, z) triple, "
+                f"got {self.default_object_size}"
+            )
+        if not 0.0 <= self.detection_min_score <= 1.0:
+            raise ConfigError("hardware.detection_min_score must be in [0, 1]")
+        if self.pixel_anchor not in self.PIXEL_ANCHORS:
+            raise ConfigError(
+                f"hardware.pixel_anchor must be one of {list(self.PIXEL_ANCHORS)}, "
+                f"got {self.pixel_anchor!r}"
+            )
+        if self.workspace_margin_xy < 0.0:
+            raise ConfigError("hardware.workspace_margin_xy must be >= 0")
+        if not self.grasp_pitch_angles_deg:
+            raise ConfigError("hardware.grasp_pitch_angles_deg must list at least one pitch")
+        for pitch in self.grasp_pitch_angles_deg:
+            if not 0.0 < pitch <= 90.0:
+                raise ConfigError(
+                    f"hardware.grasp_pitch_angles_deg entries must be in (0, 90], got {pitch}"
+                )
+
+
 def _default_wrist_camera() -> CameraConfig:
     """Wrist camera default: attached to the hand so it moves with the gripper.
 
@@ -844,12 +1143,25 @@ class FrameworkConfig:
     """Backend used when a skill does not name one. ``classical`` or ``gr00t``."""
     executor_overrides: Mapping[str, str] = field(default_factory=dict)
     """Per-skill backend selection, e.g. ``{"pick": "gr00t"}``."""
+    backend: str = "sim"
+    """What the runtime is built on: ``sim`` (Isaac Sim, the default) or
+    ``hardware`` (the Jetson-hosted arm and detector; never imports Isaac)."""
+    hardware: HardwareConfig = field(default_factory=HardwareConfig)
+
+    BACKENDS = ("sim", "hardware")
 
     def validate(self) -> None:
         for f in fields(self):
             value = getattr(self, f.name)
             if is_dataclass(value) and hasattr(value, "validate"):
                 value.validate()
+        if self.backend not in self.BACKENDS:
+            raise ConfigError(f"backend must be one of {list(self.BACKENDS)}, got {self.backend!r}")
+        if self.backend == "hardware" and self.robot.kinematics != "planar_4dof":
+            raise ConfigError(
+                f"backend is 'hardware' but robot.kinematics is {self.robot.kinematics!r}; "
+                "the hardware lane has no Lula and needs 'planar_4dof'"
+            )
         if self.default_executor not in ("classical", "gr00t"):
             raise ConfigError(
                 f"default_executor must be 'classical' or 'gr00t', got {self.default_executor!r}"
@@ -903,8 +1215,23 @@ def _coerce(value: Any, target_type: Any, path: str) -> Any:
         (arg,) = get_args(target_type) or (Any,)
         return [_coerce(v, arg, f"{path}[{i}]") for i, v in enumerate(value)]
 
-    if origin is dict or target_type is Mapping or origin is Mapping:
-        return dict(value)
+    # ``get_origin(typing.Mapping[K, V])`` is ``collections.abc.Mapping``, not
+    # ``typing.Mapping``; comparing against the typing alias alone matches
+    # nothing and lets a typed mapping fall through with its values uncoerced.
+    if origin in (dict, _abc.Mapping) or target_type in (dict, Mapping, _abc.Mapping):
+        if not isinstance(value, Mapping):
+            raise ConfigError(f"{path}: expected a mapping, got {type(value).__name__}")
+        args = get_args(target_type)
+        if len(args) != 2:
+            return dict(value)
+        # Typed mappings coerce their values too, or ``Mapping[str, tuple[...]]``
+        # would quietly hold YAML lists and fail the "sequences become tuples"
+        # guarantee the rest of the schema relies on.
+        key_t, val_t = args
+        return {
+            _coerce(k, key_t, f"{path}[{k!r}]"): _coerce(v, val_t, f"{path}[{k!r}]")
+            for k, v in value.items()
+        }
 
     if target_type is float and isinstance(value, int) and not isinstance(value, bool):
         return float(value)

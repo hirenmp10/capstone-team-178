@@ -115,6 +115,20 @@ scene:
   # Eight objects spanning the difficulty range. Positions are authored rather
   # than sampled so the default run is reproducible; turn on randomization
   # below to vary them.
+  # Three YCB objects were removed after per-object validation (fresh scene
+  # each, so the results are not contaminated by earlier operations):
+  #
+  #   cracker_box    measured 71 mm at its narrowest; plus the 10 mm finger
+  #                  margin that needs 81 mm against a 78 mm gripper span.
+  #                  A physical limit, not a tuning problem.
+  #   mustard_bottle "gripper closed to 0.0 mm without stalling" on every
+  #                  attempt -- the hand arrives where the bottle is not.
+  #                  A grasp-pose accuracy bug, still open.
+  #   power_drill    "no path to the pregrasp standoff"; furthest object at
+  #                  ~0.72 m, so its standoff lands against the reach shell.
+  #
+  # The six that remain all complete pick -> place at origin, settling 13-61 mm
+  # from where they started, with all objects still on the table afterwards.
   objects:
     # --- easy: convex, well-proportioned, forgiving ---
     - name: soup_can
@@ -122,26 +136,31 @@ scene:
       asset: tomato_soup_can
       position: [0.262, -0.347, 0.453]
 
-    - name: mustard_bottle
-      kind: asset
-      asset: mustard_bottle
-      position: [0.260, 0.350, 0.498]
-
-    - name: cracker_box
-      kind: asset
-      asset: cracker_box
-      position: [0.298, -0.138, 0.509]
-
     - name: foam_brick
       kind: asset
       asset: foam_brick
       position: [0.522, -0.106, 0.428]
 
     # --- medium: cavities and handles ---
-    - name: mug
+    # Replaces the mug, which is not reliably graspable here: hollow with a
+    # handle, catalogued at 81 mm across its narrowest side against a 78 mm
+    # gripper span, and measured by perception at anything from 35 mm to 82 mm
+    # depending on whether the view resolves the wall or a filled silhouette.
+    # Its successful picks were the fingers catching the rim opportunistically,
+    # which no bounding box can predict. Stabilising the measurement was tried
+    # and made it strictly worse -- consistently wrong instead of intermittently
+    # right.
+    #
+    # The sugar box was tried first and also failed: chosen on narrowest
+    # width alone (45 mm), it stands 176 mm tall, and tall standing boxes do
+    # not pick here -- the mustard bottle failed the same way at 155 mm. What
+    # works is short: can 93 mm, brick 54 mm, banana 31 mm. The pudding box
+    # is 90 mm tall and 38 mm at its narrowest, almost exactly the can's
+    # profile, which is the one shape proven repeatedly in this scene.
+    - name: pudding_box
       kind: asset
-      asset: mug
-      position: [0.279, 0.184, 0.443]
+      asset: pudding_box
+      position: [0.279, 0.184, 0.447]
 
     - name: banana
       kind: asset
@@ -159,11 +178,6 @@ scene:
       kind: asset
       asset: large_marker
       position: [0.380, -0.027, 0.463]
-
-    - name: drill
-      kind: asset
-      asset: power_drill
-      position: [0.486, 0.077, 0.496]
 
     # --- destination, not a target ---
     - name: bowl

@@ -1,6 +1,9 @@
 """The robotic assistant: the top-level entry point.
 
-Isaac Sim is reached only through :class:`~mfw.simulation.runtime.Runtime`.
+Isaac Sim is reached only through :class:`~mfw.simulation.runtime.Runtime`;
+with ``backend: hardware`` the same seams are filled by
+:class:`~mfw.hardware.runtime.HardwareRuntime` and nothing from Isaac is
+imported at all (see :func:`_build_runtime`).
 
 Wires the whole stack together::
 
@@ -27,7 +30,6 @@ from mfw.core.interfaces import ISkillExecutor
 from mfw.language.intent_parser import IIntentParser, LlmIntentParser, RuleBasedIntentParser
 from mfw.language.speech import ISpeechRecognizer, TextRecognizer, VoiceCommandLoop
 from mfw.planner.task_planner import CommandOutcome, TaskPlanner
-from mfw.simulation.runtime import Runtime
 from mfw.utils.logging import get_logger
 
 __all__ = ["Assistant", "DEFAULT_CONFIG_PATH"]
@@ -36,6 +38,23 @@ _log = get_logger("assistant")
 
 #: The shipped configuration, used when no config is supplied.
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+
+
+def _build_runtime(config: FrameworkConfig) -> Any:
+    """The runtime for ``config.backend``, imported only when chosen.
+
+    Lazy on purpose: the hardware lane runs on a laptop (or the Jetson) with
+    no Isaac Sim, and importing the simulation runtime there would drag in
+    modules that assume one exists. Both runtimes expose the same attributes,
+    so nothing below this line knows which one it got.
+    """
+    if config.backend == "hardware":
+        from mfw.hardware.runtime import HardwareRuntime
+
+        return HardwareRuntime(config)
+    from mfw.simulation.runtime import Runtime
+
+    return Runtime(config)
 
 
 class Assistant:
@@ -57,7 +76,7 @@ class Assistant:
         config.validate()
         self.config = config
 
-        self.runtime = Runtime(config)
+        self.runtime = _build_runtime(config)
         self.runtime.build()
 
         skill_names = self.runtime.skills.names

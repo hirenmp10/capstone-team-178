@@ -50,6 +50,10 @@ class SkillContext:
     config: FrameworkConfig
     events: EventLogger | None = None
     support_height: float = 0.0
+    grasp_generator: Any = None
+    """Optional :class:`~mfw.core.interfaces.IGraspGenerator`. ``None`` keeps
+    the sim lane's direct OBB synthesis; the hardware lane injects a top-down
+    generator because its depthless perception has no real box to enumerate."""
 
     def emit(self, event: str, payload: dict[str, Any]) -> None:
         if self.events is not None:

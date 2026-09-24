@@ -44,6 +44,44 @@ def get_simulation_app() -> Any:
     return _APP
 
 
+#: Kit channels that emit a warning per simulation step. They are not reporting
+#: a fault -- the simulation manager logs one line every time a transform is
+#: queried at a timestamp it has no surrounding samples for, which is every step
+#: once a run is long enough -- but at two lines per step they bury every real
+#: message. A 500-second run produced tens of thousands of them, and the pick
+#: outcomes they were hiding are the only reason anyone reads this log.
+_NOISY_CHANNELS = ("isaacsim.core.simulation_manager.plugin",)
+
+
+def _quieten_noisy_channels() -> None:
+    """Raise the log threshold on channels that spam once per step.
+
+    Best effort by design. The channel-level API has moved between Kit
+    releases, so every attempt is guarded: failing to silence a warning is a
+    cosmetic problem, while an exception here would take down a simulator that
+    was otherwise fine.
+    """
+    try:
+        import omni.log  # noqa: PLC0415 - only exists once Kit has started
+
+        log = omni.log.get_log()
+        for channel in _NOISY_CHANNELS:
+            log.set_channel_level(channel, omni.log.Level.ERROR)
+        _log.debug("Quietened %d noisy Kit log channel(s)", len(_NOISY_CHANNELS))
+        return
+    except Exception as exc:  # pragma: no cover - depends on the Kit build
+        _log.debug("omni.log channel filter unavailable (%s); trying carb", exc)
+
+    try:
+        import carb.settings  # noqa: PLC0415
+
+        settings = carb.settings.get_settings()
+        for channel in _NOISY_CHANNELS:
+            settings.set(f"/log/channels/{channel}/level", "Error")
+    except Exception as exc:  # pragma: no cover
+        _log.debug("Could not quieten Kit log channels: %s", exc)
+
+
 class SimulationContext:
     """Owns the SimulationApp and the physics ``World``.
 
@@ -84,6 +122,7 @@ class SimulationContext:
             _log.info("Starting Isaac Sim (headless=%s, renderer=%s)", config.headless, config.renderer)
             _APP = SimulationApp(app_kwargs)
             self._app = _APP
+            _quieten_noisy_channels()
 
         atexit.register(self._safe_close)
 
