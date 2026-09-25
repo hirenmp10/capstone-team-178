@@ -8,7 +8,7 @@
 | `5558` | TCP newline-JSON | `jetson/detector_service.py` | Jetson (NanoOWL) or laptop (Florence-2/scripted) | Shivanand |
 | `5557` | ZMQ | `scripts/llm_worker.py` (Qwen) | laptop | Adyanth |
 | `5555` | ZMQ msgpack | `scripts/groot_server.py` | laptop GPU | Adyanth |
-| `/dev/ttyACM0` 115200 8N1 | USB-CDC serial | Arduino `servo_bridge.ino` | Jetson <-> Uno | Hiren (Stage B - PLANNED) |
+| `/dev/ttyACM0` 115200 8N1 | USB-CDC serial | Arduino `servo_bridge.ino` | Jetson <-> Uno | Hiren (bench-unverified) |
 
 ---
 
@@ -205,24 +205,38 @@ All replies include `"ok": bool`.
 
 ---
 
-## 1.5 Serial Protocol: Uno <-> Jetson (PLANNED, Stage B)
+## 1.5 Serial Protocol: Uno <-> Jetson (IMPLEMENTED, bench-unverified)
 
 ASCII line-oriented protocol, 115200 baud, 8N1.
+Lines terminated with `\n` (LF). Maximum line length **96 bytes**; longer lines receive `ERR line`.
+Every command produces **exactly one reply line**.
 
 ### Host -> Uno Commands
-- `P p0 p1 ... pN\n` : Set servo pulse targets (in µs) immediately.
-- `T ms p0 ... pN\n` : Interpolate to servo pulse targets over `ms` milliseconds.
-- `D\n` : Detach all servos.
-- `W ms\n` : Configure watchdog timeout in milliseconds.
-- `S\n` : Query status.
-- `V\n` : Query firmware version.
+
+| Frame | Args | Reply | Notes |
+|---|---|---|---|
+| `P p0 … p{N-1}\n` | N pulse values in µs | `OK\n` | Set targets immediately; attaches if detached; counts as keepalive |
+| `T ms p0 … p{N-1}\n` | duration ms (0–30000) + N pulses | `OK\n` | Linear interpolation over ms; attaches if detached; counts as keepalive |
+| `D\n` | — | `OK\n` | Detach all servos immediately (E-stop) |
+| `W ms\n` | timeout ms (0=disabled, else 50–10000) | `OK\n` | Set watchdog timeout |
+| `S\n` | — | see below | Status query; **counts as keepalive** (keeps arm attached while idle) |
+| `V\n` | — | see below | Firmware version |
 
 ### Uno -> Host Responses
-- `OK\n` : Command accepted.
-- `ERR <reason>\n` : Error executing command.
-- `S <attached:0|1> <moving:0|1> p0 ... pN\n` : Current status and channel pulses.
-- `V servo_bridge 1 <nch>\n` : Firmware version and channel count.
+
+- `OK\n` — command accepted.
+- `ERR line\n` — line exceeded 96 bytes; no action taken.
+- `ERR argc\n` — wrong number of arguments for a recognised command.
+- `ERR range\n` — a pulse value is outside `[PULSE_MIN_US, PULSE_MAX_US]`; **no** pulses applied.
+- `ERR cmd\n` — unknown command token.
+- `S <attached:0|1> <moving:0|1> <wd_ms> p0 … p{N-1}\n` — current status, watchdog setting, and commanded pulses per channel.
+- `V servo_bridge 1 <N_CH>\n` — firmware name, protocol version 1, channel count.
 
 ### Safety Rules
-- Servos start detached at boot until the first `P` or `T` command.
-- If no command is received within `watchdog_ms`, all servos detach immediately.
+
+- Servos start **detached** at boot. Nothing moves until the first `P` or `T` frame.
+- If `wd_ms > 0` and no `P`, `T`, or `S` frame is received within `wd_ms` milliseconds, all servos detach.
+  The next `S` reply will show `attached=0`.
+- `S` counts as a keepalive so `UnoSerialDriver.keepalive()` (which sends `S`) can keep the arm attached while the robot server is idle between motions.
+- Every pulse written is clamped to `[PULSE_MIN_US, PULSE_MAX_US]` in hardware; calibration limits (`rad_min/rad_max` per channel) apply a tighter clamp in software at the `robot_server` layer.
+- Pulse range check (`ERR range`) is applied atomically: if **any** channel is out of range, **no** channels are updated.

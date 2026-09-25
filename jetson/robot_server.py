@@ -183,6 +183,11 @@ class ServoCalibration:
 # ==============================================================================
 
 
+class DriverError(Exception):
+    """Raised by a driver when a serial/hardware command fails or times out."""
+
+
+
 class Driver(ABC):
     """Abstract hardware driver controlling servo actuation."""
 
@@ -198,34 +203,173 @@ class Driver(ABC):
         """Detach / de-energize servo motors."""
 
     @abstractmethod
-    def write_pulses(self, pulses: list[int]) -> None:
-        """Write microsecond pulses to all servo channels."""
+    def write_pulses(self, pulses: list[int], duration_ms: int = 0) -> None:
+        """Write microsecond pulses to all servo channels.
+
+        Args:
+            pulses: list of N pulse values in microseconds.
+            duration_ms: if > 0, use the T (interpolate) command instead of P;
+                         ignored by FakeDriver (which has no interpolation time).
+        """
 
 
 class UnoSerialDriver(Driver):
-    """Arduino Uno USB-CDC serial driver (Stage B - PLANNED).
+    """Arduino Uno USB-CDC serial driver.
 
-    Serial protocol:
-        Host->Uno: ASCII lines, 115200 8N1.
-        'P p0 p1 ... pN\\n' : set targets (us) now
-        'T ms p0 ... pN\\n' : interpolate to targets over ms
-        'D\\n'              : detach all
-        'W ms\\n'           : set watchdog
-        'S\\n'              : status query
-        'V\\n'              : version query
+    Talks to ``firmware/servo_bridge/servo_bridge.ino`` over a USB-CDC serial
+    port (115200 8N1 ASCII lines).  Import of ``serial`` (pyserial) is deferred
+    to ``open()`` so the fake lane never requires pyserial at import time.
+
+    Serial protocol summary (full spec: docs/hardware/PROTOCOL.md §1.5):
+        P p0…pN\\n  — set targets immediately
+        T ms p0…pN\\n — interpolate over ms milliseconds
+        D\\n         — detach all (E-stop)
+        W ms\\n      — set watchdog timeout
+        S\\n         — status (attached, moving, pulses); counts as keepalive
+        V\\n         — firmware version
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError("Stage B: UnoSerialDriver is planned for Stage B")
+    def __init__(
+        self,
+        port: str = "/dev/ttyACM0",
+        baud: int = 115200,
+        watchdog_ms: int = 500,
+        timeout_s: float = 0.2,
+        serial_factory: Any = None,
+    ) -> None:
+        self.port = port
+        self.baud = baud
+        self.watchdog_ms = int(watchdog_ms)
+        self.timeout_s = float(timeout_s)
+        self.serial_factory = serial_factory
+        self._ser: Any = None
+        self._lock = threading.Lock()
+        self.attached = False
+        self.moving = False
+        self.name = "uno_serial"
+        self._n_channels: int | None = None
+
+    def open(self, calibration: "ServoCalibration | None" = None) -> None:
+        """Open the serial port, handshake with the Uno, set watchdog, and sync state.
+
+        Args:
+            calibration: used to verify channel count; if None uses N=5.
+
+        Raises:
+            RuntimeError: if the firmware channel count doesn't match calibration.
+            DriverError: if version handshake fails or times out.
+        """
+        # Lazy pyserial import so the fake lane never needs it
+        if self.serial_factory is not None:
+            self._ser = self.serial_factory(self.port, self.baud, timeout=self.timeout_s)
+        else:
+            import serial  # noqa: PLC0415
+            self._ser = serial.Serial(self.port, self.baud, timeout=self.timeout_s)
+
+        # Wait for Uno auto-reset (DTR toggle on open resets ATmega328P)
+        time.sleep(2.0)
+
+        # Version handshake
+        v_reply = self._cmd("V")
+        # expect: "V servo_bridge 1 <nch>"
+        parts = v_reply.split()
+        if len(parts) != 4 or parts[0] != "V" or parts[1] != "servo_bridge":
+            raise DriverError(f"Unexpected version reply: {v_reply!r}")
+        n_firmware = int(parts[3])
+        n_expected = (len(calibration.joints) + 1) if calibration is not None else 5
+        if n_firmware != n_expected:
+            raise RuntimeError(
+                f"Firmware channel count {n_firmware} != calibration channel count {n_expected}"
+            )
+        self._n_channels = n_firmware
+
+        # Set watchdog
+        self._cmd(f"W {self.watchdog_ms}")
+
+        # Sync state
+        self._sync_state()
+
+    def _cmd(self, line: str) -> str:
+        """Send one command line and return the reply, under lock.
+
+        Raises:
+            DriverError: on timeout or if the reply is ERR …
+        """
+        with self._lock:
+            assert self._ser is not None, "serial port not open"
+            out = (line + "\n").encode()
+            logger.debug("Uno << %r", out)
+            self._ser.write(out)
+            reply = self._ser.readline().decode(errors="replace").strip()
+            logger.debug("Uno >> %r", reply)
+            if not reply:
+                raise DriverError(f"no reply from Uno for command {line!r}")
+            if reply.startswith("ERR"):
+                raise DriverError(reply)
+            return reply
+
+    def _sync_state(self) -> None:
+        """Parse an S reply and update attached / moving flags."""
+        s_reply = self._cmd("S")
+        parts = s_reply.split()
+        # S <att> <mov> <wd_ms> p0…pN
+        if len(parts) >= 3 and parts[0] == "S":
+            self.attached = parts[1] == "1"
+            self.moving = parts[2] == "1"
 
     def attach(self) -> None:
-        raise NotImplementedError("Stage B")
+        """No-op: the Uno attaches on the first P/T command."""
+        # Attach happens implicitly on first write_pulses call
+        pass
 
     def detach(self) -> None:
-        raise NotImplementedError("Stage B")
+        """Send D to detach all servos."""
+        try:
+            self._cmd("D")
+            self.attached = False
+        except DriverError as exc:
+            logger.warning("Uno detach failed: %s", exc)
 
-    def write_pulses(self, pulses: list[int]) -> None:
-        raise NotImplementedError("Stage B")
+    def write_pulses(self, pulses: list[int], duration_ms: int = 0) -> None:
+        """Send P or T command with the given pulses.
+
+        Args:
+            pulses: list of pulse values in µs.
+            duration_ms: if > 0 uses T (interpolate) command; else P (immediate).
+
+        Raises:
+            DriverError: if the Uno replies ERR or times out.
+        """
+        pulse_str = " ".join(str(int(p)) for p in pulses)
+        if duration_ms > 0:
+            cmd = f"T {int(duration_ms)} {pulse_str}"
+        else:
+            cmd = f"P {pulse_str}"
+        self._cmd(cmd)
+        self.attached = True  # P/T always attaches
+
+    def keepalive(self) -> None:
+        """Send S to refresh attached/moving state without writing pulses.
+
+        The S command counts as a keepalive frame in the Uno firmware.
+        """
+        try:
+            self._sync_state()
+        except DriverError as exc:
+            logger.warning("Uno keepalive (S) failed: %s", exc)
+
+    def close(self) -> None:
+        """Detach and close the serial port."""
+        try:
+            self.detach()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._ser is not None:
+                self._ser.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._ser = None
 
 
 class Pca9685Driver(Driver):
@@ -271,7 +415,7 @@ class FakeDriver(Driver):
     def detach(self) -> None:
         self.attached = False
 
-    def write_pulses(self, pulses: list[int]) -> None:
+    def write_pulses(self, pulses: list[int], duration_ms: int = 0) -> None:
         now = time.monotonic()
         if (
             self.watchdog_ms is not None
@@ -690,13 +834,19 @@ class RobotServer:
                 try:
                     job = self._motion_queue.get(timeout=self.tick_s)
                 except queue.Empty:
-                    # Idle keepalive tick
+                    # Idle keepalive tick:
+                    # prefer driver.keepalive() when available (UnoSerialDriver sends S,
+                    # which counts as a keepalive frame in the firmware without moving anything);
+                    # fall back to writing the current pulses (FakeDriver watchdog proof).
                     if self.driver.attached and not self._estopped:
-                        pulses = [
-                            int(round(self.calibration.rad_to_pulse(i, self._current_q[i])[0]))
-                            for i in range(4)
-                        ] + [int(round(self.calibration.width_to_pulse(self._current_gripper_w)))]
-                        self.driver.write_pulses(pulses)
+                        if hasattr(self.driver, "keepalive"):
+                            self.driver.keepalive()  # type: ignore[union-attr]
+                        else:
+                            pulses = [
+                                int(round(self.calibration.rad_to_pulse(i, self._current_q[i])[0]))
+                                for i in range(4)
+                            ] + [int(round(self.calibration.width_to_pulse(self._current_gripper_w)))]
+                            self.driver.write_pulses(pulses)
                     continue
 
                 identity, empty, method, params = job
@@ -969,7 +1119,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fake-watchdog-ms",
         type=float,
         default=None,
-        help="Watchdog timeout in ms for fake driver (default: None)",
+        help="Watchdog timeout in ms for the fake AND uno_serial drivers (default: None / firmware default)",
     )
     parser.add_argument(
         "--log-level",
@@ -994,7 +1144,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.driver == "fake":
         driver = FakeDriver(calibration, watchdog_ms=args.fake_watchdog_ms)
     elif args.driver == "uno_serial":
-        driver = UnoSerialDriver(port=args.serial_port, baud=args.baud)
+        watchdog_ms = int(args.fake_watchdog_ms) if args.fake_watchdog_ms is not None else 500
+        driver = UnoSerialDriver(
+            port=args.serial_port,
+            baud=args.baud,
+            watchdog_ms=watchdog_ms,
+        )
+        driver.open(calibration=calibration)
     elif args.driver == "pca9685":
         driver = Pca9685Driver()
     else:
