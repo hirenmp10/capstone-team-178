@@ -92,16 +92,36 @@ class FakeUnoSerial:
             line = data.decode(errors="replace").rstrip("\r\n")
             self.commands_received.append(line)
             reply = self._handle(line)
-            self._reply_buf = (reply + "\n").encode()
+            self._reply_buf += (reply + "\n").encode()
 
     def readline(self) -> bytes:
         """Return the queued reply (or empty bytes if auto_read is False)."""
         if not self.auto_read:
             return b""
         with self._lock:
+            if b"\n" in self._reply_buf:
+                line, rest = self._reply_buf.split(b"\n", 1)
+                self._reply_buf = rest
+                return line + b"\n"
             r = self._reply_buf
             self._reply_buf = b""
             return r
+
+    def reset_input_buffer(self) -> None:
+        """Clear any pending reply bytes (simulating clearing serial RX buffer)."""
+        with self._lock:
+            self._reply_buf = b""
+
+    @property
+    def output_buffer(self) -> bytes:
+        """Pending bytes to be sent to host."""
+        with self._lock:
+            return self._reply_buf
+
+    @output_buffer.setter
+    def output_buffer(self, data: bytes) -> None:
+        with self._lock:
+            self._reply_buf = data
 
     def close(self) -> None:
         pass
@@ -272,6 +292,15 @@ class TestOpenHandshake:
         fake = FakeUnoSerial(n_ch=5)
         driver = _make_driver(fake)
         driver.open(calibration=None)  # should not raise
+
+    def test_open_flushes_pending_serial_input(self) -> None:
+        """Pre-load the fake's output buffer with b"OK\\n" before open() and assert V handshake succeeds."""
+        fake = FakeUnoSerial(n_ch=5)
+        fake.output_buffer = b"OK\n"
+        driver = _make_driver(fake)
+        driver.open(calibration=ServoCalibration.default())
+        assert fake.commands_received[0] == "V"
+        assert driver.attached is False
 
 
 class TestWritePulses:

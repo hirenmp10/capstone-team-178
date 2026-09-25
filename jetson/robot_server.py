@@ -268,6 +268,8 @@ class UnoSerialDriver(Driver):
 
         # Wait for Uno auto-reset (DTR toggle on open resets ATmega328P)
         time.sleep(2.0)
+        if hasattr(self._ser, "reset_input_buffer"):
+            self._ser.reset_input_buffer()
 
         # Version handshake
         v_reply = self._cmd("V")

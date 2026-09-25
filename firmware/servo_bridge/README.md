@@ -45,6 +45,8 @@ arduino-cli upload  --fqbn arduino:avr:uno --port /dev/ttyACM0 firmware/servo_br
 
 ## Quick test in the serial monitor
 
+The first frame after power-up must be P (a known pose), never T — T interpolates from the firmware's 1500 µs boot value, not from where the servo physically is.
+
 Open the serial monitor at **115200 baud**, line endings **Newline only**.
 
 ```

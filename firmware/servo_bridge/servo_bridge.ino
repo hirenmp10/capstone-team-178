@@ -111,7 +111,7 @@ static uint16_t clamp_pulse(uint16_t p) {
    On success writes into out[]; on failure writes nothing.            */
 static bool parse_pulses(char **tokens, int start, int count, uint16_t out[]) {
     if (count != N_CH) return false;
-    uint16_t tmp[5];
+    uint16_t tmp[N_CH];
     for (int i = 0; i < count; i++) {
         long v = atol(tokens[start + i]);
         if (v < PULSE_MIN_US || v > PULSE_MAX_US) return false;
