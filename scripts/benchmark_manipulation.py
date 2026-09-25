@@ -15,21 +15,124 @@ to find out which objects the robot can actually handle is to try all of them.
 
 Per object it reports: whether a grasp was synthesised, whether the arm reached
 it, whether it left the table, and whether it was still held afterwards.
+
+``--place`` then puts the object back down. It used to call ``place`` with
+``{"target": "it"}``; "it" resolves to the *held* object, and ``Place`` refuses
+"the destination is the object being held", so every place was INFEASIBLE and
+the flag could never succeed. It now places with no destination (back where the
+object came from) or on ``--place-on LABEL``, and judges the place by ground
+truth too: the object must end up released and resting (not held, below its
+lifted height).
+
+Results are saved evidence, not console scroll-back: every run writes
+``logs/benchmark/<timestamp>_manipulation.json`` and ``.csv`` (timestamp,
+config path and SHA-256, git commit, arguments, per-object pick/place outcome
+and timings, summary), plus the latest copy at ``--report`` and a text log.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime as _dt
+import hashlib
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 LIFT_THRESHOLD_M = 0.03
+SCHEMA = "mfw.manipulation_benchmark/2"
+
+#: Per-object fields written to the CSV, in column order.
+CSV_FIELDS = (
+    "object", "asset", "perceived", "graspable", "skipped", "skill_ok", "lifted",
+    "gain_m", "still_held", "duration_s", "place_ok", "place_released",
+    "place_settled_offset_m", "place_duration_s", "skill_message", "place_message", "error",
+)
+
+
+def _git_state(root: Path) -> dict[str, Any]:
+    """Commit and dirty flag, so a result can be tied to the code that produced it."""
+    def run(*cmd: str) -> str:
+        try:
+            done = subprocess.run(
+                ["git", *cmd], cwd=root, capture_output=True, text=True, timeout=10
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    return {"commit": run("rev-parse", "HEAD") or None, "dirty": bool(run("status", "--porcelain"))}
+
+
+def summarise_results(results: list[dict]) -> dict[str, Any]:
+    """Counts the text report prints, as data."""
+    attempted = [r for r in results if not r.get("skipped")]
+    placed = [r for r in attempted if "place_ok" in r]
+    return {
+        "objects": len(results),
+        "perceived": sum(1 for r in results if r.get("perceived")),
+        "attempted": len(attempted),
+        "skipped": sum(1 for r in results if r.get("skipped")),
+        "lifted": sum(1 for r in attempted if r.get("lifted")),
+        "false_success": [r["object"] for r in results if r.get("skill_ok") and not r.get("lifted")],
+        "place_attempted": len(placed),
+        "place_ok": sum(1 for r in placed if r.get("place_ok")),
+        "place_released": sum(1 for r in placed if r.get("place_released")),
+    }
+
+
+def build_document(
+    results: list[dict],
+    config_path: str,
+    args: dict[str, Any],
+    started: _dt.datetime,
+    finished: _dt.datetime,
+) -> dict[str, Any]:
+    """The JSON evidence record for one benchmark run."""
+    config_file = Path(config_path)
+    digest = (
+        hashlib.sha256(config_file.read_bytes()).hexdigest() if config_file.is_file() else None
+    )
+    return {
+        "schema": SCHEMA,
+        "timestamp": started.isoformat(timespec="seconds"),
+        "finished": finished.isoformat(timespec="seconds"),
+        "wall_s": round((finished - started).total_seconds(), 1),
+        "config": str(config_path),
+        "config_sha256": digest,
+        "git": _git_state(_ROOT),
+        "args": args,
+        "lift_threshold_m": LIFT_THRESHOLD_M,
+        "summary": summarise_results(results),
+        "results": results,
+    }
+
+
+def write_results(document: dict[str, Any], out_dir: Path, latest: Path | None) -> tuple[Path, Path]:
+    """Write ``<ts>_manipulation.json`` and ``.csv`` under ``out_dir``; copy JSON to ``latest``."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.fromisoformat(document["timestamp"]).strftime("%Y%m%d_%H%M%S")
+    json_path = out_dir / f"{stamp}_manipulation.json"
+    csv_path = out_dir / f"{stamp}_manipulation.csv"
+    text = json.dumps(document, indent=2, default=str)
+    json_path.write_text(text, encoding="utf-8")
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in document["results"]:
+            writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
+    if latest is not None:
+        latest.parent.mkdir(parents=True, exist_ok=True)
+        latest.write_text(text, encoding="utf-8")
+    return json_path, csv_path
 
 
 def main() -> int:
@@ -37,10 +140,23 @@ def main() -> int:
     parser.add_argument("--config", default=str(_ROOT / "configs" / "benchmark.yaml"))
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--place", action="store_true", help="also attempt a place after each pick")
+    parser.add_argument(
+        "--place-on",
+        default="",
+        help="with --place: destination label (e.g. bowl); default puts the object back "
+        "where it was picked from",
+    )
     parser.add_argument("--only", default="", help="comma-separated object names to try")
-    parser.add_argument("--report", default=str(_ROOT / "logs" / "manipulation_benchmark.json"))
+    parser.add_argument(
+        "--report",
+        default=str(_ROOT / "logs" / "manipulation_benchmark.json"),
+        help="latest-run JSON copy (timestamped JSON/CSV always go to --results-dir)",
+    )
+    parser.add_argument("--results-dir", default=str(_ROOT / "logs" / "benchmark"))
     parser.add_argument("--log", default=str(_ROOT / "logs" / "manipulation_benchmark.txt"))
     args = parser.parse_args()
+    run_args = dict(vars(args))
+    started_at = _dt.datetime.now()
 
     sys.argv = [sys.argv[0]]
 
@@ -81,15 +197,23 @@ def main() -> int:
 
         initial_poses = _capture_initial_poses(runtime)
 
+        place_params = {"target": args.place_on} if args.place_on else {}
         for obj in targets:
-            results.append(_attempt(runtime, obj, args.place, emit))
+            results.append(_attempt(runtime, obj, args.place, emit, place_params))
             _reset_between_attempts(runtime, initial_poses, emit)
 
         emit()
         _summarise(results, emit)
 
-        Path(args.report).write_text(json.dumps(results, indent=2), encoding="utf-8")
-        emit(f"JSON report: {args.report}")
+        document = build_document(
+            results, args.config, run_args, started_at, _dt.datetime.now()
+        )
+        json_path, csv_path = write_results(
+            document, Path(args.results_dir), Path(args.report)
+        )
+        emit(f"results: {json_path}")
+        emit(f"         {csv_path}")
+        emit(f"latest : {args.report}")
 
         attempted = [r for r in results if not r.get("skipped")]
         lifted = sum(1 for r in attempted if r.get("lifted"))
@@ -98,7 +222,7 @@ def main() -> int:
         runtime.close()
 
 
-def _attempt(runtime, obj, do_place: bool, emit) -> dict:
+def _attempt(runtime, obj, do_place: bool, emit, place_params: dict | None = None) -> dict:
     """One pick attempt, judged against ground truth."""
     import numpy as np
 
@@ -181,15 +305,36 @@ def _attempt(runtime, obj, do_place: bool, emit) -> dict:
         emit(f"  {'':16} ^^ skill reported success but the object did not rise")
 
     if do_place and record["still_held"]:
+        # Never {"target": "it"}: "it" is the held object, and Place refuses a
+        # destination that is the object being held.
+        params = dict(place_params or {})
+        place_started = time.perf_counter()
         try:
-            place = runtime.skills.execute("place", {"target": "it"})
+            place = runtime.skills.execute("place", params)
             record["place_ok"] = bool(place.ok)
             record["place_message"] = str(place.message)
+            offset = place.data.get("settled_offset") if isinstance(place.data, dict) else None
+            record["place_settled_offset_m"] = (
+                float(offset) if offset is not None and np.isfinite(offset) else None
+            )
             emit(f"  {'':16} place: ok={place.ok} {str(place.message)[:60]}")
         except Exception as exc:  # noqa: BLE001
             record["place_ok"] = False
             record["place_message"] = f"{type(exc).__name__}: {exc}"
             emit(f"  {'':16} place RAISED {type(exc).__name__}: {exc}")
+        record["place_duration_s"] = round(time.perf_counter() - place_started, 1)
+        record["place_params"] = params
+
+        # Ground truth again: released means memory no longer holds it and it
+        # came back down from the lifted height.
+        height_after_place = _truth_height(prim_path)
+        record["height_after_place"] = height_after_place
+        record["place_released"] = bool(
+            runtime.memory.get_held_object() is None
+            and height_after_place < height_after - LIFT_THRESHOLD_M / 2
+        )
+        if record["place_ok"] and not record["place_released"]:
+            emit(f"  {'':16} ^^ place reported success but the object is not released/resting")
 
     return record
 
@@ -280,6 +425,13 @@ def _summarise(results: list[dict], emit) -> None:
     failed = [r["object"] for r in attempted if not r.get("lifted")]
     if failed:
         emit(f"failed    : {failed}")
+    placed = [r for r in attempted if "place_ok" in r]
+    if placed:
+        emit(
+            f"placed    : {sum(1 for r in placed if r.get('place_released'))}/{len(placed)} "
+            f"released by ground truth ({sum(1 for r in placed if r.get('place_ok'))} "
+            "reported ok by the skill)"
+        )
 
 
 if __name__ == "__main__":

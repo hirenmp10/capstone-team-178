@@ -350,6 +350,14 @@ class SceneGraph:
         perceived class is just "box", which is exactly what happened in practice:
         the operator said "place the can on the green box" and the robot replied
         that it could not find a "green box" while looking straight at one.
+
+        This is deliberately the *narrow* matcher (class and colour words only)
+        and its semantics are relied on by memory and the GR00T executor. Full
+        referent grounding -- generic nouns ("the red object"), class synonyms
+        ("cube"), size ("the large one"), position ("on the left", "nearest")
+        and relations ("the block next to the can") -- is
+        :func:`mfw.language.grounding.resolve_reference`, which raises
+        ``ObjectNotFound``/``AmbiguousReference`` instead of returning a list.
         """
         needle = " ".join(label.strip().lower().split())
         if not needle:

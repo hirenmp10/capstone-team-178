@@ -42,7 +42,7 @@ from mfw.skills.base import SkillContext
 from mfw.skills.registry import ClassicalExecutor, SkillRegistry
 from mfw.utils.logging import EventLogger, get_logger
 from mfw.vision.camera import Camera
-from mfw.vision.manager import VisionManager
+from mfw.vision.manager import VisionManager, object_color_signature
 
 __all__ = ["Runtime"]
 
@@ -226,6 +226,7 @@ class Runtime:
             self.sim.render_step(1)
             if all(self._camera_has_data(cam) for cam in cameras):
                 _log.info("Cameras produced data after %d render steps", step)
+                self._settle_object_colors(cameras)
                 return
 
         stalled = [cam.name for cam in cameras if not self._camera_has_data(cam)]
@@ -233,6 +234,86 @@ class Runtime:
             f"Cameras {stalled} produced no data after {self._MAX_CAMERA_WARMUP_STEPS} render "
             "steps. The render pipeline failed to start."
         )
+
+    #: Bound on the extra render steps spent waiting for object colours to settle.
+    _MAX_COLOR_SETTLE_STEPS = 90
+    #: Largest per-channel change (uint8 levels) in an object's mean colour
+    #: between consecutive frames that still counts as "not changing".
+    _COLOR_SETTLE_TOLERANCE = 4.0
+    #: Consecutive unchanged comparisons required.
+    _COLOR_SETTLE_STREAK = 2
+
+    def _settle_object_colors(self, cameras: list[Camera]) -> bool:
+        """Keep rendering until every camera's object colours stop changing.
+
+        "Every annotator returned a buffer" is not "the picture is right". The
+        first buffers arrive while materials are still resolving, and colour
+        measured from them was reported to the operator: a run whose scene is a
+        red block, a blue can and a green box answered its first "what do you
+        see" with "black block, black can, black box", and a benchmark run
+        called a soup can, a banana and a bowl all black. Depth and
+        segmentation were right throughout, so nothing else noticed.
+
+        Polls each camera's per-object mean colour (see
+        :func:`~mfw.vision.manager.object_color_signature`) and stops once
+        every camera is lit and every object's colour has held still for
+        :attr:`_COLOR_SETTLE_STREAK` consecutive frames.
+
+        What this cannot catch, stated plainly: an object that renders a
+        *steady* wrong colour for a while (a material that stays black until
+        its shader finishes compiling) looks exactly like a genuinely black
+        object, and no amount of polling one frame against the next tells them
+        apart. That case is handled downstream -- the tracker lets the first
+        hue reading replace an early black at once. Bounded, and a warning
+        rather than an error when the bound is hit: the tracker's colour hold
+        and the start-up priming observes are further lines of defence, and a
+        noisy renderer must not stop the robot from starting.
+
+        Returns whether the colours settled.
+        """
+        previous: dict[str, Any] | None = None
+        streak = 0
+        for step in range(self._MAX_COLOR_SETTLE_STEPS + 1):
+            current = {cam.name: self._color_signature(cam) for cam in cameras}
+            if previous is not None and self._signatures_match(previous, current):
+                streak += 1
+                if streak >= self._COLOR_SETTLE_STREAK:
+                    _log.info("Object colours settled after %d extra render steps", step)
+                    return True
+            else:
+                streak = 0
+            previous = current
+            if step < self._MAX_COLOR_SETTLE_STEPS:
+                self.sim.render_step(1)
+
+        _log.warning(
+            "Object colours were still changing after %d extra render steps; colour "
+            "names on the first observation may be unreliable",
+            self._MAX_COLOR_SETTLE_STEPS,
+        )
+        return False
+
+    @staticmethod
+    def _color_signature(camera: Camera) -> dict[str, Any] | None:
+        try:
+            return object_color_signature(camera.capture())
+        except PerceptionError:
+            return None
+
+    @classmethod
+    def _signatures_match(
+        cls, previous: dict[str, Any], current: dict[str, Any]
+    ) -> bool:
+        for name, now in current.items():
+            before = previous.get(name)
+            if now is None or before is None or set(now) != set(before):
+                return False
+            for key, value in now.items():
+                if float(np.max(np.abs(np.asarray(value) - np.asarray(before[key])))) > (
+                    cls._COLOR_SETTLE_TOLERANCE
+                ):
+                    return False
+        return True
 
     @staticmethod
     def _camera_has_data(camera: Camera) -> bool:

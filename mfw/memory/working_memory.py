@@ -64,6 +64,11 @@ class WorkingMemory(IMemory):
         self._command_history: Deque[CommandRecord] = deque(maxlen=config.max_command_history)
         self._result_history: Deque[SkillResult] = deque(maxlen=config.max_command_history)
         self._held_object: str | None = None
+        #: The scene graph as it stood when the current object was picked up.
+        #: Not a pose -- it is one of the same SceneGraphs already kept in
+        #: history, retained by reference so "where did this come from" can be
+        #: answered without memory learning to store coordinates.
+        self._scene_at_pick: SceneGraph | None = None
         self._last_referenced: str | None = None
         self._robot_state: RobotState | None = None
         self._pronouns = {word.strip().lower() for word in config.pronoun_words}
@@ -96,6 +101,10 @@ class WorkingMemory(IMemory):
     def set_held_object(self, track_id: str | None) -> None:
         if track_id != self._held_object:
             _log.info("Held object: %s -> %s", self._held_object, track_id)
+            # Snapshot the scene at the moment of the pick, so a later "place it"
+            # with no destination can put the object back where it came from
+            # rather than wherever the hand happens to be. Released on drop.
+            self._scene_at_pick = self.current_scene if track_id is not None else None
         self._held_object = track_id
         if track_id is not None:
             # The thing just picked up is the most natural referent for "it".
@@ -103,6 +112,15 @@ class WorkingMemory(IMemory):
 
     def get_held_object(self) -> str | None:
         return self._held_object
+
+    def scene_at_pick(self) -> SceneGraph | None:
+        """The scene as it was when the held object was picked up.
+
+        Used by ``place`` to recover the object's resting position. Returns
+        ``None`` when nothing is held, or when the pick happened before any
+        scene had been observed.
+        """
+        return self._scene_at_pick
 
     def note_reference(self, track_id: str) -> None:
         """Record that a command referred to this object."""

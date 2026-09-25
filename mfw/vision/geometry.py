@@ -29,6 +29,11 @@ __all__ = [
     "principal_axes",
     "cluster_by_euclidean_distance",
     "points_above_plane",
+    "dominant_color_name",
+    "is_chromatic_color",
+    "frame_brightness",
+    "is_unlit_frame",
+    "UNLIT_FRAME_VALUE",
 ]
 
 _EPS = 1e-12
@@ -293,6 +298,64 @@ def dominant_color_name(colors: NDArray[np.uint8] | None) -> str:
         if low <= hue < high:
             return name
     return ""
+
+
+#: Every name :func:`dominant_color_name` can return that carries a hue.
+_CHROMATIC_NAMES = frozenset(name for _, _, name in _HUE_BANDS) | {"brown"}
+
+
+def is_chromatic_color(name: str) -> bool:
+    """Whether a colour name carries a hue (``red``) rather than a lightness (``black``).
+
+    The asymmetry this encodes is what lets the tracker trust one reading over
+    another. Everything that goes wrong with a rendered colour -- an RGB buffer
+    that has not been written yet, a material whose shader is still compiling,
+    a frame with no light in it, the arm's shadow -- *removes* hue and pushes
+    the pixels toward black or grey. None of them invents a saturated hue. So a
+    hue reading is strong evidence and an achromatic one after it is weak.
+    """
+    return str(name or "").strip().lower() in _CHROMATIC_NAMES
+
+
+#: A frame whose bright end sits at or below this (uint8 units) is unlit or
+#: not yet rendered rather than a picture of a dark scene. A lit table-top
+#: frame is dominated by the table and by washed-out object colours around
+#: 150-220; the failure this guards against measured [1, 1, 1]. Kept well
+#: below any lit frame so a genuinely black object on a lit table -- whose own
+#: pixels are dark but whose frame is not -- is still allowed to be "black".
+UNLIT_FRAME_VALUE = 24
+
+
+def frame_brightness(rgb: NDArray[np.uint8] | None) -> float:
+    """The bright end of a frame: 95th percentile of each pixel's max channel.
+
+    A percentile rather than the mean, so that a frame which is mostly a dark
+    object seen at close range still registers as lit from its highlights, and
+    a frame that is black apart from a few hot pixels still registers as unlit.
+    Subsampled (every 4th pixel each way): this runs on every capture and the
+    statistic does not need 300k samples.
+    """
+    if rgb is None:
+        return 0.0
+    array = np.asarray(rgb)
+    if array.size == 0:
+        return 0.0
+    if array.ndim == 3:
+        sample = array[::4, ::4, :3]
+    else:
+        sample = array.reshape(-1, array.shape[-1])[::16, :3]
+    value = np.max(sample.reshape(-1, sample.shape[-1]), axis=1)
+    return float(np.percentile(value, 95.0))
+
+
+def is_unlit_frame(rgb: NDArray[np.uint8] | None) -> bool:
+    """Whether a frame carries no usable colour (see :data:`UNLIT_FRAME_VALUE`).
+
+    Colour measured from such a frame is *unknown*, not "black": naming it
+    black is how a red block, a blue can and a green box were all reported as
+    black on the first observation of a run.
+    """
+    return frame_brightness(rgb) <= UNLIT_FRAME_VALUE
 
 
 def points_above_plane(

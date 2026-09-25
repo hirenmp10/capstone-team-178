@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mfw.config.schema import FrameworkConfig
-from mfw.core.errors import MfwError, SafetyViolation
+from mfw.core.errors import AmbiguousReference, MfwError, ObjectNotFound, SafetyViolation
 from mfw.core.interfaces import ISkill
 from mfw.core.types import SkillResult, SkillStatus
 from mfw.utils.logging import EventLogger, get_logger
@@ -50,6 +50,18 @@ class SkillContext:
     config: FrameworkConfig
     events: EventLogger | None = None
     support_height: float = 0.0
+    grasp_generator: Any = None
+    """Optional :class:`~mfw.core.interfaces.IGraspGenerator`. ``None`` keeps
+    the sim lane's direct OBB synthesis; the hardware lane injects a top-down
+    generator because its depthless perception has no real box to enumerate."""
+    held_grasp: Any = None
+    """The last verified grasp (:class:`mfw.skills.primitives.HeldGrasp`) or
+    ``None``. Written by ``Pick``, read and cleared by ``Place`` and
+    ``OpenGripper``. It records where the held object sits in the *gripper*
+    frame, measured at the lift, so a release with a different wrist
+    orientation can still aim the object rather than the hand. Keyed by track
+    id: a record for another object (a GR00T pick never writes one) is
+    ignored, never applied."""
 
     def emit(self, event: str, payload: dict[str, Any]) -> None:
         if self.events is not None:
@@ -106,6 +118,21 @@ class Skill(ISkill):
             # Never swallowed: a safety breach must reach the operator.
             self.ctx.emit("skill.safety_violation", {"skill": self.name, "params": params})
             raise
+        except (AmbiguousReference, ObjectNotFound) as exc:
+            # A reference error is a question or a plain "not here", never a
+            # motion failure. The structured fields ride along in ``data`` so
+            # the planner asks "which one?" with the grounding's own
+            # descriptions and track ids instead of re-deriving them (audit:
+            # AmbiguousReference used to be flattened to a message and retried
+            # three times). The ``"<ErrorClass>: "`` message prefix is kept
+            # because the planner and older callers key on it.
+            result = SkillResult(
+                skill_name=self.name,
+                status=SkillStatus.FAILED,
+                message=f"{type(exc).__name__}: {exc}",
+                duration_s=time.perf_counter() - started,
+                data=_reference_error_data(exc),
+            )
         except MfwError as exc:
             result = SkillResult(
                 skill_name=self.name,
@@ -167,3 +194,21 @@ class Skill(ISkill):
         return SkillResult(
             skill_name=self.name, status=SkillStatus.ABORTED, message=message, data=data
         )
+
+
+def _reference_error_data(exc: AmbiguousReference | ObjectNotFound) -> dict[str, Any]:
+    """``SkillResult.data`` for a reference error, in the planner's contract.
+
+    ``error_type`` plus, for an ambiguity, the index-aligned ``candidates``
+    and ``track_ids``; for a missing object, what *is* ``visible``.
+    """
+    data: dict[str, Any] = {"error_type": type(exc).__name__}
+    phrase = getattr(exc, "phrase", None)
+    if phrase is not None:
+        data["phrase"] = phrase
+    if isinstance(exc, AmbiguousReference):
+        data["candidates"] = list(exc.candidates)
+        data["track_ids"] = list(exc.track_ids)
+    else:
+        data["visible"] = list(getattr(exc, "visible", ()) or ())
+    return data

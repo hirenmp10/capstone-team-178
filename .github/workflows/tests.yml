@@ -1,0 +1,50 @@
+# Pure-logic test suite on every push and pull request.
+#
+# Runs everything except the `isaac` marker: those tests need an Isaac Sim 5.1
+# SimulationApp and an RTX GPU, which hosted runners do not have (run them
+# locally with `..\python.bat scripts\run_isaac_tests.py`). No model weights,
+# microphone, Jetson or GPU are needed: the GR00T, speech, detector and robot
+# transports are exercised against in-process servers and fakes.
+#
+# The install list is the ACTIVE block of requirements.txt with the headless
+# OpenCV build. It was checked by collecting the whole suite, and running the
+# GR00T/speech/config/vision files, with every other third-party import
+# blocked (a meta-path finder), so a test that silently needs torch,
+# sounddevice or PIL fails here instead of only on a developer machine.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pure-logic:
+    name: pure-logic (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install test dependencies
+        run: >
+          python -m pip install --upgrade pip &&
+          python -m pip install numpy scipy pyyaml pyzmq msgpack msgpack-numpy
+          opencv-python-headless pytest
+
+      - name: Pure-logic suite
+        run: python -m pytest tests -q -m "not isaac" -p no:cacheprovider

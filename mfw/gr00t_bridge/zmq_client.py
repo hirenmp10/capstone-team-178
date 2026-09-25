@@ -21,12 +21,29 @@ seam was for. The pickle client remains for the mock server used in tests, which
 must run without ZeroMQ installed.
 
 ``pyzmq`` and ``msgpack`` are imported lazily, so importing this module (and
-therefore the whole bridge) still works in Isaac Sim's interpreter, where neither
-is installed.
+therefore the whole bridge) still works in an interpreter without them.
+
+Wire contract (``Isaac-GR00T/gr00t/policy/server_client.py`` at n1.7-release)
+------------------------------------------------------------------------------
+* request: msgpack map ``{"endpoint": str, "data": {...}, "api_token"?: str}``;
+  the server calls ``handler(**data)``, so ``get_action`` needs
+  ``{"observation": ..., "options": ...}``.
+* reply: whatever the handler returned -- ``get_action`` returns the tuple
+  ``(action, info)``, which msgpack delivers as a **list**. Any server-side
+  exception, unknown endpoint or bad token comes back as ``{"error": str}``.
+* The server registers a ``kill`` endpoint, so a server bound beyond loopback
+  should require an ``api_token`` (``scripts/groot_server.py --api-token``).
+  This client sends one when given ``api_token=`` or when
+  ``MFW_GR00T_API_TOKEN`` is set.
+
+``tests/test_gr00t_zmq.py`` exercises this client against an in-thread REP
+server speaking that contract. It validates the bridge (framing, token, error
+and timeout handling), **not** model inference: no checkpoint is loaded there.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -36,9 +53,12 @@ from mfw.config.schema import Gr00tConfig
 from mfw.core.errors import PolicyError
 from mfw.utils.logging import get_logger
 
-__all__ = ["Gr00tZmqClient"]
+__all__ = ["Gr00tZmqClient", "API_TOKEN_ENV"]
 
 _log = get_logger("gr00t.zmq")
+
+#: Environment variable holding the shared secret for a token-protected server.
+API_TOKEN_ENV = "MFW_GR00T_API_TOKEN"
 
 
 class Gr00tZmqClient:
@@ -48,9 +68,12 @@ class Gr00tZmqClient:
     inheritance, so the framework never imports GR00T types.
     """
 
-    def __init__(self, config: Gr00tConfig) -> None:
+    def __init__(self, config: Gr00tConfig, api_token: str | None = None) -> None:
         config.validate()
         self.config = config
+        #: Sent with every request when set. Kept out of the YAML on purpose:
+        #: a secret does not belong in a committed config file.
+        self.api_token = api_token if api_token is not None else os.environ.get(API_TOKEN_ENV)
         self._socket: Any = None
         self._context: Any = None
         self._ready = False
@@ -125,7 +148,9 @@ class Gr00tZmqClient:
         if not self.is_ready():
             raise PolicyError("policy client is not connected; call connect() first")
 
-        payload = {"endpoint": endpoint, "data": data or {}}
+        payload: dict[str, Any] = {"endpoint": endpoint, "data": data or {}}
+        if self.api_token:
+            payload["api_token"] = self.api_token
         try:
             self._socket.send(self._pack(payload))
             reply = self._unpack(self._socket.recv())
@@ -164,9 +189,10 @@ class Gr00tZmqClient:
     def predict(self, observation: dict[str, Any]) -> dict[str, NDArray[np.float64]]:
         """Send one observation, receive one action chunk.
 
-        For ``oxe_droid`` the reply carries ``eef_9d`` (relative),
-        ``gripper_position`` (absolute) and ``joint_position`` (relative), each
-        over a 40-step horizon.
+        For ``oxe_droid`` the reply carries ``eef_9d``, ``gripper_position`` and
+        ``joint_position`` over a 40-step horizon. N1.7's processor decodes the
+        relative training representation back to absolute poses, which is why
+        ``gr00t.actions_are_absolute`` defaults to true.
 
         The payload is wrapped as ``{"observation": ..., "options": ...}`` because
         the server dispatches with ``handler(**request["data"])`` -- it spreads
@@ -211,14 +237,14 @@ class Gr00tZmqClient:
         if self._socket is not None:
             try:
                 self._socket.close()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - closing must never raise
+                _log.debug("ignoring error closing the ZMQ socket: %s", exc)
             self._socket = None
         if self._context is not None:
             try:
                 self._context.term()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("ignoring error terminating the ZMQ context: %s", exc)
             self._context = None
 
     def __enter__(self) -> "Gr00tZmqClient":

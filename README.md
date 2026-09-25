@@ -174,6 +174,25 @@ python manipulation_framework/scripts/validate_scene.py --gui --hold 30
 | `no_penetration` | Prevents interpenetrating spawns and explosive physics repulsion |
 | `stable_at_rest` | Zero physics drift before manipulation sequence initiates |
 
+### 5. Run the Franka Panda on the Benchmark Scene
+The benchmark scene (`configs/benchmark.yaml`) is an office table with scanned YCB objects that the Franka picks reliably — marker, banana, pudding box, soup can and foam brick — plus a bowl and a sorting bin as destinations.
+
+The repository must sit **inside** the Isaac Sim folder (`isaac-sim-standalone-5.1.0-windows-x86_64\<repo>`), because `..\python.bat` is Isaac Sim's own Python launcher. Run from the repository folder:
+
+```bash
+..\python.bat scripts\run_assistant.py --config configs/benchmark.yaml --gui -c "what do you see" -c "pick up the marker" -c "put it in the bowl" -c "go home"
+```
+
+Each `-c` runs one command, in order. Drop `--gui` to run headless; use `--interactive` instead of `-c` to type commands one at a time.
+
+Benchmark every object — pick it, then place it back where it was picked:
+
+```bash
+..\python.bat scripts\benchmark_manipulation.py --config configs/benchmark.yaml --place
+```
+
+Success is judged by simulator ground truth (the object must rise more than 3 cm, then come to rest after release), not by the skill's own report. Every run writes `logs/benchmark/<timestamp>_manipulation.json` and `.csv`.
+
 ---
 
 ## Key Design Principles

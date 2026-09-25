@@ -17,12 +17,29 @@ that matters:
 * **Rejecting** is correct when the action is not merely large but invalid --
   non-finite values, or a target outside the workspace. Clamping those would
   fabricate a plausible command out of a meaningless one.
+
+The support surface is part of the envelope
+-------------------------------------------
+``scene.workspace_min`` is a box whose z-min is the *floor* (0.0), while the
+table top in ``configs/default.yaml`` sits at z = 0.4. Clamping an absolute
+target into that box was described as "safe by construction", but it is not:
+a target at z = 0.005 is inside the box and 0.4 m *inside the table*.
+``controller.servo_to_pose`` is IK plus one interpolation step with no
+collision check, so nothing downstream would have stopped it. Measured with the
+old mock (which emitted deltas that the executor read as absolute poses) the
+servo targets walked from [0.415, 0, 0.415] to [0.2, 0, 0.005] -- through the
+table -- with every step reported as merely "clamped".
+
+So the filter takes the support height and raises the z floor to
+``support_height + support_clearance`` (the TCP sits between the fingertip
+pads, so a small clearance keeps the pads off the surface while still letting a
+top-down grasp close on a 5 cm block). Absolute targets are clamped onto it;
+delta targets that cross it raise, exactly like any other workspace breach.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,9 +50,15 @@ from mfw.core.types import Frame, Pose
 from mfw.utils import transforms as tf
 from mfw.utils.logging import get_logger
 
-__all__ = ["ActionSafetyFilter", "FilteredAction"]
+__all__ = ["ActionSafetyFilter", "FilteredAction", "DEFAULT_SUPPORT_CLEARANCE_M"]
 
 _log = get_logger("gr00t.safety")
+
+#: Metres the TCP must stay above the support surface. The TCP is the midpoint
+#: between the fingertip pads, which extend roughly a centimetre below it, so
+#: 15 mm keeps the pads off the table while leaving a top-down grasp on a
+#: 50 mm cube (TCP ~25 mm above the table) reachable.
+DEFAULT_SUPPORT_CLEARANCE_M = 0.015
 
 
 @dataclass(frozen=True)
@@ -74,7 +97,7 @@ class FilteredAction(dict):
 
 
 class ActionSafetyFilter:
-    """Converts a relative policy action into a bounded absolute target."""
+    """Converts a policy action (absolute pose or delta) into a bounded absolute target."""
 
     def __init__(
         self,
@@ -83,13 +106,35 @@ class ActionSafetyFilter:
         workspace_max: NDArray[np.float64],
         gripper_open_width: float,
         gripper_closed_width: float,
+        support_height: float | None = None,
+        support_clearance: float = DEFAULT_SUPPORT_CLEARANCE_M,
     ) -> None:
+        """``support_height`` is the z of the surface the arm works on.
+
+        ``None`` keeps the bare workspace box (the historical behaviour, and
+        correct only when the box's z-min already sits above the surface).
+        """
         config.validate()
         self.config = config
-        self.workspace_min = np.asarray(workspace_min, dtype=np.float64)
+        self.workspace_min = np.asarray(workspace_min, dtype=np.float64).copy()
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64)
         self.gripper_open_width = float(gripper_open_width)
         self.gripper_closed_width = float(gripper_closed_width)
+        self.support_height = None if support_height is None else float(support_height)
+        if self.support_height is not None:
+            floor = self.support_height + float(support_clearance)
+            if floor >= self.workspace_max[2]:
+                raise SafetyViolation(
+                    f"support floor z={floor:.3f} (surface {self.support_height:.3f} + "
+                    f"clearance {support_clearance:.3f}) is at or above workspace z-max "
+                    f"{self.workspace_max[2]:.3f}; no policy target could be valid"
+                )
+            self.workspace_min[2] = max(self.workspace_min[2], floor)
+
+    @property
+    def floor_z(self) -> float:
+        """Lowest z a policy target may command (workspace z-min or support floor)."""
+        return float(self.workspace_min[2])
 
     def apply(
         self,
@@ -197,8 +242,10 @@ class ActionSafetyFilter:
             if absolute:
                 # Clamp an absolute target onto the envelope rather than aborting.
                 #
-                # The envelope IS the safety property, and a point clamped into it
-                # is safe by construction -- unlike a *delta*, where clamping
+                # The envelope IS the safety property -- the workspace box with
+                # its z-min raised to the support floor (see the module
+                # docstring: the bare box contains the table) -- and a point
+                # clamped into it stays out of the table -- unlike a *delta*, where clamping
                 # invents a direction the policy never chose. Aborting instead is
                 # disproportionate for a policy that steers continuously: measured
                 # here, a target 4 mm outside X-min killed an entire 30-iteration

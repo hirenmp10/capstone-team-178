@@ -209,9 +209,10 @@ class TestObservationContract:
     def test_video_carries_a_batch_axis(self, gr00t_config):
         """(B, T, H, W, C) -- five dimensions, not four.
 
-        Verified against the live checkpoint. The embodiment config declares
-        modality keys and delta_indices but says nothing about batching, so this
-        was wrong until the real model rejected it:
+        Enforced by NVIDIA's observation validator (confirmed against the
+        checkpoint's modality config; no model loaded). The embodiment config
+        declares modality keys and delta_indices but says nothing about
+        batching, so this was wrong until the validator rejected it:
             "Video key must be (B, T, H, W, C), got (2, 224, 224, 3)"
         """
         builder = ObservationBuilder(gr00t_config)
@@ -275,7 +276,8 @@ class TestSafetyFilter:
     def test_passes_a_small_absolute_action_unchanged(self, safety):
         """GR00T emits ABSOLUTE world poses, despite the "relative" embodiment tag.
 
-        These numbers are from the live model: with the TCP at [0.45, 0, 0.45],
+        These numbers are recorded in the schema docstring as a live-model
+        measurement (no log of that run survives): with the TCP at [0.45, 0, 0.45],
         action[0] was [0.4569, -0.0059, 0.4435] -- an 11 mm move. Read as a delta
         it becomes a 0.61 m step and is clamped every single time, which is
         exactly what produced a 100% clamp rate and looked like a failing policy.
@@ -406,7 +408,7 @@ class TestSafetyFilter:
 
 
 class TestActionUnwrapping:
-    """The policy's reply shape, verified against the live checkpoint."""
+    """The policy's reply shape, as NVIDIA's get_action defines it: (action, info)."""
 
     def test_unwraps_a_tuple_reply(self):
         """get_action returns a TUPLE containing the dict, not a bare dict."""
@@ -458,3 +460,257 @@ class TestExecutorRouting:
 
         with pytest.raises(ConfigError, match="gr00t.enabled"):
             load_config(overrides={"default_executor": "gr00t"})
+
+    def test_config_rejects_the_unimplemented_support_constrained_height(self):
+        """The flag was never read by any code; true must fail loudly, false must still load."""
+        from mfw.config.schema import ConfigError
+
+        with pytest.raises(ConfigError, match="support_constrained_height is not implemented"):
+            load_config(overrides={"perception": {"support_constrained_height": True}})
+        assert load_config(overrides={"perception": {"support_constrained_height": False}})
+
+
+class TestSupportFloor:
+    """The workspace box's z-min is the floor; the table top is 0.4 m above it.
+
+    Clamping an absolute target into the bare box let targets reach z = 0.005,
+    i.e. inside the table, while ``servo_to_pose`` does no collision checking.
+    """
+
+    @pytest.fixture
+    def safety(self):
+        return ActionSafetyFilter(
+            config=Gr00tConfig(enabled=True),
+            workspace_min=np.array([0.12, -0.55, 0.0]),
+            workspace_max=np.array([0.85, 0.55, 0.85]),
+            gripper_open_width=0.08,
+            gripper_closed_width=0.0,
+            support_height=0.4,
+            support_clearance=0.015,
+        )
+
+    def test_absolute_target_inside_the_table_is_lifted_to_the_floor(self, safety):
+        current = Pose(np.array([0.5, 0.0, 0.43]), np.array([0.0, 1, 0, 0]), Frame.WORLD)
+        rot6d = tf.matrix_to_rot6d(current.rotation_matrix())
+        filtered = safety.apply(current, np.concatenate([[0.5, 0.0, 0.40], rot6d]), 0.08)
+
+        assert filtered.was_clamped
+        assert filtered.target_pose.position[2] == pytest.approx(0.415)
+        assert safety.floor_z == pytest.approx(0.415)
+
+    def test_delta_that_crosses_the_floor_is_rejected(self, safety):
+        current = Pose(np.array([0.5, 0.0, 0.42]), np.array([1.0, 0, 0, 0]), Frame.WORLD)
+        with pytest.raises(SafetyViolation, match="outside the workspace"):
+            safety.apply(
+                current,
+                np.concatenate([[0.0, 0.0, -0.02], IDENTITY_ROT6D]),
+                0.08,
+                absolute=False,
+            )
+
+    def test_targets_above_the_floor_are_untouched(self, safety):
+        current = Pose(np.array([0.5, 0.0, 0.45]), np.array([0.0, 1, 0, 0]), Frame.WORLD)
+        rot6d = tf.matrix_to_rot6d(current.rotation_matrix())
+        filtered = safety.apply(current, np.concatenate([[0.5, 0.0, 0.44], rot6d]), 0.08)
+        assert not filtered.was_clamped
+
+    def test_floor_above_the_workspace_ceiling_is_refused(self):
+        with pytest.raises(SafetyViolation, match="z-max"):
+            ActionSafetyFilter(
+                config=Gr00tConfig(enabled=True),
+                workspace_min=np.array([0.1, -0.5, 0.0]),
+                workspace_max=np.array([0.8, 0.5, 0.3]),
+                gripper_open_width=0.08,
+                gripper_closed_width=0.0,
+                support_height=0.4,
+            )
+
+    def test_executor_derives_the_floor_from_the_scene(self):
+        from mfw.gr00t_bridge.executor import support_height
+
+        config = load_config()
+        assert support_height(config) == pytest.approx(
+            config.scene.table_position[2] + config.scene.table_scale[2] / 2.0
+        )
+        no_table = load_config(overrides={"scene": {"add_table": False}})
+        assert support_height(no_table) == pytest.approx(no_table.perception.ground_plane_z)
+
+
+class TestMockPolicyRepresentation:
+    """The mock must speak the representation the executor is configured for.
+
+    It used to emit deltas while the executor (``actions_are_absolute: true``)
+    read them as world poses: 24/24 actions clamped and the servo targets
+    walked to [0.2, 0, 0.005].
+    """
+
+    def test_absolute_mock_steps_are_small_moves_from_the_current_pose(self):
+        policy = MockPolicy(actions_are_absolute=True)
+        top_down = tf.quat_to_matrix(np.array([0.0, 1.0, 0.0, 0.0]))
+        current = np.concatenate([[0.30, 0.0, 0.60], tf.matrix_to_rot6d(top_down)])
+        chunk = policy.predict({"state": {"eef_9d": current[None, None, :]}})["eef_9d"]
+
+        path = np.vstack([current[:3], chunk[:, :3]])
+        steps = np.linalg.norm(np.diff(path, axis=0), axis=1)
+        assert np.all(steps < 0.01), "each absolute pose must be a few mm from the last"
+        assert np.allclose(chunk[:, 3:], current[3:]), "absolute mock keeps the wrist orientation"
+
+    def test_relative_mock_still_emits_small_deltas(self):
+        chunk = MockPolicy(actions_are_absolute=False).predict(
+            {"state": {"eef_9d": np.zeros((1, 1, 9))}}
+        )["eef_9d"]
+        assert np.all(np.linalg.norm(chunk[:, :3], axis=1) < 0.01)
+        assert np.allclose(chunk[:, 3:], IDENTITY_ROT6D)
+
+    def test_executor_with_the_absolute_mock_clamps_nothing(self, mock_server):
+        """End to end over the pickle transport: the regression guard for the 100% clamp."""
+        import types
+
+        from mfw.gr00t_bridge.executor import Gr00tExecutor, support_height
+
+        host, port = mock_server
+        config = load_config(
+            overrides={
+                "gr00t": {"enabled": True, "use_mock_server": True, "host": host, "port": port}
+            }
+        )
+        floor = support_height(config)
+
+        class Arm:
+            def __init__(self):
+                self.pose = Pose(
+                    np.array([0.30, 0.0, 0.60]), np.array([0.0, 1.0, 0, 0]), Frame.WORLD
+                )
+                self.targets = []
+
+            def tcp_pose(self):
+                return self.pose
+
+            def get_state(self):
+                return RobotState(
+                    joint_state=JointState(
+                        positions=np.zeros(7), names=tuple(f"j{i}" for i in range(7))
+                    ),
+                    tcp_pose=self.pose,
+                    gripper=GripperState(
+                        width=0.08, target_width=0.08, is_moving=False, is_grasping=False
+                    ),
+                    sim_time=0.0,
+                    step_index=0,
+                )
+
+            def servo_to_pose(self, pose):
+                self.targets.append(pose.position.copy())
+                self.pose = pose
+                return True
+
+            def open_gripper(self):
+                pass
+
+            def close_gripper(self):
+                pass
+
+        arm = Arm()
+        frame = types.SimpleNamespace(rgb=np.zeros((48, 64, 3), np.uint8))
+        camera = types.SimpleNamespace(capture=lambda: frame)
+        client = Gr00tTcpClient(config.gr00t)
+        client.connect()
+        try:
+            executor = Gr00tExecutor(
+                client,
+                arm,
+                vision=None,
+                controller=arm,
+                cameras={config.exterior_camera.name: camera, config.wrist_camera.name: camera},
+                config=config,
+            )
+            result = executor.execute("move_to", {"target": "centre", "max_iterations": 3})
+        finally:
+            client.close()
+
+        assert result.data["clamped_actions"] == 0
+        assert result.data["executed_steps"] == 3 * config.gr00t.actions_executed_per_chunk
+        assert min(t[2] for t in arm.targets) > floor
+
+    def test_client_refuses_a_representation_mismatch(self):
+        server = PolicyServer("127.0.0.1", 0, MockPolicy(actions_are_absolute=False))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            client = Gr00tTcpClient(
+                Gr00tConfig(enabled=True, host=host, port=port, actions_are_absolute=True)
+            )
+            with pytest.raises(PolicyError, match="deltas"):
+                client.connect(retries=1, backoff_s=0.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestRealBackendApi:
+    """``server.Gr00tPolicy`` must call the N1.7 API, not the N1.5 one.
+
+    The old code imported ``gr00t.experiment.data_config`` and
+    ``gr00t.model.policy`` -- N1.5 modules absent from the N1.7 checkout, so the
+    real backend could never start. A stand-in ``gr00t.policy.gr00t_policy``
+    module records the call; no model is loaded.
+    """
+
+    @pytest.fixture
+    def fake_gr00t(self, monkeypatch):
+        import sys
+        import types
+
+        calls: dict = {}
+
+        class FakeN17Policy:
+            def __init__(self, embodiment_tag, model_path, *, device, strict=True):
+                calls.update(
+                    embodiment_tag=embodiment_tag,
+                    model_path=model_path,
+                    device=device,
+                    strict=strict,
+                )
+
+            def get_action(self, observation, options=None):
+                calls["options"] = options
+                return {"eef_9d": np.zeros((1, 40, 9), np.float32)}, {"info": 1}
+
+        module = types.ModuleType("gr00t.policy.gr00t_policy")
+        module.Gr00tPolicy = FakeN17Policy
+        for name in ("gr00t", "gr00t.policy"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        monkeypatch.setitem(sys.modules, "gr00t.policy.gr00t_policy", module)
+        return calls
+
+    def test_constructs_with_the_n17_signature(self, fake_gr00t, tmp_path):
+        from mfw.gr00t_bridge.server import Gr00tPolicy
+
+        policy = Gr00tPolicy(checkpoint=str(tmp_path), device="cuda:0")
+        assert fake_gr00t == {
+            "embodiment_tag": "oxe_droid_relative_eef_relative_joint",
+            "model_path": str(tmp_path),
+            "device": "cuda:0",
+            "strict": True,
+        }
+        assert policy.actions_are_absolute is True
+
+    def test_predict_unwraps_the_action_info_tuple(self, fake_gr00t, tmp_path):
+        from mfw.gr00t_bridge.server import Gr00tPolicy
+
+        action = Gr00tPolicy(checkpoint=str(tmp_path)).predict({"state": {}})
+        assert set(action) == {"eef_9d"}
+        assert action["eef_9d"].shape == (1, 40, 9)
+        assert fake_gr00t["options"] is None
+
+    def test_missing_gr00t_is_a_policy_error_not_a_system_exit(self, monkeypatch, tmp_path):
+        import sys
+
+        from mfw.gr00t_bridge.server import Gr00tPolicy
+
+        monkeypatch.setitem(sys.modules, "gr00t", None)
+        monkeypatch.setitem(sys.modules, "gr00t.policy", None)
+        monkeypatch.setitem(sys.modules, "gr00t.policy.gr00t_policy", None)
+        with pytest.raises(PolicyError, match="not importable"):
+            Gr00tPolicy(checkpoint=str(tmp_path))

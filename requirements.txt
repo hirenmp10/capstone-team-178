@@ -1,33 +1,91 @@
-# Manipulation Framework (mfw) Dependencies
-# ===============================================
+# Manipulation Framework (mfw) dependencies, per interpreter
+# ===========================================================
+#
+# This project runs in up to five SEPARATE interpreters on purpose (Isaac Sim is
+# Python 3.11, GR00T needs 3.12, CTranslate2/NeMo crash inside Isaac). Only the
+# block marked ACTIVE installs with `pip install -r requirements.txt`; every
+# other block is a commented recipe for its own environment.
+#
+# Floors are only where a real constraint exists; exact pins appear only where an
+# upstream project pins them (GR00T) and are marked as such. Everything was
+# derived from an AST scan of mfw/, scripts/, jetson/ and tests/ (2026-09-24).
 
-# 1. Core Isaac Sim 5.1 Environment
-# Note: When running inside Isaac Sim 5.1 via python.bat, numpy and standard
-# scientific libraries are bundled. The packages below provide the configuration,
-# IPC, data serialization, and testing infrastructure:
-pyyaml>=6.0
-msgpack>=1.0.5
-msgpack-numpy>=0.4.8
-pyzmq>=25.1.0
-scipy>=1.10.0
-numpy>=1.24.0
-pytest>=7.0.0
+# ---------------------------------------------------------------------------
+# A. ACTIVE -- vanilla Python 3.12: the pure-logic test suite, the hardware
+#    lane on the laptop (run_assistant.py --hardware / --fake-hardware),
+#    calibrate_*.py, and CI (.github/workflows/tests.yml).
+#    `py -3.12 -m pytest tests -q -m "not isaac"` needs exactly these.
+# ---------------------------------------------------------------------------
+numpy>=1.24            # every module; >=1.24 is the oldest line all envs share (GR00T pins 1.26.4)
+scipy>=1.10            # mfw/vision/tracking.py optimal track assignment (greedy fallback without it)
+pyyaml>=6.0            # mfw/config/schema.py load_config -- nothing runs without it
+pyzmq>=25.1            # hardware RPC (mfw/hardware/zmq_rpc.py) and the GR00T client
+msgpack>=1.0           # 1.0 changed raw/use_bin_type defaults; the wire code assumes the new ones
+msgpack-numpy>=0.4.8   # ndarray framing; 0.4.8 is what NVIDIA's GR00T server pins
+opencv-python>=4.9     # JPEG decode of the Jetson camera stream, calibrate_table.py
+                       # (CI installs opencv-python-headless instead: same cv2 API, no GUI libs)
+pytest>=7.0
 
-# 2. Resident LLM Worker Environment (Optional - Dedicated Python 3.11 venv)
-# Used by scripts/llm_worker.py for real Qwen 2.5-3B-Instruct intent parsing:
-# torch>=2.2.0
-# transformers>=4.40.0
-# accelerate>=0.28.0
+# ---------------------------------------------------------------------------
+# B. Isaac Sim 5.1 bundled Python 3.11 (..\python.bat) -- install NOTHING.
+#    numpy, scipy, pyyaml, pyzmq, msgpack, msgpack_numpy, cv2 and pytest ship
+#    in Isaac's kit/python and exts/omni.pip.compute/pip_prebundle. Adding
+#    packages there risks replacing Kit's own builds.
+# ---------------------------------------------------------------------------
 
-# 3. Voice / Speech Worker Environment (Optional - Dedicated Python 3.11 venv)
-# Used by scripts/speech_worker.py for microphone input and Whisper ASR:
-# sounddevice>=0.4.6
-# faster-whisper>=1.0.0
+# ---------------------------------------------------------------------------
+# C. Laptop Florence-2 detector (scripts/serve_detector.py), vanilla 3.12.
+#    Loads microsoft/Florence-2 via transformers (native class, else
+#    trust_remote_code). Use the CUDA torch wheel for your driver.
+# ---------------------------------------------------------------------------
+# torch
+# transformers
+# pillow               # PIL.Image for the processor input
+# (also scripts/render_cameras.py uses pillow to write PNGs, under Isaac's python)
 
-# 4. NVIDIA GR00T N1.7 Server Environment (Optional - Python 3.12 venv)
-# Used by scripts/groot_server.py:
-# torch>=2.4.0
-# huggingface-hub>=0.24.0
-# msgpack>=1.0.5
-# msgpack-numpy>=0.4.8
-# pyzmq>=25.1.0
+# ---------------------------------------------------------------------------
+# D. Sim-lane LLM worker (scripts/llm_worker.py, Qwen2.5-3B-Instruct).
+# ---------------------------------------------------------------------------
+# torch
+# transformers
+# accelerate           # llm_worker passes device_map=, which transformers delegates to accelerate
+
+# ---------------------------------------------------------------------------
+# E. Speech worker (scripts/speech_worker.py) -- a system 3.11/3.12 python,
+#    NEVER Isaac's (CTranslate2 crashes inside it).
+#    --asr whisper :
+# sounddevice          # microphone capture (not needed for --wav / --stdin)
+# faster-whisper
+#    --asr canary : NeMo from git trunk in ~/canary-venv, launched through
+#    scripts/serve_speech.py (appends that venv's site-packages; see its
+#    docstring for the torch/torchvision CUDA-line trap). Observed working:
+#    nemo_toolkit 3.1.0 in the venv, torch 2.12 cu130 + torchvision 0.27 in the base.
+# nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git
+#    scripts/tts_to_wav.py needs nothing: Windows SAPI via PowerShell.
+
+# ---------------------------------------------------------------------------
+# F. GR00T N1.7 server (scripts/groot_server.py) -- its own Python 3.12 venv.
+#    Install GR00T itself; its pyproject pins the stack (torch==2.9.0,
+#    transformers==4.57.3, numpy==1.26.4, pyzmq==27.0.1, msgpack==1.1.0,
+#    msgpack-numpy==0.4.8). flash-attn/deepspeed are Linux-only there; on
+#    Windows the Qwen3 backbone falls back to sdpa attention.
+# ---------------------------------------------------------------------------
+# -e <path-to>/Isaac-GR00T
+# huggingface-hub      # repo-id -> snapshot resolution (already a GR00T dependency)
+
+# ---------------------------------------------------------------------------
+# G. Jetson Orin Nano (JetPack 6.2.2 system Python 3.10): jetson/robot_server.py,
+#    jetson/detector_service.py, speech_worker.py --asr parakeet.
+#    NanoOWL runs in its own container (jetson-containers), not via pip.
+# ---------------------------------------------------------------------------
+# numpy
+# pyyaml
+# pyzmq
+# msgpack
+# msgpack-numpy
+# opencv-python        # or JetPack's bundled OpenCV
+# pillow               # detector_service.py NanoOWL input
+# pyserial             # Arduino servo bridge driver
+# smbus2               # PCA9685 servo driver
+# sherpa-onnx          # Parakeet-TDT ASR
+# sounddevice          # parakeet --mic capture

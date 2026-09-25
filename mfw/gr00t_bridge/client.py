@@ -119,6 +119,19 @@ class Gr00tTcpClient:
                         f"{self.config.embodiment_tag!r}"
                     )
 
+                server_absolute = reply.get("actions_are_absolute")
+                if (
+                    server_absolute is not None
+                    and bool(server_absolute) != self.config.actions_are_absolute
+                ):
+                    # Measured: a delta-emitting mock read as absolute poses
+                    # clamped 24/24 actions and steered the servo targets to
+                    # [0.2, 0, 0.005] -- inside the table. Refuse up front.
+                    raise PolicyError(
+                        f"server emits {'absolute poses' if server_absolute else 'deltas'} "
+                        f"but gr00t.actions_are_absolute is {self.config.actions_are_absolute}"
+                    )
+
                 self._ready = True
                 _log.info(
                     "Connected to GR00T server at %s:%d (embodiment %s)",
@@ -144,9 +157,10 @@ class Gr00tTcpClient:
     def predict(self, observation: dict[str, Any]) -> dict[str, NDArray[np.float64]]:
         """Send one observation and receive one action chunk.
 
-        For ``oxe_droid`` the reply carries ``eef_9d`` (relative),
-        ``gripper_position`` (absolute) and ``joint_position`` (relative), each
-        over a 40-step horizon.
+        For ``oxe_droid`` the reply carries ``eef_9d``, ``gripper_position`` and
+        ``joint_position``, each over a 40-step horizon. Whether ``eef_9d`` is an
+        absolute pose or a delta is ``gr00t.actions_are_absolute`` (checked
+        against the server at handshake).
         """
         if not self.is_ready():
             raise PolicyError("policy client is not connected; call connect() first")
