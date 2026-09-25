@@ -707,7 +707,10 @@ _SCOPED = ("PYTHONPYCACHEPREFIX", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "GRO
 _POWERSHELL = shutil.which("powershell") or shutil.which("pwsh")
 
 
-@pytest.mark.skipif(_POWERSHELL is None, reason="PowerShell is not available")
+@pytest.mark.skipif(
+    _POWERSHELL is None or sys.platform != "win32",
+    reason="scripts/start_groot_server.ps1 is a Windows launcher (USERPROFILE, Windows paths)",
+)
 class TestLauncher:
     @staticmethod
     def _run(command: str) -> subprocess.CompletedProcess:

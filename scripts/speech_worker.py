@@ -901,9 +901,15 @@ def bind_server_socket(host: str, port: int):
 
     Windows: ``SO_REUSEADDR`` there lets a second socket bind a port another
     socket already holds -- exactly what must not happen -- so the socket asks
-    for ``SO_EXCLUSIVEADDRUSE`` instead. POSIX: ``SO_REUSEADDR`` only permits
-    re-binding over TIME_WAIT leftovers of a previous run; a live listener
-    still refuses the bind (and ``listen`` refuses the rare both-bound race).
+    for ``SO_EXCLUSIVEADDRUSE`` instead.
+
+    POSIX: no ``SO_REUSEADDR`` at all. The port is claimed *before* listening,
+    and Linux lets two ``SO_REUSEADDR`` sockets bind the same port as long as
+    neither is listening yet (socket(7)) -- measured on GitHub's ubuntu-latest
+    runner, where the duplicate's bind succeeded. Without the option the
+    second bind fails with EADDRINUSE immediately. The cost: a restart within
+    ~60 s of a crash that left server-side TIME_WAIT connections is refused
+    too, with the same "already in use" message -- wait, or pick another port.
 
     Raises :class:`PortInUseError` with an operator-facing message.
     """
@@ -915,8 +921,6 @@ def bind_server_socket(host: str, port: int):
             exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
             if exclusive is not None:
                 server.setsockopt(socket.SOL_SOCKET, exclusive, 1)
-        else:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
     except OSError as exc:
         server.close()
