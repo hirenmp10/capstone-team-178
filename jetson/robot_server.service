@@ -1,0 +1,18 @@
+[Unit]
+Description=Robot Server — hardware lane ZMQ RPC bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/capstone-team-178/jetson/robot_server.py \
+    --driver uno_serial \
+    --host 0.0.0.0 \
+    --port 5560
+WorkingDirectory=/opt/capstone-team-178
+Restart=on-failure
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

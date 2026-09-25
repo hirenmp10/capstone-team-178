@@ -37,12 +37,18 @@ import importlib.util as _importlib_util
 #: The hardware lane (mfw/hardware, jetson/, tests/test_hardware_*.py) is not part of
 #: every checkout -- the simulation-only branch omits it. Tests of the hardware lane
 #: skip there instead of breaking collection of the simulation tests in this file.
-HARDWARE_LANE_PRESENT = (
-    _importlib_util.find_spec("mfw.hardware") is not None
-    and _importlib_util.find_spec("jetson") is not None
+HARDWARE_LANE_PRESENT = all(
+    _importlib_util.find_spec(m) is not None
+    for m in (
+        "mfw.hardware.kinematics",
+        "jetson.robot_server",
+        "jetson.detector_service",
+        "tests.test_hardware_e2e",
+    )
 )
 needs_hardware_lane = pytest.mark.skipif(
-    not HARDWARE_LANE_PRESENT, reason="hardware lane (mfw/hardware, jetson/) is not in this checkout"
+    not HARDWARE_LANE_PRESENT,
+    reason="hardware lane (mfw.hardware.kinematics, jetson.detector_service, tests.test_hardware_e2e) is not in this checkout",
 )
 
 from mfw.config.schema import MemoryConfig, load_config
