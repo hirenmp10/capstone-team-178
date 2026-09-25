@@ -136,11 +136,21 @@ class ServoCalibration:
 
     @classmethod
     def from_json(cls, path_or_str: str | Path) -> ServoCalibration:
-        p = Path(path_or_str)
-        if p.is_file():
-            text = p.read_text(encoding="utf-8")
+        if isinstance(path_or_str, Path):
+            text = path_or_str.read_text(encoding="utf-8")
         else:
-            text = str(path_or_str)
+            s = str(path_or_str).strip()
+            if s.startswith("{"):
+                text = s
+            else:
+                try:
+                    p = Path(path_or_str)
+                    if p.is_file():
+                        text = p.read_text(encoding="utf-8")
+                    else:
+                        text = s
+                except (OSError, ValueError):
+                    text = s
         return cls.from_dict(json.loads(text))
 
     def rad_to_pulse(self, i: int, rad: float) -> tuple[float, float]:
