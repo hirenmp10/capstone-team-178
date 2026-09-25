@@ -16,17 +16,3 @@ See ARCHITECTURE.md for the full design.
 from __future__ import annotations
 
 __version__ = "0.1.0"
-
-# Guard find_spec for partial hardware lane checkouts (Stage A)
-import importlib.util as _importlib_util
-_real_find_spec = _importlib_util.find_spec
-
-def _safe_find_spec(name, *args, **kwargs):
-    if name == "mfw.hardware":
-        spec = _real_find_spec(name, *args, **kwargs)
-        if spec is not None and not _real_find_spec("mfw.hardware.kinematics"):
-            return None
-        return spec
-    return _real_find_spec(name, *args, **kwargs)
-
-_importlib_util.find_spec = _safe_find_spec
