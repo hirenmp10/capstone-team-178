@@ -1,0 +1,93 @@
+# Hardware lane configuration for physical robot arm.
+#
+# Geometry and link lengths are marked PLACEHOLDER until physical bench measurements
+# are performed. Servo pulse calibration resides in Jetson servo_calibration.json.
+
+backend: hardware
+
+robot:
+  kinematics: planar_4dof
+  arm_joint_names:
+    - base_yaw
+    - shoulder
+    - elbow
+    - wrist
+  home_joint_positions: [0.0, 0.0, 0.0, 0.0]
+  gripper_feedback: false
+  tcp_parent_prim: wrist
+  tcp_offset_from_hand: [0.0, 0.0, 0.09]  # matches arm.tool (0.09 m)
+  left_finger_prim: left_jaw
+  right_finger_prim: right_jaw
+  gripper_open_width: 0.08
+  gripper_closed_width: 0.0
+  gripper_force: 5.0
+  gripper_speed: 0.05
+  joint_velocity_limit: 1.0
+  joint_position_tolerance: 0.01
+
+wrist_camera:
+  name: wrist_camera
+  enabled: false
+
+exterior_camera:
+  name: exterior_camera
+  enabled: true
+  homography: []  # Uncalibrated: populated via scripts/calibrate_table.py
+  pose_measured: false
+
+motion:
+  planner: joint_space
+  max_planning_time_s: 5.0
+  cartesian_step: 0.005
+
+scene:
+  workspace_min: [-0.30, -0.30, 0.0]
+  workspace_max: [0.30, 0.30, 0.35]
+
+hardware:
+  jetson_host: "127.0.0.1"
+  jetson_port: 5560
+  detector_host: "127.0.0.1"
+  detector_port: 5558
+  arm_bridge: uno_serial
+  fake_clock: false
+  request_timeout_s: 5.0
+  trajectory_timeout_margin_s: 5.0
+  trajectory_chunk_s: 1.0
+  settle_steps_after_motion: 24
+  heartbeat_s: 1.0
+  detection_min_score: 0.1
+  pixel_anchor: bottom_center
+  workspace_margin_xy: 0.03
+  grasp_pitch_angles_deg: [90.0, 75.0, 60.0]
+  grasp_close_margin_m: 0.004
+
+  arm:
+    base_height: 0.07       # PLACEHOLDER — MEASURE: table to shoulder axis (m)
+    shoulder_offset: 0.0    # PLACEHOLDER — MEASURE: yaw axis to shoulder axis (m)
+    upper_arm: 0.105        # PLACEHOLDER — MEASURE: shoulder axis to elbow axis (m)
+    forearm: 0.10           # PLACEHOLDER — MEASURE: elbow axis to wrist axis (m)
+    tool: 0.09              # PLACEHOLDER — MEASURE: wrist axis to jaw midpoint (m)
+    joint_lower: [-1.5708, -0.5236, -1.5708, -1.5708]
+    joint_upper: [1.5708, 1.5708, 1.5708, 1.5708]
+    elbow_up: true
+    jaw_axis: tangential
+    transit_height: 0.15
+
+  labels:
+    - marker
+    - banana
+    - box
+    - cube
+    - bowl
+    - bin
+
+  default_object_size: [0.04, 0.04, 0.04]
+
+  object_sizes:
+    marker: [0.024, 0.024, 0.12]   # PLACEHOLDER — MEASURE (diameter 24mm, height 120mm)
+    banana: [0.04, 0.14, 0.04]     # PLACEHOLDER — MEASURE (w 40mm, l 140mm, h 40mm)
+    box: [0.12, 0.08, 0.05]        # PLACEHOLDER — MEASURE (w 120mm, d 80mm, h 50mm)
+    cube: [0.04, 0.04, 0.04]       # PLACEHOLDER — MEASURE (side 40mm)
+    bowl: [0.12, 0.12, 0.05]       # PLACEHOLDER — MEASURE (diameter 120mm, rim 50mm)
+    bin: [0.15, 0.12, 0.10]        # PLACEHOLDER — MEASURE (w 150mm, d 120mm, h 100mm)

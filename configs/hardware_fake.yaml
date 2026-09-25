@@ -1,0 +1,8 @@
+# Fake hardware lane configuration for simulation and unit tests.
+# Inherits from hardware.yaml and overrides arm_bridge to fake and fake_clock to true.
+
+extends: hardware.yaml
+
+hardware:
+  arm_bridge: fake
+  fake_clock: true

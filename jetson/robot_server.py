@@ -746,7 +746,7 @@ class RobotServer:
                 }
             else:
                 objects = self._parse_fake_world()
-                # TODO: attachment physics needs mfw.hardware.kinematics, which is not in the repo yet
+                # Reference: attachment physics uses mfw.hardware.kinematics.PlanarKinematics
                 reply = {
                     "ok": True,
                     "objects": objects,
