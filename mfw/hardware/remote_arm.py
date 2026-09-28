@@ -640,7 +640,9 @@ class RemoteArm(IRobot):
         the server's velocity ceiling. Safe at bring-up; never call it while
         holding an object. At bring-up after a bridge reset (every server
         start on the Uno) the servos attach AT home instantly -- the reply
-        says ``first_attach`` and a warning repeats the hand-pose rule.
+        says ``first_attach`` and a warning repeats the hand-pose rule. This
+        method does not ask anyone: :class:`~mfw.hardware.runtime.HardwareRuntime`
+        runs its first-home gate (operator confirmation) before calling it.
         """
         reply = self._client.home()
         self._absorb(reply)
@@ -649,7 +651,8 @@ class RemoteArm(IRobot):
                 "The servo bridge had no known position (it resets whenever the Jetson opens its "
                 "port): the servos attached AT home at full speed. If the arm was not hand-posed "
                 "at home it jumped there -- hand-pose it right before this first home (run_assistant "
-                "--hardware sends it on startup), after every robot_server start."
+                "--hardware asks for that at its prompt, or --home-confirmed asserts it), after every "
+                "robot_server start."
             )
         home = np.asarray(self._config.home_joint_positions, dtype=np.float64)
         error = float(np.max(np.abs(self._q - home)))

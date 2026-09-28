@@ -192,13 +192,22 @@ python3 jetson/robot_server.py --config jetson/robot_config.yaml --driver uno --
 
 ### 5c. What the bridge guarantees (and what you must do for it)
 
-- **Hand-pose the arm to home before EVERY server start.** Opening the serial
-  port resets the Uno (DTR), so every start -- and any USB re-enumeration or
-  brownout -- is a power-up: the bridge knows no position and its first frame
-  attaches every servo *at* its target, instantly. The server refuses every
-  motion except `home` until that first attach (`get_state` ->
-  `bridge_position_known: false`); the boot `home` is a full-speed jump to
-  `home_q`, logged as one. The placeholder home is `[0, 0, -0.6109, 0.1745]`
+- **Hand-pose the arm to home before the first `home` after EVERY server
+  start.** Opening the serial port resets the Uno (DTR), so every start -- and
+  any USB re-enumeration or brownout -- is a power-up: the bridge knows no
+  position and its first frame attaches every servo *at* its target,
+  instantly. The server refuses every motion except `home` until that first
+  attach (`get_state` -> `bridge_position_known: false`); the boot `home` is a
+  full-speed jump to `home_q`, logged as one. Neither laptop tool sends it
+  silently: `run_assistant.py --hardware` stops at a FIRST HOME checklist,
+  discards anything typed during bring-up and waits for the word `home`
+  (Ctrl-C / end of input aborts before anything moves; with no terminal it
+  refuses unless `--home-confirmed`), and `calibrate_servos.py` asks for `yes`
+  (`--yes` in scripts). The same checklist appears on a later run against a
+  running server once the servos are limp (the server detaches them 5 s after
+  the previous run's last request): that `home` re-attaches every servo AT ITS
+  LAST POSE at full speed before moving slowly home, so pose the arm at the
+  last pose it prints, not at home. The placeholder home is `[0, 0, -0.6109, 0.1745]`
   rad = 1500/1500/1150/1600 us: upper arm vertical, forearm folded 35 deg
   back, jaws up-and-back, TCP about (-0.095, 0, 0.338) m -- behind the base and
   out of the camera's workspace. S5 measurements replace it.
@@ -241,7 +250,7 @@ Unit files are in `jetson/systemd/`; `scripts/jetson_mode.sh` installs and switc
 ```
 sudo scripts/jetson_mode.sh install         # units -> /etc/systemd/system, /etc/mfw/mfw.env from the example (once)
 sudoedit /etc/mfw/mfw.env                   # MFW_PYTHON, model paths, TRANSCRIBE_LIBRARY, MFW_MIC, MFW_ARM_GEOMETRY, *_EXTRA
-# hand-pose the arm at home, hand on the E-stop, then:
+# hand on the E-stop, then:
 sudo scripts/jetson_mode.sh conversation    # robot -> llama-server -> shim -> speech -> detector, each after a cache drop
 scripts/jetson_mode.sh status               # unit states, MemAvailable, one tegrastats line
 journalctl -u 'mfw-*' -b --no-pager | tail -n 80
@@ -252,9 +261,14 @@ sudo scripts/jetson_mode.sh build           # stop everything (nothing resident)
   unit drops the page cache and compacts memory before it starts, and its
   `ExecStartPost` waits until the model is actually serving.
 - **Nothing starts at boot on purpose**: after robot_server starts, its first
-  `home` request attaches every servo AT home at full speed -- and
-  `run_assistant.py --hardware` sends that home unprompted when it connects. A
-  person hand-poses the arm at home right before starting run_assistant.
+  `home` request attaches every servo AT home at full speed, and
+  `run_assistant.py --hardware` sends that home when it connects -- after its
+  FIRST HOME prompt (hand-pose the arm there, E-stop in reach, hands clear,
+  then type `home`; on a later run with limp servos, at the last pose it
+  prints). A run with no terminal (a script, a scheduled task, a future
+  service unit for the laptop side) refuses and exits 1 unless it passes
+  `--home-confirmed`, which asserts that a person has just hand-posed the arm
+  and is at the E-stop. None of the units here runs run_assistant.
 - `mfw.env` hooks: `MFW_ROBOT_EXTRA="--require-camera"` (add
   `--allow-placeholder-calibration` for the first bring-up only);
   `MFW_DETECTOR_EXTRA="--label-config /etc/mfw/detector_labels.json"` for the
@@ -308,7 +322,8 @@ port once at 115200, waits 2 s (`--reset-wait-s`), drains the boot output and
 checks each reply. `--pulses` sets the P frame (default 1500 x5).
 
 Then, from the laptop: `py -3.12 scripts/calibrate_servos.py --jetson <ip>:5560`
-(first command after a server start: `home`, with the arm hand-posed there),
+(first command after a server start: `home`, with the arm hand-posed there;
+it asks for `yes`),
 followed by the camera and table calibration in `docs/MVP_RUNBOOK.md`.
 
 ## 9. Troubleshooting

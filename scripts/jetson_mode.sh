@@ -10,9 +10,10 @@
 # or cudaMalloc out-of-memory in `journalctl -u 'mfw-*'`: reboot, do not retry.
 #
 # SAFETY: `conversation` starts robot_server. Its first `home` request (sent
-# unprompted when run_assistant --hardware connects) attaches every servo AT
-# home at full speed. Hand-pose the arm at home right before starting
-# run_assistant, and keep the +6 V E-stop in reach.
+# when run_assistant --hardware connects, after its FIRST HOME prompt; a run
+# with no terminal needs --home-confirmed) attaches every servo AT home at full
+# speed. Hand-pose the arm at home at that prompt, and keep the +6 V E-stop in
+# reach.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -78,7 +79,7 @@ cmd_install() {
 cmd_conversation() {
     need_root conversation
     [ -f "$ENV_FILE" ] || { echo "missing ${ENV_FILE}: run 'sudo $0 install' first" >&2; exit 1; }
-    echo "hand-pose the arm at home now: the servos attach there at full speed when robot_server starts"
+    echo "robot_server attaches nothing when it starts; the first home (run_assistant --hardware's FIRST HOME prompt) attaches every servo AT home at full speed: hand-pose the arm at home at that prompt"
     systemctl stop mfw-build.target 2> /dev/null || true
     drop_caches
     echo "MemAvailable before loading: $(free_mb) MB"

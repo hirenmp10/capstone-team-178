@@ -49,6 +49,14 @@ the earlier "52/62" was an intermediate working-tree parser. The 14-utterance re
 cleanest number here; keep an untouched set for any future claim. After the 2026-09-28 fixes (negation
 refused, a stop word wins, an LLM intent needs a word asking for its skill) a replay of the recorded Qwen
 replies through the new parser gives the same hybrid scores (62/63, 31/31, 33/34; offline, no model run).
+**Current figures (supersede the hybrid column above):** after the later 2026-09-28 language changes
+("drop <named object> in <place>" is a pick-then-place transfer, leading correction markers, the LLM
+release gate) the language stream re-ran the real model (hardware skills, hybrid): dev **61/62**, held-out
+**31/31**, fresh **34/34**. The one dev miss, "drop the can next to the bowl", is a testset label (place)
+that now disagrees with the parser (pick the can, then place) by design; "scan the room" is labelled
+unsupported and excluded. A replay of those recorded replies through the fixer-pass parser (negations that
+start with "no" kept whole, held-object drops kept as places) gives the same 61/62, 31/31, 34/34
+(offline, no model run).
 
 - The first check on 2026-09-26 (older harness) scored the model 46/62 = 74.2 % with 35/48 = 72.9 %
   agreement where the rules were right (gate: >= 90 %): a FAIL. Its error classes, each now targeted by

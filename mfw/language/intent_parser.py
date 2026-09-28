@@ -35,7 +35,16 @@ Two implementations behind one interface:
   Either way the model's output is checked before it can move the arm
   (:meth:`LlmIntentParser._validated`): numbers are re-read from the
   utterance, a place destination may not be a pronoun, and in hybrid mode a
-  target must be words the operator actually said.
+  target must be words the operator actually said. Every model intent then
+  passes :attr:`LlmIntentParser.llm_gate` when one is set: the Assistant's
+  gate asks "Did you mean: open the gripper and drop the marker?" before a
+  model-chosen release of a held object, and refuses it in scripted mode.
+
+**Corrections.** A leading correction marker ("no, put it in the bowl",
+"actually, ...", "sorry, ...") is dropped and the command after it parsed
+(:func:`strip_correction`); a negation after the marker is still refused, and
+a "no" that starts the negation itself ("no need to drop it", "no going
+home") is not a marker at all.
 
 **Moving a named object** ("move the red block to the bowl", "put the can in
 the bowl", "move the red object to the left") is two actions: pick it, then
@@ -46,6 +55,10 @@ first failure); that is the only place the expansion happens. Before this, the
 audit measured "move the red object to the left" -> ``move_relative{left}``
 (the object silently dropped, the empty arm moved) and "put the red block in
 the bowl" -> ``place{in, bowl}`` (the block ignored; a place with nothing held).
+"drop <named object> in/on/next to <place>" is the same transfer since
+2026-09-28; a pronoun ("drop it in the bowl") stays a plain place. The parser
+cannot know what is held (its context carries a track id, not a name), so the
+Assistant runs only the place when the named object is the one in the gripper.
 
 Place parameters (the contract with the Place skill):
 
@@ -79,6 +92,8 @@ __all__ = [
     "Intent",
     "UnparsedCommand",
     "UnregisteredSkill",
+    "NotConfirmed",
+    "strip_correction",
     "LLM_MODES",
     "DEFAULT_LLM_MODE",
     "REFUSAL_SKILL",
@@ -117,10 +132,23 @@ class NegatedCommand(UnparsedCommand):
     """
 
 
+class NotConfirmed(UnparsedCommand):
+    """An LLM-sourced intent that needed the operator's yes and did not get it.
+
+    Raised by the gate :class:`LlmIntentParser` calls before it returns a
+    model intent (:attr:`LlmIntentParser.llm_gate`; the Assistant installs one
+    that asks before a model-chosen release of a held object). A subclass of
+    :class:`UnparsedCommand`, so the planner treats it like any refusal: the
+    message reaches the operator and nothing moves.
+    """
+
+
 #: A negation anywhere in the clause refuses it (after "normalise", so
-#: "don't" is "don t"). "no"/"not" are included on purpose: "no, put it in the
-#: bowl" and "the marker, not the block" are corrections, and the safe reading
-#: of a correction is to do nothing and let the operator say it again.
+#: "don't" is "don t"). "no"/"not" are included on purpose: "the marker, not
+#: the block" is a correction whose safe reading is to do nothing and let the
+#: operator say it again. A LEADING correction marker followed by a command
+#: ("no, put it in the bowl") is removed first by :func:`strip_correction`, so
+#: only the command after it is judged.
 _NEGATION_RE = re.compile(
     r"\b(?:don t|dont|do not|does not|doesn t|didn t|never|not|no|nope|cannot|can t|mustn t|shouldn t|won t)\b"
 )
@@ -128,10 +156,110 @@ _NEGATION_RE = re.compile(
 #: stop: "stop, don't drop it" and "stop moving left" are stops.
 _STOP_WORD_RE = re.compile(r"\b(?:stop|halt|abort)\b")
 
+#: Words an operator puts IN FRONT of a corrected command (language decisions
+#: stream, 2026-09-28): "no, put it in the bowl", "nope, the red one",
+#: "actually, place it on the box", "sorry, pick the marker". Stacked markers
+#: ("no no", "actually no", "no sorry") are all removed. Matched on normalised
+#: text (the comma is gone), so "no put it in the bowl" is the same utterance.
+#: "not" is NOT a marker ("not the block" names what not to do) and neither is
+#: "wait" (a command of its own). Pinned in
+#: tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+#:
+#:   phrase                                  was                now
+#:   "no, put it in the bowl"                UNPARSED (negated) place in bowl
+#:   "nope, pick the marker"                 UNPARSED (negated) pick "marker"
+#:   "actually, put the marker in the bowl"  place in bowl      pick "marker" (a transfer)
+#:
+#: "actually"/"sorry" were never refused, but they hid a transfer: the marker
+#: was ignored and whatever was held went into the bowl.
+#:
+#: The negation refusal still applies to what follows the marker: "no, don't
+#: drop it" is refused, and "no, stop" is a stop.
+#:
+#: "no"/"nope"/"nah" are also how a negation STARTS ("no need to drop it", "no
+#: more moving left", "no dropping it"), and the normalised text has lost the
+#: comma that told the two apart. So they are removed only when the next word
+#: starts a command or an answer (:data:`_AFTER_A_NEGATING_MARKER`: a verb the
+#: grammar knows, an article, a pronoun or an ordinal); otherwise the text is
+#: kept whole and refused as the negation it is (fixer, 2026-09-28; before
+#: this, "no need to drop it" opened the gripper and "no going home" homed).
+#: Pinned in tests/test_hardware_language.py::LANGUAGE_STREAM_BOUNDARIES.
+_CORRECTION_RE = re.compile(
+    r"^(?:(?:no|nope|nah|actually|sorry|oops|correction|i mean|i meant|scratch that|my bad)\s+)+"
+)
+_NEGATING_MARKERS = frozenset({"no", "nope", "nah"})
+#: Words that may follow a stripped "no"/"nope"/"nah". Deliberately a closed
+#: list: a word missing from it keeps the utterance refused (safe), a word
+#: wrongly in it would execute a negation. Never add a gerund ("dropping"),
+#: "need", "more", "longer", "way", "problem", "reason", "point", "one" or
+#: "not" -- each continues the negation.
+_AFTER_A_NEGATING_MARKER = frozenset(
+    {
+        # verbs the grammar (or the model's vocabulary) starts a command with
+        "pick", "grab", "take", "get", "lift", "grasp", "grip", "hold", "fetch", "collect",
+        "place", "put", "set", "drop", "release", "let", "open", "close", "move", "go",
+        "return", "head", "come", "look", "scan", "observe", "show", "tell", "describe",
+        "find", "locate", "what", "which", "where", "wait", "pause", "stay", "stop", "halt",
+        "abort", "cancel", "freeze", "emergency", "bring", "transfer", "carry", "shift",
+        "slide", "relocate", "turn", "rotate", "twist", "lower", "raise", "elevate", "toss",
+        "throw", "chuck", "dump", "deposit", "leave", "hover", "reach", "point", "push",
+        "pull", "nudge", "squeeze", "clamp", "reset",
+        # politeness / redirection in front of a command
+        "please", "just", "instead", "rather", "now",
+        # an answer or a referent ("nope, the red one", "no, the second one")
+        "the", "a", "an", "that", "this", "these", "those", "it", "its", "them",
+        "first", "second", "third", "fourth", "fifth", "last", "other",
+    }
+)
+#: "no, can you put it in the bowl": a modal counts only before "you".
+_MODALS = frozenset({"can", "could", "would", "will"})
+
+
+def _starts_a_command(rest: str) -> bool:
+    words = rest.split()
+    if not words:
+        return False
+    if words[0] in _MODALS:
+        return len(words) > 1 and words[1] == "you"
+    return words[0] in _AFTER_A_NEGATING_MARKER
+
+
+def strip_correction(text: str) -> str:
+    """``text`` without a leading correction marker ("no, put it in the bowl").
+
+    ``text`` is normalised (lowercase, no punctuation). When nothing but
+    markers is left ("no", "no no", "sorry") the text is returned unchanged,
+    so a bare "no" is still refused as a negation. When the markers include
+    "no"/"nope"/"nah" and the next word does not start a command ("no need to
+    drop it", "no more moving left", "no going home") the text is returned
+    unchanged too: that "no" is the negation itself.
+    """
+    match = _CORRECTION_RE.match(text + " ")
+    if match is None:
+        return text
+    rest = text[min(match.end(), len(text)):].strip()
+    if not rest:
+        return text
+    if set(match.group(0).split()) & _NEGATING_MARKERS and not _starts_a_command(rest):
+        return text
+    return rest
+
+
+def _without_correction(utterance: str) -> str:
+    """The raw ``utterance``, or the normalised command after its correction marker."""
+    normalised = RuleBasedIntentParser._normalise(utterance or "")
+    stripped = strip_correction(normalised)
+    return utterance if stripped == normalised else stripped
+
 
 def is_negated(utterance: str) -> bool:
-    """True when the first clause of ``utterance`` carries a negation."""
-    text = RuleBasedIntentParser._first_clause(RuleBasedIntentParser._normalise(utterance or ""))
+    """True when the first clause of ``utterance`` carries a negation.
+
+    A leading correction marker is not a negation ("no, put it in the bowl").
+    """
+    text = RuleBasedIntentParser._first_clause(
+        strip_correction(RuleBasedIntentParser._normalise(utterance or ""))
+    )
     return _NEGATION_RE.search(text) is not None
 
 
@@ -269,14 +397,43 @@ _MOTION_FILLER = frozenset(
      "meter", "metre", "and", "slowly", "carefully", "gently", "quickly", "touch"}
 ) | _SELF_WORDS
 
+#: "drop" joined 2026-09-28 (language decisions stream) for a NAMED object and a
+#: named destination only -- see :func:`split_transfer`. Pinned in
+#: tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+#:
+#:   phrase                               was                        now
+#:   "drop the can next to the bowl"      place next_to bowl         pick "can" (then place)
+#:   "drop the eraser in the bowl"        place in bowl              pick "eraser" (then place)
+#:   "drop the can to the left of the bowl"  open_gripper            pick "can" (then place)
+#:
+#: Before, whatever the arm held went into the bowl, whichever object was
+#: named. When the named object IS the held one, the Assistant runs only the
+#: place (:meth:`mfw.assistant.Assistant.clauses`). "drop it in the bowl" (a
+#: pronoun), "drop the can" and "drop the can on it" are unchanged.
 _TRANSFER_VERBS = ("move", "put", "place", "set", "bring", "transfer", "carry", "take",
-                   "shift", "slide", "relocate")
+                   "shift", "slide", "relocate", "drop")
 _TRANSFER_RE = re.compile(
     r"^(?:(?:please|kindly|now|can you|could you|would you|will you|go ahead and|"
     r"i want you to|i need you to|i would like you to|i d like you to)\s+)*"
     rf"(?P<verb>{'|'.join(_TRANSFER_VERBS)})\s+(?P<rest>.+?)(?:\s+(?:please|now))*$"
 )
 _OBJECT_PRONOUNS = frozenset({"it", "that", "this", "them", "that one", "this one"})
+#: "drop <phrase> in the bowl" where the phrase means whatever is held; such a
+#: drop stays the plain place it was before "drop" became a transfer verb.
+#: Pinned in tests/test_hardware_language.py::LANGUAGE_STREAM_BOUNDARIES.
+_DROP_HELD_OBJECT = re.compile(
+    r"(?:"
+    r"(?:(?:what|whatever|the (?:one|thing|object|item|stuff)|everything|anything)(?: that)?"
+    r"(?: (?:you re|youre|you are|you ve|you have|you ve got|you have got|you got|you)"
+    r"(?: (?:holding|carrying|gripping|grasping|got|have))?)?"
+    r"(?: (?:in|on) (?:your|the) (?:hand|hands|gripper|grip|claw|jaws|fingers))?)"
+    r"|(?:your|the) (?:load|cargo|payload)"
+    r"|it all|all of it"
+    r")"
+)
+_DROP_ADVERB_TAIL = re.compile(
+    r"(?:\s+(?:gently|carefully|slowly|softly|back|right here|right there|here|there|down))+$"
+)
 
 
 @dataclass(frozen=True)
@@ -345,11 +502,15 @@ def split_transfer(utterance: str) -> TransferSplit | None:
     on the left" places it to the left).
     """
     text = RuleBasedIntentParser._normalise(utterance)
-    text = RuleBasedIntentParser._first_clause(text)
+    text = RuleBasedIntentParser._first_clause(strip_correction(text))
     match = _TRANSFER_RE.match(text)
     if match is None:
         return None
     verb, rest = match.group("verb"), match.group("rest")
+    if verb == "drop":
+        # "drop off the can in the bowl" / "drop the can off in the bowl".
+        rest = re.sub(r"^off\s+", "", rest)
+        rest = re.sub(r"\s+off(?=\s+(?:in|into|inside|on|onto|next|beside|near|at|to)\b)", "", rest)
     rest, distance = _strip_distance(rest)
     rest = re.sub(r"\s+", " ", _VAGUE_AMOUNT.sub(" ", rest)).strip()
 
@@ -394,11 +555,29 @@ def split_transfer(utterance: str) -> TransferSplit | None:
     # "Set it down next to the mug": "down" belongs to the verb, not the object.
     # It used to leave "it down" as the object -> pick "it" (the held object)
     # before the place (tests/test_hardware_language.py::HARDWARE_MAPPINGS).
-    obj = re.sub(r"^(it|that|this|them)\s+down$", r"\1", obj)
+    # Same for a deictic (2026-09-28): "put it here in the box" picked "it".
+    obj = re.sub(r"^(it|that|this|them)\s+(?:down|here|there)$", r"\1", obj)
+    if verb == "drop":
+        # "drop the can gently / back / right here in the bowl": the adverb
+        # belongs to the verb (it used to become the pick target "can gently").
+        obj = _DROP_ADVERB_TAIL.sub("", obj).strip()
+        if _DROP_HELD_OBJECT.fullmatch(obj):
+            # "drop what you're holding in the bowl", "drop your load in the
+            # bowl", "drop the object in the bowl": the held object, like "it".
+            # A plain place, as before "drop" was a transfer verb (fixer,
+            # 2026-09-28; they had become a pick of "what you re holding",
+            # refused with "already holding something").
+            return None
     if not obj:
         return None
     pronoun = obj in _OBJECT_PRONOUNS
     if not pronoun and not _names_an_object(obj):
+        return None
+    if verb == "drop" and (pronoun or direction is not None):
+        # Only "drop <named object> <relation> <named place>" is a transfer.
+        # "drop it in the bowl" is the place it always was (_match_place), and
+        # "drop the can to the left" keeps its pre-existing reading; both stay
+        # on the drop grammar's own path, untouched.
         return None
 
     if direction is not None:
@@ -439,7 +618,9 @@ class RuleBasedIntentParser(IIntentParser):
         if not utterance or not utterance.strip():
             raise UnparsedCommand("empty command")
 
-        text = self._normalise(utterance)
+        # A leading correction marker is dropped first ("no, put it in the
+        # bowl" is "put it in the bowl"); see strip_correction.
+        text = strip_correction(self._normalise(utterance))
         # "Pick the can and put it in the box" is ONE command: pick. Truncating at
         # the conjunction implements "emit only the first action" directly, rather
         # than leaving it to matcher ordering -- which got this backwards, matching
@@ -1206,6 +1387,15 @@ JSON:"""
         self._fallback = fallback or RuleBasedIntentParser(known_skills)
         self.mode = mode
         self.last_source: str | None = None
+        #: Called as ``llm_gate(intent, utterance, context)`` with every intent
+        #: the MODEL produced (never a rule parse), after validation and before
+        #: it is returned. ``utterance`` is what the operator said, correction
+        #: marker included (the model saw the command after it), so a refusal
+        #: quotes the operator exactly. It may raise :class:`UnparsedCommand` (usually
+        #: :class:`NotConfirmed`) to refuse. ``None`` (the default): no gate,
+        #: so the parser alone behaves exactly as measured. The Assistant
+        #: installs one that asks before a model-chosen release of a held object.
+        self.llm_gate: Callable[[Intent, str, dict[str, Any]], None] | None = None
 
     @property
     def mode(self) -> str:
@@ -1269,13 +1459,17 @@ JSON:"""
             if not utterance or not utterance.strip():
                 self._record(None, "rule-refused")
                 raise
+            # The model sees the command after a correction marker, never the
+            # marker itself ("no, put it in the bowl" -> "put it in the bowl").
+            command = _without_correction(utterance)
             try:
-                intent = self._ask_model(utterance, context, strict=True)
+                intent = self._ask_model(command, context, strict=True)
             except Exception as exc:  # noqa: BLE001 - any model failure keeps the refusal
                 _log.info("LLM could not parse %r either (%s); keeping the rule parser's refusal",
                           utterance, exc)
                 self._record(None, "rule-refused")
                 raise refusal from None
+            self._apply_gate(intent, utterance, context)
             return self._record(intent, "llm")
         return self._record(intent, "rule")
 
@@ -1284,8 +1478,9 @@ JSON:"""
         if is_negated(utterance):
             # The grammar owns negation (a stop word wins, anything else is refused).
             return self._record(self._fallback.parse(utterance, context), "rule-fallback")
+        command = _without_correction(utterance)
         try:
-            intent = self._ask_model(utterance, context, strict=False)
+            intent = self._ask_model(command, context, strict=False)
         except _UnknownSkillFromModel as exc:
             _log.warning("LLM proposed unknown skill %r; using the rule-based parser", exc.skill)
         except Exception as exc:  # noqa: BLE001
@@ -1293,8 +1488,19 @@ JSON:"""
             # not stop the robot understanding "stop".
             _log.warning("LLM intent parsing failed (%s); using the rule-based parser", exc)
         else:
+            self._apply_gate(intent, utterance, context)
             return self._record(intent, "llm")
         return self._record(self._fallback.parse(utterance, context), "rule-fallback")
+
+    def _apply_gate(self, intent: Intent, utterance: str, context: dict[str, Any]) -> None:
+        """Run :attr:`llm_gate` on a model intent; a refusal is recorded and raised."""
+        if self.llm_gate is None:
+            return
+        try:
+            self.llm_gate(intent, utterance, context)
+        except UnparsedCommand:
+            self._record(None, "llm-unconfirmed")
+            raise
 
     def _record(self, intent: Intent | None, source: str) -> Intent:
         self.last_source = source
@@ -1355,7 +1561,9 @@ JSON:"""
         """
         skill = intent.skill
         params = dict(intent.params)
-        text = RuleBasedIntentParser._first_clause(RuleBasedIntentParser._normalise(utterance))
+        text = RuleBasedIntentParser._first_clause(
+            strip_correction(RuleBasedIntentParser._normalise(utterance))
+        )
         if _NEGATION_RE.search(text) and skill not in _ALWAYS_SAFE_SKILLS:
             raise NegatedCommand(f"LLM {skill} for a negated command {utterance!r}")
         if strict:

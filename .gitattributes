@@ -1,7 +1,20 @@
-# Files that run on the Jetson (Linux) must keep LF endings on every checkout,
-# including Windows checkouts with core.autocrlf=true (CRLF breaks bash and systemd).
-*.sh      text eol=lf
-*.service text eol=lf
-*.target  text eol=lf
-*.ino     text eol=lf
-jetson/** text eol=lf
+# Files that run on the Jetson (bash, systemd, Python 3.10, the Uno sketch)
+# must reach it with LF line endings: bash reads "\r" as part of a command
+# ("$'\r': command not found"), systemd rejects or mis-parses CRLF unit lines,
+# and a CRLF shebang ("python3\r") does not exec. This checkout is used from
+# Windows with core.autocrlf=true, which would otherwise write CRLF into the
+# working tree, and a file copied from there to the Jetson (scp, USB stick)
+# carries it along. Pinned by tests/test_mvp_flow.py (TestLineEndings).
+#
+# Deliberately NOT a repo-wide rule: the rest of the repository mixes
+# endings, and forcing eol on everything would rewrite unrelated files.
+#
+# Everything under jetson/ is deployed to the board; text=auto leaves any
+# binary that is ever added there untouched. The rules below it come later,
+# so they win for the file types that are always text.
+jetson/**     text=auto eol=lf
+*.sh          text eol=lf
+scripts/*.sh  text eol=lf
+*.service     text eol=lf
+*.target      text eol=lf
+*.ino         text eol=lf

@@ -39,6 +39,7 @@ from mfw.language.intent_parser import (
     REFUSAL_SKILL,
     LlmIntentParser,
     NegatedCommand,
+    NotConfirmed,
     RuleBasedIntentParser,
     UnparsedCommand,
     UnregisteredSkill,
@@ -734,7 +735,11 @@ class TestHybridNeedsSpokenEvidence:
 
 NEGATED = [
     "don't let go of it", "do not drop it", "don't open the gripper", "never release it",
-    "don't go home", "do not pick up the marker", "no, put it in the bowl",
+    "don't go home", "do not pick up the marker",
+    # was: "no, put it in the bowl" (refused until 2026-09-28; a leading
+    # correction marker is now dropped -- see TestCorrectionMarkers). A
+    # negation AFTER the marker is still refused:
+    "no, don't drop it", "nope, do not go home", "no",
 ]
 
 
@@ -772,3 +777,105 @@ class TestNegationIsRefused:
 
     def test_emergency_still_beats_stop(self):
         assert RuleBasedIntentParser(HW_SKILLS).parse("emergency stop, don't move").skill == "emergency_stop"
+
+
+# ----------------------------------------------------------------------
+# language decisions stream, 2026-09-28: corrections and the LLM gate
+# ----------------------------------------------------------------------
+
+
+class TestCorrectionMarkers:
+    """"no, put it in the bowl" parses the command after the marker, rules and model alike."""
+
+    @pytest.mark.parametrize("skills", [SIM_SKILLS, HW_SKILLS], ids=["sim", "hardware"])
+    def test_the_grammar_parses_the_command_after_the_marker(self, skills):
+        parser = RuleBasedIntentParser(skills)
+        assert dict(parser.parse("no, put it in the bowl", CONTEXT)) == {
+            "skill": "place", "params": {"relation": "in", "target": "bowl"}, "confidence": 0.95}
+        assert parser.parse("actually, place it on the box", CONTEXT).params == {"relation": "on", "target": "box"}
+
+    def test_hybrid_takes_the_rule_parse_and_never_asks_the_model(self):
+        worker = FakeLlmWorker({"no, put it in the bowl": _reply("open_gripper")})
+        parser = _hybrid(worker, HW_SKILLS)
+        assert parser.parse("no, put it in the bowl", CONTEXT).skill == "place"
+        assert worker.calls == 0 and parser.last_source == "rule"
+
+    def test_the_model_sees_the_command_without_the_marker(self):
+        """A rule-refused correction reaches the model as the command alone."""
+        worker = FakeLlmWorker({"toss it in the bin": _reply("place", {"relation": "in", "target": "bin"})})
+        parser = _hybrid(worker, HW_SKILLS)
+        intent = parser.parse("nope, toss it in the bin", dict(CONTEXT, held_object="marker"))
+        assert (intent.skill, intent.params) == ("place", {"relation": "in", "target": "bin"})
+        assert worker.calls == 1 and FakeLlmWorker.command_of(worker.prompts[0]) == "toss it in the bin"
+
+    def test_a_negation_after_the_marker_never_reaches_the_model(self):
+        worker = FakeLlmWorker({"don t drop it": _reply("open_gripper"), "no, don't drop it": _reply("open_gripper")})
+        parser = _hybrid(worker, HW_SKILLS)
+        with pytest.raises(NegatedCommand):
+            parser.parse("no, don't drop it", CONTEXT)
+        assert worker.calls == 0
+
+    def test_llm_first_also_sees_the_command_without_the_marker(self):
+        worker = FakeLlmWorker({"put it in the bowl": _reply("place", {"relation": "in", "target": "bowl"})})
+        parser = LlmIntentParser(worker, HW_SKILLS, mode="llm-first")
+        assert parser.parse("no, put it in the bowl", CONTEXT).skill == "place"
+        assert parser.last_source == "llm"
+
+    def test_the_model_cannot_turn_a_marker_plus_noise_into_a_motion(self):
+        """"nope, the red one" is no command; the measured model maps such noise to a pick."""
+        worker = FakeLlmWorker({"the red one": _reply("pick", {"target": "red one"})})
+        parser = _hybrid(worker, HW_SKILLS)
+        with pytest.raises(UnparsedCommand):
+            parser.parse("nope, the red one", CONTEXT)
+        assert parser.last_source == "rule-refused"
+
+
+class TestLlmGate:
+    """``LlmIntentParser.llm_gate`` sees every MODEL intent and only those."""
+
+    HELD = dict(CONTEXT, held_object="obj_001")
+
+    def _gated(self, worker, refuse=False):
+        seen = []
+
+        def gate(intent, utterance, context):
+            seen.append((intent.skill, utterance, context.get("held_object")))
+            if refuse:
+                raise NotConfirmed("not confirmed")
+
+        parser = _hybrid(worker, HW_SKILLS)
+        parser.llm_gate = gate
+        return parser, seen
+
+    def test_no_gate_by_default(self):
+        assert LlmIntentParser(FakeLlmWorker(), HW_SKILLS).llm_gate is None
+
+    def test_a_rule_parse_never_reaches_the_gate(self):
+        parser, seen = self._gated(FakeLlmWorker())
+        assert parser.parse("open the gripper", self.HELD).skill == "open_gripper"
+        assert seen == [] and parser.last_source == "rule"
+
+    def test_a_model_intent_goes_through_the_gate_with_its_context(self):
+        parser, seen = self._gated(FakeLlmWorker({"loosen your grip": _reply("open_gripper")}))
+        assert parser.parse("loosen your grip", self.HELD).skill == "open_gripper"
+        assert seen == [("open_gripper", "loosen your grip", "obj_001")]
+        assert parser.last_source == "llm"
+
+    def test_a_gate_refusal_is_raised_not_swallowed(self):
+        parser, seen = self._gated(FakeLlmWorker({"loosen your grip": _reply("open_gripper")}), refuse=True)
+        with pytest.raises(NotConfirmed):
+            parser.parse("loosen your grip", self.HELD)
+        assert parser.last_source == "llm-unconfirmed" and len(seen) == 1
+
+    def test_llm_first_also_gates_the_model(self):
+        worker = FakeLlmWorker({"open the gripper": _reply("open_gripper")})
+        parser = LlmIntentParser(worker, HW_SKILLS, mode="llm-first")
+        parser.llm_gate = lambda intent, utterance, context: (_ for _ in ()).throw(NotConfirmed("no"))
+        with pytest.raises(NotConfirmed):
+            parser.parse("open the gripper", self.HELD)
+
+    def test_a_refused_model_answer_never_reaches_the_gate(self):
+        parser, seen = self._gated(FakeLlmWorker({"hmm okay": _reply("open_gripper")}))
+        with pytest.raises(UnparsedCommand):
+            parser.parse("hmm okay", self.HELD)
+        assert seen == []

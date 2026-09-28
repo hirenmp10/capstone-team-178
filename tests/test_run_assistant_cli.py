@@ -577,3 +577,86 @@ class TestRemoteSpeechServerIsNeverAutostarted:
 
     def test_loopback_server_is_still_autostarted(self, cli, monkeypatch, restore_sigint):
         assert self._run(cli, monkeypatch, "127.0.0.1:5556") == ["find_voice_python", "autostart"]
+
+
+# ----------------------------------------------------------------------
+# first home: --home-confirmed and the no-terminal refusal
+# ----------------------------------------------------------------------
+
+
+class _RealArmAssistant(_FakeAssistant):
+    """Builds like ``Assistant`` against a real driver whose bridge knows no
+    position: ``HardwareRuntime.build`` calls the installed module gate before
+    the home. ``homes`` counts the homes that would have been sent."""
+
+    homes = 0
+    contexts: list = []
+
+    def __init__(self, config=None, llm_complete=None) -> None:
+        from mfw.hardware import runtime as runtime_mod
+
+        context = {"endpoint": "tcp://10.0.0.5:5560", "driver": "uno",
+                   "home_q": [0.0, 0.0, -0.6109, 0.1745], "state": {"bridge_position_known": False}}
+        _RealArmAssistant.contexts.append(context)
+        runtime_mod._default_first_home_gate(context)  # raises FirstHomeRefused to refuse
+        _RealArmAssistant.homes += 1
+        super().__init__(config, llm_complete)
+
+
+class TestFirstHomeFlag:
+    def _run(self, cli, monkeypatch, argv: list[str]) -> int:
+        import io
+
+        import mfw.assistant
+
+        _RealArmAssistant.homes = 0
+        _RealArmAssistant.contexts = []
+        _FakeAssistant.ran = []
+        _FakeAssistant.fail = set()
+        monkeypatch.setattr(mfw.assistant, "Assistant", _RealArmAssistant)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # a scripted run: no terminal
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", *argv])
+        return cli.main()
+
+    def test_no_terminal_without_the_flag_refuses_before_moving(self, cli, monkeypatch, restore_sigint, capsys):
+        from mfw.hardware import runtime as runtime_mod
+
+        before = runtime_mod._default_first_home_gate
+        code = self._run(cli, monkeypatch, ["--hardware", "-c", "go home"])
+        out = capsys.readouterr().out
+        assert code == 1
+        assert _RealArmAssistant.homes == 0 and _FakeAssistant.ran == []
+        assert "FIRST HOME NOT SENT" in out and "--home-confirmed" in out and "Nothing was sent" in out
+        assert "Traceback" not in out
+        assert runtime_mod._default_first_home_gate is before, "main() must restore the module gate"
+
+    def test_home_confirmed_proceeds_and_runs_the_commands(self, cli, monkeypatch, restore_sigint, capsys):
+        from mfw.hardware import runtime as runtime_mod
+
+        before = runtime_mod._default_first_home_gate
+        code = self._run(cli, monkeypatch, ["--hardware", "--home-confirmed", "-c", "go home"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert _RealArmAssistant.homes == 1 and _FakeAssistant.ran == ["go home"]
+        assert "--home-confirmed given" in out and "Hand-pose the arm at home" in out
+        assert "1st home : pre-confirmed (--home-confirmed)" in out
+        assert runtime_mod._default_first_home_gate is before
+
+    def test_the_banner_says_the_first_home_will_be_confirmed(self, cli, monkeypatch, restore_sigint, capsys):
+        self._run(cli, monkeypatch, ["--hardware", "-c", "go home"])
+        assert "1st home : a real arm with no known position or limp servos asks you to type 'home'" in capsys.readouterr().out
+
+    def test_sim_lane_never_installs_a_home_gate(self, cli, monkeypatch, restore_sigint):
+        from mfw.hardware import runtime as runtime_mod
+
+        installed: list = []
+        monkeypatch.setattr(runtime_mod, "set_first_home_gate", lambda gate: installed.append(gate))
+        code, ran = _main(cli, monkeypatch, ["-c", "go home"])
+        assert code == 0 and ran == ["go home"] and installed == []
+
+    def test_help_documents_the_flag(self, cli, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", "--help"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        text = " ".join(capsys.readouterr().out.split())
+        assert "--home-confirmed" in text and "not a terminal" in text

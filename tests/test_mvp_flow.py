@@ -907,3 +907,282 @@ class TestJetsonSystemd:
     def test_tegrastats_log_writes_into_logs(self):
         text = (REPO_ROOT / "scripts" / "tegrastats_log.sh").read_text(encoding="utf-8")
         assert 'OUT="${LOG_DIR}/tegrastats_${STAMP}' in text and 'LOG_DIR="${REPO}/logs"' in text
+
+
+# ----------------------------------------------------------------------
+# line endings: everything the Jetson receives is LF, and .gitattributes keeps it so
+# ----------------------------------------------------------------------
+
+#: Directories never deployed and possibly large; skipped when walking the tree.
+_SKIP_DIRS = {".git", "__pycache__", "logs", "renders", "assets", ".pytest_cache", "node_modules"}
+#: File types that are LF wherever they live (bash, systemd units, the sketch).
+_LF_SUFFIXES = (".sh", ".service", ".target", ".ino")
+#: .gitattributes patterns the Jetson files rely on (see the file's header).
+_LF_PATTERNS = ("*.sh", "scripts/*.sh", "*.service", "*.target", "*.ino", "jetson/**")
+
+
+def _jetson_bound_files() -> list[str]:
+    """Every file under jetson/ plus every .sh/.service/.target/.ino in the tree."""
+    import os
+
+    found: set[str] = set()
+    for root, dirs, files in os.walk(REPO_ROOT):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.endswith("-venv")]
+        rel_root = Path(root).relative_to(REPO_ROOT)
+        in_jetson = rel_root.parts[:1] == ("jetson",)
+        for name in files:
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            if in_jetson or name.endswith(_LF_SUFFIXES):
+                found.add((rel_root / name).as_posix())
+    return sorted(found)
+
+
+JETSON_BOUND_FILES = _jetson_bound_files()
+
+
+class TestLineEndings:
+    """bash (``$'\\r': command not found``), systemd and a ``python3\\r``
+    shebang all fail on CRLF, and this checkout lives on Windows with
+    ``core.autocrlf=true``: without .gitattributes a fresh checkout writes
+    CRLF into exactly the files that are copied to the Jetson."""
+
+    def test_the_walk_found_the_deployed_files(self):
+        for expected in ("jetson/robot_server.py", "jetson/detector_service.py", "jetson/llm_worker_llamacpp.py",
+                         "jetson/serial_smoke.py", "jetson/arduino/servo_bridge/servo_bridge.ino",
+                         "jetson/systemd/mfw-robot.service", "jetson/systemd/mfw-conversation.target",
+                         "jetson/systemd/wait_ready.sh", "jetson/systemd/mfw.env.example",
+                         "scripts/jetson_mode.sh", "scripts/tegrastats_log.sh"):
+            assert expected in JETSON_BOUND_FILES
+
+    @pytest.mark.parametrize("path", JETSON_BOUND_FILES)
+    def test_no_crlf_in_the_working_tree(self, path):
+        data = (REPO_ROOT / path).read_bytes()
+        if b"\0" in data:
+            pytest.skip("binary file")
+        assert b"\r\n" not in data, f"{path} has CRLF: bash, systemd and shebangs on the Jetson reject it"
+
+    def test_gitattributes_pins_lf_for_the_jetson_files_only(self):
+        text = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+        assert b"\r\n" not in (REPO_ROOT / ".gitattributes").read_bytes()
+        rules = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pattern, *attrs = line.split()
+            rules[pattern] = attrs
+        for pattern in _LF_PATTERNS:
+            assert pattern in rules and "eol=lf" in rules[pattern], pattern
+        # The repository mixes endings on purpose: no repo-wide eol rule.
+        assert "*" not in rules and "**" not in rules
+        # Binaries that ever land in jetson/ must not be converted.
+        assert "text=auto" in rules["jetson/**"]
+
+    @pytest.mark.parametrize("path", ["jetson/robot_server.py", "jetson/systemd/mfw-robot.service",
+                                      "jetson/systemd/wait_ready.sh", "scripts/jetson_mode.sh",
+                                      "jetson/arduino/servo_bridge/servo_bridge.ino",
+                                      "jetson/systemd/mfw.env.example"])
+    def test_git_applies_eol_lf(self, path):
+        """What git itself resolves (not just what the file says)."""
+        import shutil
+        import subprocess
+
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("no git on this machine")
+        probe = subprocess.run([git, "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+                               capture_output=True, text=True, timeout=30)
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            pytest.skip("not a git work tree")
+        result = subprocess.run([git, "-C", str(REPO_ROOT), "check-attr", "eol", "--", path],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().endswith("eol: lf"), result.stdout
+
+    def test_git_leaves_the_laptop_side_alone(self):
+        import shutil
+        import subprocess
+
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("no git on this machine")
+        result = subprocess.run([git, "-C", str(REPO_ROOT), "check-attr", "eol", "--", "mfw/hardware/runtime.py"],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            pytest.skip("not a git work tree")
+        assert result.stdout.strip().endswith("eol: unspecified"), result.stdout
+
+
+# ----------------------------------------------------------------------
+# scan independence: the scan's "seen in >= min_frames of N observes"
+# ----------------------------------------------------------------------
+
+
+class _ScanClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += float(seconds)
+
+
+class _Webcam:
+    """robot_server's get_frame: a new frame (new seq) every 33 ms of clock.
+
+    The seq rides in pixel (0, 0) so the backend can tell frames apart the
+    way the real one does -- by content, never by being told."""
+
+    PERIOD_S = 0.033
+
+    def __init__(self, clock: _ScanClock) -> None:
+        self.clock = clock
+        self.seq = 0
+        self.grabbed: list[int] = []
+
+    def grab(self):
+        from jetson.detector_service import Frame
+
+        self.clock.t += self.PERIOD_S
+        self.seq += 1
+        self.grabbed.append(self.seq)
+        rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+        rgb[0, 0, 0] = self.seq
+        return Frame(rgb=rgb, seq=self.seq, t_capture=self.clock.t, received=self.clock.t)
+
+
+class _GlareFlorence:
+    """Florence on a static table: the marker in every frame, plus a 'banana'
+    box on every frame captured while a transient glare lasts (a reflection,
+    a hand passing): a real, time-limited phantom, not a per-frame coin flip.
+    Each inference costs ``infer_s`` of clock (about 1 s on the Orin)."""
+
+    MARKER = {"label": "marker", "confidence": 0.9, "bbox_px": [100, 100, 130, 180]}
+    BANANA = {"label": "banana", "confidence": 0.8, "bbox_px": [300, 200, 360, 240]}
+
+    def __init__(self, clock: _ScanClock, webcam: _Webcam, glare: tuple[float, float] | None, infer_s: float = 1.0):
+        self.clock = clock
+        self.webcam = webcam
+        self.glare = glare
+        self.infer_s = float(infer_s)
+        self.capture_t: dict[int, float] = {}
+
+    def detect(self, rgb, labels, min_score):
+        seq = int(rgb[0, 0, 0])
+        t_capture = self.capture_t.setdefault(seq, self.clock.t)
+        self.clock.t += self.infer_s
+        objects = [dict(self.MARKER)]
+        if self.glare is not None and self.glare[0] <= t_capture <= self.glare[1]:
+            objects.append(dict(self.BANANA))
+        return objects
+
+
+def _scan_looks(history_max_age_s: float, gap_s: float, glare: tuple[float, float] | None = None,
+                looks: int = 3) -> list[dict[str, Any]]:
+    """``looks`` detect requests ``gap_s`` apart through the real FramePipeline
+    and FrameVoter (3 frames, 2 required: serve_detector's defaults), as
+    FixedCameraScan's look phase issues them. Per look: the labels reported,
+    the frames this request grabbed and the frames the vote was taken over."""
+    from jetson.detector_service import FramePipeline, FrameVoter
+
+    clock = _ScanClock()
+    webcam = _Webcam(clock)
+    florence = _GlareFlorence(clock, webcam, glare)
+    pipe = FramePipeline(florence, webcam, FrameVoter(3, 2, 0.3), history_max_age_s=history_max_age_s,
+                         clock=clock, sleep=clock.sleep)
+    results = []
+    for i in range(looks):
+        if i:
+            clock.sleep(gap_s)
+        before = len(webcam.grabbed)
+        reply = pipe.detect(["banana", "marker"], 0.1)
+        results.append({
+            "labels": sorted({o["label"] for o in reply["objects"]}),
+            "grabbed": set(webcam.grabbed[before:]),
+            "voted_over": set(reply["frames"]["voted_over"]),
+        })
+    return results
+
+
+def _seen_in(results: list[dict[str, Any]], label: str) -> int:
+    return sum(1 for r in results if label in r["labels"])
+
+
+class TestScanIndependence:
+    """The limitation, pinned so the runbook stays true: at the shipped
+    ``hardware.scan.frame_gap_s`` (0.15 s) and the detector's default frame
+    history (``--history-max-age 2.0``), a scan look's vote can reuse frames
+    an earlier look already counted, so "seen in 2 of 3 looks" is not three
+    independent samples. Two knobs make the looks independent; both are
+    shown working here. Neither is on by default (each costs detector time
+    that has not been measured on the Jetson) -- see MVP_RUNBOOK section 13.
+    """
+
+    def _scan_cfg(self):
+        return load_config(HARDWARE_YAML).hardware.scan
+
+    def test_shipped_gap_is_inside_the_detector_history_window(self):
+        from jetson.detector_service import FramePipeline
+
+        default_history = FramePipeline.__init__.__defaults__[2]  # history_max_age_s
+        assert default_history == 2.0
+        assert self._scan_cfg().frame_gap_s < default_history, (
+            "the scan looks are now spaced past the detector history: update MVP_RUNBOOK section 13"
+        )
+        env = (SYSTEMD_DIR / "mfw.env.example").read_text(encoding="utf-8")
+        assert not any(line.startswith("MFW_DETECTOR_EXTRA=") and "--history-max-age" in line
+                       for line in env.splitlines()), "history is off by default now: update the runbook"
+
+    def test_at_the_shipped_gap_a_look_votes_with_an_earlier_looks_frame(self):
+        looks = _scan_looks(history_max_age_s=2.0, gap_s=self._scan_cfg().frame_gap_s)
+        assert all(r["labels"] == ["marker"] for r in looks)
+        shared = [
+            looks[i]["voted_over"] & set().union(*(looks[j]["grabbed"] for j in range(i)))
+            for i in range(1, len(looks))
+        ]
+        assert any(shared), "no reuse: the limitation is gone, update the runbook"
+        # ...and every report still rests on at least one frame of its own
+        # request (the stale-position fix is not what this is about).
+        assert all(r["voted_over"] & r["grabbed"] for r in looks)
+
+    def test_a_glare_on_three_frames_counts_as_seen_in_two_looks(self):
+        """The consequence: a phantom present on three consecutive frames
+        (f2-f4) passes the scan's 2-of-3 rule, because look 2 confirms it
+        with ONE new frame plus look 1's last frame."""
+        looks = _scan_looks(history_max_age_s=2.0, gap_s=self._scan_cfg().frame_gap_s, glare=(1.0, 3.5))
+        assert _seen_in(looks, "banana") == 2 >= self._scan_cfg().min_frames
+        assert len(looks[1]["grabbed"]) == 1 and looks[1]["voted_over"] & looks[0]["grabbed"]
+
+    def test_history_max_age_zero_makes_each_look_vote_on_its_own_frames(self):
+        looks = _scan_looks(history_max_age_s=0.0, gap_s=self._scan_cfg().frame_gap_s)
+        assert all(r["labels"] == ["marker"] for r in looks)
+        for r in looks:
+            assert r["voted_over"] <= r["grabbed"]
+            assert len(r["grabbed"]) >= 2  # the price: two inferences per look, always
+
+    def test_history_max_age_zero_stops_the_glare_counting_twice(self):
+        looks = _scan_looks(history_max_age_s=0.0, gap_s=self._scan_cfg().frame_gap_s, glare=(1.0, 3.5))
+        assert _seen_in(looks, "banana") == 1 < self._scan_cfg().min_frames  # "not sure", not "seen"
+
+    def test_spacing_the_looks_past_the_history_window_also_works(self):
+        looks = _scan_looks(history_max_age_s=2.0, gap_s=2.1)
+        assert all(r["labels"] == ["marker"] for r in looks)
+        for r in looks:
+            assert r["voted_over"] <= r["grabbed"]
+
+    def test_serve_detector_accepts_history_zero(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_serve_detector_hist", REPO_ROOT / "scripts" / "serve_detector.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        args = module.build_parser().parse_args(["--history-max-age", "0"])
+        assert args.history_max_age == 0.0
+
+    def test_the_runbook_states_the_limitation_and_both_knobs(self):
+        text = " ".join((REPO_ROOT / "docs" / "MVP_RUNBOOK.md").read_text(encoding="utf-8").split())
+        assert "--history-max-age 0" in text and "frame_gap_s" in text
+        assert "not independent" in text

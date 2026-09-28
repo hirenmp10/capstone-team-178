@@ -30,9 +30,25 @@ Hardware lane (no Isaac Sim; run with a plain ``py -3.12``):
   --demo            on the hardware lane: scan the room -> what do you see ->
                     pick up the marker -> put it in the bowl -> go home
                     (hardware.demo_script in the YAML overrides it)
+  --home-confirmed  pre-confirm the first home for a run with no terminal
+                    (see below)
 
-Exit status: 0 when every -c/--demo command succeeded, 1 when any failed, 130
-on Ctrl-C. On the hardware lane the run stops at the first failure unless
+First home (real arm only). After every robot_server start the servo bridge
+knows no position, and the bring-up `home` attaches every servo AT home at
+full speed. Against a real driver in that state, --hardware prints the
+hand-pose instructions (arm at home, E-stop in reach, hands clear), discards
+anything typed during bring-up and waits for the word `home`; Ctrl-C or end
+of input aborts before anything moves. It asks the same way on a second run
+against the same robot_server when the servos are detached (the server's
+5 s host timeout after the previous session, a cleared estop): that home
+re-attaches AT the last pulsed pose at full speed first, so the arm is posed
+there, not at home. With no terminal (stdin not a TTY: piped, scheduled, a
+service unit) it refuses and exits 1 unless --home-confirmed says a person
+already hand-posed the arm. Only the fake lane, and a real arm whose servos
+are still attached at a known position, never prompt.
+
+Exit status: 0 when every -c/--demo command succeeded, 1 when any failed (or
+the first home was refused), 130 on Ctrl-C. On the hardware lane the run stops at the first failure unless
 --keep-going; the sim lane runs every command, as it always has.
 
 ``sys.argv`` is cleared before the simulator starts: ``SimulationApp`` parses argv
@@ -912,6 +928,15 @@ def main() -> int:
         "(the exit status is still 1). Default there: stop at the first failure. The sim "
         "lane always runs every command",
     )
+    parser.add_argument(
+        "--home-confirmed",
+        action="store_true",
+        help="hardware lane: a person has hand-posed the arm (at home after a robot_server "
+        "start; at its last pose when the servos are limp), E-stop in reach, hands clear, so the "
+        "first home -- a full-speed attach -- may be sent without the typed 'home' prompt. "
+        "Required when stdin is not a terminal (scripted or service runs); without it such a run "
+        "refuses before moving anything",
+    )
     parser.add_argument("--interactive", action="store_true", help="prompt for commands")
     parser.add_argument(
         "-c", "--command", action="append", default=[], help="run a command (repeatable)"
@@ -1116,6 +1141,11 @@ def main() -> int:
         print(f"  backend  : {config.default_executor}")
         print(f"  labels   : {', '.join(hw.labels)}")
         print(f"  STOP     : {STOP_NOTICE.format(chunk=hw.trajectory_chunk_s)}")
+        print("  1st home : " + (
+            "pre-confirmed (--home-confirmed): the arm must already be hand-posed at home"
+            if args.home_confirmed else
+            "a real arm with no known position or limp servos asks you to type 'home' first"
+        ))
         print("=" * 72)
     else:
         print("=" * 72)
@@ -1190,7 +1220,19 @@ def main() -> int:
         if hardware_mode and assistant.runtime.skills.has("scan_scene"):
             return route_clauses(clauses_of, run_clause)
         return clauses_of, run_clause
+    #: Caught below only on the hardware lane (an empty tuple catches nothing),
+    #: so the sim lane never imports the hardware runtime.
+    home_refused: tuple = ()
+    previous_home_gate: Any = None
     if hardware_mode:
+        # The first home after a robot_server start jumps a real arm to home at
+        # full speed; the runtime asks the operator (TTY) or needs
+        # --home-confirmed. Assistant builds the runtime itself, so the gate is
+        # installed as the module default and restored in the finally below.
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused, set_first_home_gate
+
+        home_refused = (FirstHomeRefused,)
+        previous_home_gate = set_first_home_gate(FirstHomeGate(confirmed=args.home_confirmed))
         # Ctrl-C estops first -- during bring-up too (HS-4) -- then exits through
         # the finally below.
         stop_guard = HardwareStopGuard(config.hardware.jetson_host, config.hardware.jetson_port)
@@ -1519,11 +1561,24 @@ def main() -> int:
             print("\nInterrupted during bring-up (connecting / boot homing). An estop was "
                   "sent to the robot server -- the line above says whether it was "
                   "acknowledged; if it was not, cut the +6 V servo supply. An "
-                  "acknowledged estop keeps the servos detached until clear_estop.")
+                  "acknowledged estop keeps the servos detached until clear_estop "
+                  "(`scripts/calibrate_servos.py --jetson <ip>:5560` -> `clear`).")
         else:
             print("\nInterrupted.")
         exit_code = 130
+    except home_refused as exc:
+        # Nothing was sent to the arm: say why and how to proceed, no traceback.
+        print("\n" + "!" * 72)
+        print("  FIRST HOME NOT SENT")
+        print("!" * 72)
+        print(f"  {exc}")
+        print("!" * 72)
+        exit_code = 1
     finally:
+        if previous_home_gate is not None:
+            from mfw.hardware.runtime import set_first_home_gate
+
+            set_first_home_gate(previous_home_gate)
         if assistant is not None:
             assistant.close()
         elif stop_guard is not None:

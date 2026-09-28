@@ -14,9 +14,10 @@
 
 #
 # Deliberately NOT started at boot (no [Install] section): the first `home`
-# after robot_server starts (sent unprompted by run_assistant --hardware when it
-# connects) attaches every servo AT home at full speed, so a person hand-poses
-# the arm at home right before starting run_assistant.
+# after robot_server starts (sent by run_assistant --hardware when it connects,
+# after its FIRST HOME prompt, or pre-confirmed with --home-confirmed) attaches
+# every servo AT home at full speed, so a person hand-poses the arm at home and
+# stands at the E-stop for it.
 
 [Unit]
 Description=mfw conversation mode (robot + Qwen + Canary + Florence)

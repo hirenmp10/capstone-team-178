@@ -47,9 +47,12 @@ import pytest
 
 from mfw.language.intent_parser import (
     LlmIntentParser,
+    NegatedCommand,
     RuleBasedIntentParser,
     UnparsedCommand,
     _RELATION_WORDS,
+    split_transfer,
+    strip_correction,
 )
 from tests import test_language_logic as sim_lane
 
@@ -84,7 +87,9 @@ class TestDropWithDestinationIsPlace:
             ("drop it in the bowl", "in", "bowl"),
             ("drop it on the box", "on", "box"),
             ("drop it into the bowl", "in", "bowl"),
-            ("drop the can next to the bowl", "next_to", "bowl"),
+            # was here until 2026-09-28: ("drop the can next to the bowl", "next_to", "bowl").
+            # A NAMED object is now a transfer (pick it, then place): see
+            # TestDropANamedObjectIsATransfer below and HARDWARE_MAPPINGS.
             ("drop it on top of the box", "on", "box"),
         ],
     )
@@ -137,6 +142,138 @@ class TestDropWithDestinationIsPlace:
         intent = parser.parse("drop it in the bowl and then go home")
         assert intent.skill == "place"
         assert intent.params["target"] == "bowl"
+
+
+class TestDropANamedObjectIsATransfer:
+    """Language decisions stream, 2026-09-28: "drop <named object> <relation> <place>".
+
+    was: ``place`` -- whatever the arm held went into the destination, whichever
+    object was named ("drop the eraser in the bowl" while holding the marker put
+    the marker in the bowl). now: a transfer, exactly like "put the can in the
+    bowl": the parser's intent is the first action (pick the named object) and
+    :func:`split_transfer` gives the Assistant both clauses. The Assistant runs
+    only the place when the named object is the one held (tests/test_grounding.py).
+    """
+
+    @pytest.mark.parametrize(
+        "utterance,obj,relation,target",
+        [
+            ("drop the can next to the bowl", "can", "next_to", "bowl"),
+            ("drop the eraser in the bowl", "eraser", "in", "bowl"),
+            ("drop the red block onto the box please", "red block", "on", "box"),
+            ("please drop the marker into the bin", "marker", "in", "bin"),
+            ("drop the can to the left of the bowl", "can", "left_of", "bowl"),
+            ("drop off the can in the bowl", "can", "in", "bowl"),
+            ("drop the can off in the bowl", "can", "in", "bowl"),
+        ],
+    )
+    def test_named_object_is_picked_first(self, parser, utterance, obj, relation, target):
+        intent = parser.parse(utterance)
+        assert (intent.skill, intent.params) == ("pick", {"target": obj})
+        split = split_transfer(utterance)
+        assert split is not None and split.pick_clause is not None
+        assert split.object_phrase == obj
+        assert split.place_params == {"relation": relation, "target": target}
+
+    @pytest.mark.parametrize(
+        "utterance,expected",
+        [
+            # A pronoun names the held object: a plain place, as before.
+            ("drop it in the bowl", ("place", {"relation": "in", "target": "bowl"})),
+            ("drop it off in the bowl", ("place", {"relation": "in", "target": "bowl"})),
+            ("drop that next to the box", ("place", {"relation": "next_to", "target": "box"})),
+            # No destination, a pronoun destination, or a direction: unchanged releases.
+            ("drop the can", ("open_gripper", {})),
+            ("drop the can on it", ("open_gripper", {})),
+            ("drop the can to the left", ("open_gripper", {})),
+            ("drop the can in there", ("open_gripper", {})),
+        ],
+    )
+    def test_pronoun_and_destinationless_drops_are_unchanged(self, parser, utterance, expected):
+        assert _same_outcome(_outcome(parser, utterance), expected)
+        split = split_transfer(utterance)
+        assert split is None or split.pick_clause is None
+
+
+class TestCorrectionMarkers:
+    """Language decisions stream, 2026-09-28: a leading correction is not a negation.
+
+    was: "no, put it in the bowl" -> NegatedCommand (the operator had to say it
+    again). now: the command after the marker is parsed. A negation AFTER the
+    marker is still refused, and a stop word still wins.
+    """
+
+    @pytest.mark.parametrize(
+        "utterance,expected",
+        [
+            ("no, put it in the bowl", ("place", {"relation": "in", "target": "bowl"})),
+            ("no put it in the bowl", ("place", {"relation": "in", "target": "bowl"})),
+            ("nope, pick the marker", ("pick", {"target": "marker"})),
+            ("nah, go home", ("go_home", {})),
+            ("no no, open the gripper", ("open_gripper", {})),
+            ("actually, place it on the box", ("place", {"relation": "on", "target": "box"})),
+            ("actually no, place it on the box", ("place", {"relation": "on", "target": "box"})),
+            ("sorry, pick the marker", ("pick", {"target": "marker"})),
+            ("i mean pick the can", ("pick", {"target": "can"})),
+            ("no, stop", ("stop", {})),
+            ("no, don't stop", ("stop", {})),
+        ],
+    )
+    def test_the_command_after_the_marker_is_parsed(self, parser, utterance, expected):
+        assert _same_outcome(_outcome(parser, utterance), expected)
+
+    @pytest.mark.parametrize(
+        "utterance",
+        ["no, don't drop it", "no don't drop it", "nope, do not go home", "actually, don't open the gripper",
+         "don't open the gripper", "do not go home", "no", "no no", "nope", "sorry no",
+         "the marker, not the block", "put it in the bowl, no"],
+    )
+    def test_a_negated_command_is_still_refused(self, parser, utterance):
+        with pytest.raises(NegatedCommand):
+            parser.parse(utterance)
+
+    def test_a_marker_before_something_that_is_not_a_command_is_just_unparsed(self, parser):
+        with pytest.raises(UnparsedCommand) as info:
+            parser.parse("nope, the red one")
+        assert not isinstance(info.value, NegatedCommand)
+
+    def test_a_correction_keeps_a_transfer_whole(self, parser):
+        """"actually, put the marker in the bowl" hid the transfer: place in bowl, marker ignored."""
+        assert parser.parse("actually, put the marker in the bowl").params == {"target": "marker"}
+        split = split_transfer("no, put the marker in the bowl")
+        assert split is not None and split.clauses == ("pick the marker", "place it in the bowl")
+
+    def test_strip_correction_leaves_a_bare_marker_alone(self):
+        assert strip_correction("no") == "no"
+        assert strip_correction("no no") == "no no"
+        assert strip_correction("no put it in the bowl") == "put it in the bowl"
+        assert strip_correction("nothing to do") == "nothing to do"
+        assert strip_correction("notice the can") == "notice the can"
+
+    @pytest.mark.parametrize("text", [
+        "no need to drop it", "no more moving left", "no dropping it", "no going home", "no one",
+        "nope not that one", "no no need to drop it", "actually no need to drop it", "nah never mind",
+        "no way", "no problem", "no longer holding it", "no can do", "no reason to drop it",
+    ])
+    def test_a_no_that_starts_a_negation_is_kept(self, text):
+        """Fixer, 2026-09-28: "no"/"nope"/"nah" are stripped only before a command start."""
+        assert strip_correction(text) == text
+
+    @pytest.mark.parametrize("text,rest", [
+        ("no drop it", "drop it"), ("no let go", "let go"), ("nope the red one", "the red one"),
+        ("no can you put it in the bowl", "can you put it in the bowl"), ("nah just go home", "just go home"),
+        ("sorry need to drop it", "need to drop it"),  # "sorry" is no negation; the rest is judged
+    ])
+    def test_a_no_before_a_command_start_is_stripped(self, text, rest):
+        assert strip_correction(text) == rest
+
+    @pytest.mark.parametrize("utterance", [
+        "no need to drop it", "no need to go home", "no dropping it", "no going home",
+        "no more moving left", "no, no need to drop it",
+    ])
+    def test_a_no_that_starts_a_negation_is_refused_as_one(self, parser, utterance):
+        with pytest.raises(NegatedCommand):
+            parser.parse(utterance)
 
 
 class TestTakeAPictureIsObserve:
@@ -304,7 +441,10 @@ HARDWARE_MAPPINGS = [
      "a destination was named; releasing where the arm happens to be drops the object on the table"),
     ("drop it on the box", ("open_gripper", {}), ("place", {"relation": "on", "target": "box"}), "same"),
     ("drop it into the bowl", ("open_gripper", {}), ("place", {"relation": "in", "target": "bowl"}), "same"),
-    ("drop the can next to the bowl", ("open_gripper", {}), ("place", {"relation": "next_to", "target": "bowl"}), "same"),
+    # was ("place", next_to bowl) from phase 9 until 2026-09-28 (language decisions
+    # stream); now a transfer whose first action is the pick of the named object.
+    ("drop the can next to the bowl", ("open_gripper", {}), ("pick", {"target": "can"}),
+     "phase 9 made it a place of whatever was held; a named object is picked first now"),
     ("drop it on top of the box", ("open_gripper", {}), ("place", {"relation": "on", "target": "box"}), "same"),
     # take a picture/photo/snapshot is a request to perceive
     ("take a picture", ("pick", {"target": "picture"}), ("observe", {}),
@@ -376,6 +516,30 @@ HARDWARE_MAPPINGS = [
     ("don't go home", ("go_home", {}), UNPARSED, "negated go_home"),
     ("do not pick up the marker", ("pick", {"target": "marker"}), UNPARSED, "negated pick"),
     ("stop, don't drop it", ("open_gripper", {}), ("stop", {}), "a stop word wins"),
+    # language decisions stream, 2026-09-28. "before" is the parser as it was
+    # just before this change (commit 7046082).
+    # drop + a NAMED object + a destination is a transfer (pick it first)
+    ("drop the eraser in the bowl", ("place", {"relation": "in", "target": "bowl"}), ("pick", {"target": "eraser"}),
+     "the held object (whatever it was) went into the bowl; the eraser was ignored"),
+    ("drop the can to the left of the bowl", ("open_gripper", {}), ("pick", {"target": "can"}),
+     "released whatever was held where the arm happened to be"),
+    ("drop the red block onto the box", ("place", {"relation": "on", "target": "box"}),
+     ("pick", {"target": "red block"}), "same as the eraser"),
+    # an adverb after the named object belongs to the verb (fixer, 2026-09-28;
+    # in between it was pick "can gently" / "can back")
+    ("drop the can gently in the bowl", ("place", {"relation": "in", "target": "bowl"}),
+     ("pick", {"target": "can"}), "same as the eraser"),
+    ("drop the can back in the bowl", ("place", {"relation": "in", "target": "bowl"}),
+     ("pick", {"target": "can"}), "same as the eraser"),
+    # a pronoun followed by a deictic is still the pronoun
+    ("put it here in the box", ("pick", {"target": "it"}), ("place", {"relation": "in", "target": "box"}),
+     "picked 'it' (the held object) before placing, like 'set it down next to' did"),
+    # a leading correction marker is not a negation
+    ("no, put it in the bowl", UNPARSED, ("place", {"relation": "in", "target": "bowl"}),
+     "a correction was refused as a negation and had to be repeated"),
+    ("nope, pick the marker", UNPARSED, ("pick", {"target": "marker"}), "same"),
+    ("actually, put the marker in the bowl", ("place", {"relation": "in", "target": "bowl"}),
+     ("pick", {"target": "marker"}), "the marker hid the transfer: whatever was held went into the bowl"),
 ]
 
 #: Phrases the first phase 9 patterns changed by accident (F4) and which map
@@ -512,6 +676,17 @@ class TestGrammarCorpusProperties:
         intent = parser.parse(utterance)
         if intent.skill == "open_gripper":
             assert intent.params == {}, utterance
+            return
+        if intent.skill == "pick":
+            # 2026-09-28: "drop the can in the bowl" is a transfer. Only a NAMED
+            # subject may become one, and its place clause must name a real target.
+            assert verb == "drop the can", utterance
+            assert intent.params == {"target": "can"}, utterance
+            split = split_transfer(utterance)
+            assert split is not None and split.pick_clause == "pick the can", utterance
+            intent = split.place_params
+            assert intent["target"] and intent["target"] not in RuleBasedIntentParser._NOT_A_TARGET, utterance
+            assert intent["relation"] == _RELATION_WORDS[relation], utterance
             return
         assert intent.skill == "place", utterance
         target = intent.params.get("target")
@@ -846,6 +1021,44 @@ LANGUAGE_STREAM_BOUNDARIES = [
     ("come to me", UNPARSED, "the operator is not an object"),
     ("approach", UNPARSED, "nothing named"),
     ("move to the bowl", ("move_to", {"target": "bowl"}), "unchanged"),
+    # language decisions stream, 2026-09-28: neighbours of the drop-transfer and
+    # correction rows in HARDWARE_MAPPINGS
+    ("drop it into the bin", ("place", {"relation": "in", "target": "bin"}), "a pronoun: still a plain place"),
+    ("drop the can to the left", ("open_gripper", {}), "a direction is not a destination; unchanged"),
+    ("sorry, pick the marker", ("pick", {"target": "marker"}), "'sorry' was never refused"),
+    ("nah, go home", ("go_home", {}), "'nah' was never a negator"),
+    ("actually, place it on the box", ("place", {"relation": "on", "target": "box"}), "unchanged"),
+    ("no, stop", ("stop", {}), "a stop word still wins"),
+    ("no, don't drop it", UNPARSED, "a negation after the marker is still refused"),
+    ("nope, the red one", UNPARSED, "no command after the marker: refused (not as a negation)"),
+    ("no", UNPARSED, "a bare marker is still a refused negation"),
+    # fixer, 2026-09-28: a "no" that STARTS a negation is not a correction marker
+    # (each of these executed in the working tree before the fix; all were
+    # refused at 7046082 and are again)
+    ("no need to drop it", UNPARSED, "'no need to' negates: it opened the gripper"),
+    ("no need to open the gripper", UNPARSED, "same"),
+    ("no need to go home", UNPARSED, "it homed"),
+    ("no need to move left", UNPARSED, "it moved the arm"),
+    ("no need to put it in the bowl", UNPARSED, "it placed"),
+    ("no, no need to drop it", UNPARSED, "stacked markers, then the negation"),
+    ("actually, no need to drop it", UNPARSED, "same"),
+    ("no dropping it", UNPARSED, "'no <gerund>' negates"),
+    ("no going home", UNPARSED, "same; in hybrid mode the model saw 'going home' and homed"),
+    ("no more moving left", UNPARSED, "'no more' negates"),
+    ("no let go", ("open_gripper", {}), "a verb after the marker: still a correction"),
+    ("nope, the red one", UNPARSED, "an article after the marker: stripped, then not a command"),
+    # fixer, 2026-09-28: a drop of "what you're holding" names the held object,
+    # like "it": the plain place it was at 7046082 (the drop-transfer change had
+    # made each a pick of the phrase, refused with "already holding something")
+    ("drop what you're holding in the bowl", ("place", {"relation": "in", "target": "bowl"}),
+     "the held object, not something to pick"),
+    ("drop the one you are holding in the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
+    ("drop what you have in the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
+    ("drop your load in the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
+    ("drop the object in the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
+    ("drop the thing in the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
+    ("drop the item into the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
+    ("drop everything in the bowl", ("place", {"relation": "in", "target": "bowl"}), "same"),
 ]
 
 

@@ -762,3 +762,446 @@ class TestRuntimeGuards:
                 runtime.build()
         finally:
             runtime.close()
+
+
+# ----------------------------------------------------------------------
+# first home after a bridge reset: never sent silently to a real arm
+# ----------------------------------------------------------------------
+
+
+def _never_prompt(reason: str) -> Callable[..., str]:
+    def prompt(*_a: Any) -> str:
+        pytest.fail(reason)
+
+    return prompt
+
+
+class TestFirstHomeGate:
+    """The bring-up ``home`` after every robot_server start attaches every
+    servo AT home at full speed (the bridge knows no position). Against a
+    real driver that must wait for the operator.
+
+    The "real" driver here is the in-process FakeDriver with the server's
+    ``fake`` flag cleared: the ping then says ``fake: false`` exactly as the
+    Uno driver does, and the FakeDriver models the physical hazard the gate
+    exists for -- straight after start ``position_known`` is False, and the
+    first ``home`` attaches AT home in one P frame (pinned in
+    ``test_hardware_bridge.py::TestSlowReattach``). "Nothing sent" is
+    checked on the driver itself: no P frame, position still unknown.
+    """
+
+    @pytest.fixture
+    def real_lane(self, lane_factory):
+        cfg, _world, robot_server, _det, driver = lane_factory()
+        robot_server.fake = False  # what ping reports for the uno/pca9685 drivers
+        assert not driver.position_known and driver.write_count == 0
+        return cfg, robot_server, driver
+
+    @staticmethod
+    def _runtime(cfg, gate):
+        from mfw.hardware.runtime import HardwareRuntime
+
+        return HardwareRuntime(cfg, first_home_gate=gate)
+
+    def test_unknown_position_waits_for_the_typed_word_before_the_first_home(self, real_lane):
+        """was: a bare Enter confirmed. now: the operator types ``home`` (fixer, 2026-09-28)."""
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate
+
+        cfg, _server, driver = real_lane
+        at_prompt: list[tuple[int, bool]] = []
+
+        def enter(_text: str) -> str:
+            at_prompt.append((driver.write_count, driver.position_known))
+            return "home"
+
+        out = io.StringIO()
+        runtime = self._runtime(cfg, FirstHomeGate(prompt=enter, out=out, interactive=True))
+        try:
+            runtime.build()
+            # Asked exactly once, and at that moment nothing had been pulsed.
+            assert at_prompt == [(0, False)]
+            assert runtime.first_home == "operator"
+            # Only after Enter: the home was sent (P frames, position now known).
+            assert driver.write_count >= 1 and driver.position_known
+            text = out.getvalue()
+            assert "Hand-pose the arm at home" in text
+            assert "E-stop" in text and "clear of the arm" in text and "FULL SPEED" in text
+        finally:
+            runtime.close()
+
+    def test_a_queued_enter_does_not_confirm(self, real_lane):
+        """An Enter pressed during the multi-second bring-up is already in the
+        console buffer when the prompt appears. The fake console models that
+        buffer: ``flush`` discards it, and a bare line that still arrives is
+        asked again, never a confirmation."""
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate
+
+        cfg, _server, driver = real_lane
+        typeahead = ["", ""]  # two Enters typed while the runtime was connecting
+        answers = ["", "  HOME "]  # at the prompt: one more stray Enter, then the word
+        seen: list[tuple[str, int]] = []
+
+        def flush() -> int:
+            n = len(typeahead)
+            typeahead.clear()
+            return n
+
+        def console(_text: str) -> str:
+            line = typeahead.pop(0) if typeahead else answers.pop(0)
+            seen.append((line, driver.write_count))
+            return line
+
+        out = io.StringIO()
+        gate = FirstHomeGate(prompt=console, out=out, interactive=True, flush=flush)
+        runtime = self._runtime(cfg, gate)
+        try:
+            runtime.build()
+            assert seen == [("", 0), ("  HOME ", 0)], "the typeahead must never reach the prompt"
+            assert gate.asked == 2 and runtime.first_home == "operator"
+            assert driver.position_known
+            assert "discarded 2 keystroke" in out.getvalue() and "type the word home" in out.getvalue()
+        finally:
+            runtime.close()
+
+    def test_a_console_without_flush_would_have_confirmed_on_the_queued_enter(self, real_lane):
+        """The fake must be able to fail: with no flush the queued Enter is read
+        first -- and still does not confirm, because a bare line is not the word."""
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate
+
+        cfg, _server, driver = real_lane
+        lines = ["", "home"]
+        gate = FirstHomeGate(prompt=lambda _t: lines.pop(0), out=io.StringIO(), interactive=True,
+                             flush=lambda: 0)
+        runtime = self._runtime(cfg, gate)
+        try:
+            runtime.build()
+            assert gate.asked == 2 and driver.position_known
+        finally:
+            runtime.close()
+
+    def test_only_stray_lines_refuse_after_three_prompts(self, real_lane):
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused
+
+        cfg, _server, driver = real_lane
+        answers = iter(["", "y", "ok"])
+        gate = FirstHomeGate(prompt=lambda _t: next(answers), out=io.StringIO(), interactive=True)
+        runtime = self._runtime(cfg, gate)
+        try:
+            with pytest.raises(FirstHomeRefused, match="nothing was sent"):
+                runtime.build()
+            assert gate.asked == 3
+            assert driver.write_count == 0 and not driver.position_known
+        finally:
+            runtime.close()
+
+    def test_the_default_prompt_flushes_the_console_first(self, monkeypatch):
+        """With the real ``input``, the console is drained before every prompt."""
+        import builtins
+        import io
+
+        from mfw.hardware import runtime as runtime_mod
+
+        order: list[str] = []
+        monkeypatch.setattr(runtime_mod, "_flush_console_input", lambda: order.append("flush") or 0)
+        monkeypatch.setattr(builtins, "input", lambda _t="": order.append("input") or "home")
+        gate = runtime_mod.FirstHomeGate(out=io.StringIO(), interactive=True)
+        assert gate({"endpoint": "tcp://x:5560", "driver": "uno", "home_q": [0, 0, 0, 0]}) == "operator"
+        assert order == ["flush", "input"]
+
+    def test_eof_at_the_prompt_aborts_and_sends_nothing(self, real_lane):
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused
+
+        cfg, _server, driver = real_lane
+
+        def eof(_text: str) -> str:
+            raise EOFError
+
+        runtime = self._runtime(cfg, FirstHomeGate(prompt=eof, out=io.StringIO(), interactive=True))
+        try:
+            with pytest.raises(FirstHomeRefused, match="nothing was sent"):
+                runtime.build()
+            assert driver.write_count == 0 and not driver.position_known
+            assert runtime.first_home is None and runtime.skills is None
+        finally:
+            runtime.close()
+
+    def test_ctrl_c_at_the_prompt_propagates_and_sends_nothing(self, real_lane):
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate
+
+        cfg, _server, driver = real_lane
+
+        def ctrl_c(_text: str) -> str:
+            raise KeyboardInterrupt
+
+        runtime = self._runtime(cfg, FirstHomeGate(prompt=ctrl_c, out=io.StringIO(), interactive=True))
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                runtime.build()
+            assert driver.write_count == 0 and not driver.position_known
+        finally:
+            runtime.close()
+
+    def test_no_terminal_refuses_and_names_the_flag(self, real_lane):
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused
+
+        cfg, _server, driver = real_lane
+        gate = FirstHomeGate(prompt=_never_prompt("prompted with no terminal"), interactive=False)
+        runtime = self._runtime(cfg, gate)
+        try:
+            with pytest.raises(FirstHomeRefused, match="--home-confirmed"):
+                runtime.build()
+            assert driver.write_count == 0 and not driver.position_known
+        finally:
+            runtime.close()
+
+    def test_home_confirmed_flag_proceeds_without_a_prompt(self, real_lane):
+        import io
+
+        from mfw.hardware.runtime import FirstHomeGate
+
+        cfg, _server, driver = real_lane
+        out = io.StringIO()
+        gate = FirstHomeGate(confirmed=True, prompt=_never_prompt("prompted despite --home-confirmed"),
+                             out=out, interactive=False)
+        runtime = self._runtime(cfg, gate)
+        try:
+            runtime.build()
+            assert runtime.first_home == "flag"
+            assert driver.write_count >= 1 and driver.position_known
+            assert "--home-confirmed given" in out.getvalue() and "Hand-pose the arm at home" in out.getvalue()
+        finally:
+            runtime.close()
+
+    def test_estopped_server_is_refused_before_prompting(self, real_lane):
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused
+
+        cfg, _server, driver = real_lane
+        client = JetsonClient(cfg.hardware.jetson_host, cfg.hardware.jetson_port)
+        try:
+            client.connect()
+            client.estop()  # e.g. the Ctrl-C estop sent while an earlier session was at the prompt
+        finally:
+            client.close()
+        gate = FirstHomeGate(prompt=_never_prompt("asked a person to pose an arm whose server refuses motion"),
+                             interactive=True)
+        runtime = self._runtime(cfg, gate)
+        try:
+            with pytest.raises(FirstHomeRefused, match="estopped.*clear"):
+                runtime.build()
+            assert driver.write_count == 0 and not driver.position_known
+        finally:
+            runtime.close()
+
+    def test_a_known_position_homes_without_asking(self, real_lane):
+        """Second run against the same server: the bridge knows its pose, the
+        home is an ordinary move at the velocity ceiling, nothing to confirm."""
+        cfg, _server, driver = real_lane
+        client = JetsonClient(cfg.hardware.jetson_host, cfg.hardware.jetson_port)
+        try:
+            client.connect()
+            client.home()
+        finally:
+            client.close()
+        assert driver.position_known
+        runtime = self._runtime(cfg, _never_prompt("asked although the bridge knows its position"))
+        try:
+            runtime.build()
+            assert runtime.first_home == "not needed"
+        finally:
+            runtime.close()
+
+    @staticmethod
+    def _leave_the_arm_limp_away_from_home(cfg, robot_server, driver):
+        """A previous session homed and moved the arm, then ended; the server's
+        host timeout detached the servos (what ``check_host_liveness`` does)."""
+        client = JetsonClient(cfg.hardware.jetson_host, cfg.hardware.jetson_port)
+        try:
+            client.connect()
+            client.home()
+            q = [float(v) for v in client.get_state()["q"]]
+            away = [q[0] + 0.2, q[1] + 0.1, q[2] - 0.1, q[3]]
+            client.follow_trajectory([q, away], 0.5)
+        finally:
+            client.close()
+        last_pulses = tuple(int(round(v)) for v in driver.pulses())
+        with driver.lock:
+            driver.detach("host timeout: no client request for 5.0 s")
+        robot_server.host_lost = True
+        assert driver.position_known and not driver.attached
+        return last_pulses
+
+    def test_limp_servos_at_a_known_position_ask_first(self, real_lane):
+        """Second run on the same robot_server: the position is known, but the
+        servos are detached, and ``home`` re-attaches AT the last pulsed pose at
+        full speed before its slow move -- the FakeDriver records it as the
+        first ``P`` frame after the prompt. A sagged arm snaps back there.
+
+        was (before the fixer, 2026-09-28): no prompt, home sent at once.
+        now: the gate runs with ``reason == "limp"`` and the limp wording.
+        """
+        import io
+
+        from mfw.hardware.runtime import FIRST_HOME_LIMP, FirstHomeGate
+
+        cfg, robot_server, driver = real_lane
+        last_pulses = self._leave_the_arm_limp_away_from_home(cfg, robot_server, driver)
+        detached_at = len(driver.commands)
+        at_prompt: list[int] = []
+        contexts: list[dict] = []
+
+        def confirm(_text: str) -> str:
+            at_prompt.append(len(driver.commands))
+            return "home"
+
+        out = io.StringIO()
+        gate = FirstHomeGate(prompt=confirm, out=out, interactive=True)
+
+        def recording_gate(context):
+            contexts.append(dict(context))
+            return gate(context)
+
+        runtime = self._runtime(cfg, recording_gate)
+        try:
+            runtime.build()
+            assert contexts[0]["reason"] == FIRST_HOME_LIMP and gate.asked == 1
+            assert runtime.first_home == "operator"
+            text = out.getvalue()
+            assert "DETACHED (limp)" in text and "LAST POSE" in text and "not at home" in text
+            assert "host timeout" in text and "E-stop" in text
+            # Nothing was pulsed between the detach and the typed "home" ...
+            assert not [c for c in driver.commands[detached_at:at_prompt[0]] if c[0] == "P"]
+            # ... and the first frame after it re-energised AT the last pose,
+            # not at home: the snap a sagged arm makes.
+            first_after = next(c for c in driver.commands[at_prompt[0]:] if c[0] == "P")
+            assert first_after[1] == last_pulses
+            assert driver.attached
+        finally:
+            runtime.close()
+
+    def test_limp_servos_with_no_terminal_refuse_with_the_limp_reason(self, real_lane):
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused
+
+        cfg, robot_server, driver = real_lane
+        self._leave_the_arm_limp_away_from_home(cfg, robot_server, driver)
+        writes = len(driver.commands)
+        gate = FirstHomeGate(prompt=_never_prompt("prompted with no terminal"), interactive=False)
+        runtime = self._runtime(cfg, gate)
+        try:
+            with pytest.raises(FirstHomeRefused, match="detached.*last pose.*--home-confirmed"):
+                runtime.build()
+            assert not [c for c in driver.commands[writes:] if c[0] == "P"]
+            assert not driver.attached
+        finally:
+            runtime.close()
+
+    def test_fake_driver_is_unchanged_no_prompt(self, fake_lane):
+        """The fake lane (ping says fake: true) homes from an unknown position
+        exactly as before: no prompt."""
+        cfg, _world, _server, _det, driver = fake_lane
+        assert not driver.position_known
+        runtime = self._runtime(cfg, _never_prompt("the fake lane must never prompt"))
+        try:
+            runtime.build()
+            assert runtime.first_home == "not needed"
+            assert driver.position_known
+        finally:
+            runtime.close()
+
+    def test_default_gate_is_the_installed_module_gate(self, real_lane):
+        """Assistant builds HardwareRuntime(config) with no gate argument;
+        run_assistant.py installs its gate as the module default."""
+        from mfw.hardware import runtime as runtime_mod
+
+        cfg, _server, driver = real_lane
+        seen: list[dict] = []
+
+        def record(context) -> str:
+            seen.append(dict(context))
+            assert driver.write_count == 0
+            return "flag"
+
+        previous = runtime_mod.set_first_home_gate(record)
+        try:
+            runtime = runtime_mod.HardwareRuntime(cfg)
+            try:
+                runtime.build()
+            finally:
+                runtime.close()
+        finally:
+            assert runtime_mod.set_first_home_gate(previous) is record
+        assert len(seen) == 1 and seen[0]["endpoint"].endswith(f":{cfg.hardware.jetson_port}")
+        assert seen[0]["home_q"] == pytest.approx(list(cfg.robot.home_joint_positions))
+        assert seen[0]["state"]["bridge_position_known"] is False
+
+    def test_initial_module_default_refuses_without_a_terminal(self, monkeypatch):
+        """Any caller that never installs a gate (another script, a notebook)
+        gets the safe default: prompt at a TTY, refuse otherwise."""
+        import io
+        import sys
+
+        from mfw.hardware import runtime as runtime_mod
+
+        assert isinstance(runtime_mod._default_first_home_gate, runtime_mod.FirstHomeGate)
+        assert runtime_mod._default_first_home_gate.confirmed is False
+        gate = runtime_mod.FirstHomeGate()
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # not a TTY
+        with pytest.raises(runtime_mod.FirstHomeRefused, match="--home-confirmed"):
+            gate({"endpoint": "tcp://x:5560", "driver": "uno", "home_q": [0, 0, 0, 0]})
+        monkeypatch.setattr(sys, "stdin", None)  # pythonw / detached
+        assert gate.is_interactive() is False
+
+    def test_stdin_from_the_null_device_is_not_a_terminal(self, monkeypatch):
+        """``run_assistant.py < NUL`` on Windows: NUL is a character device, so
+        ``isatty()`` says True (measured); the gate must still see no terminal
+        and refuse with the flag's name rather than prompt into the void."""
+        import os
+        import sys
+
+        from mfw.hardware import runtime as runtime_mod
+
+        with open(os.devnull, encoding="utf-8") as null:
+            monkeypatch.setattr(sys, "stdin", null)
+            gate = runtime_mod.FirstHomeGate(prompt=_never_prompt("prompted on the null device"))
+            assert gate.is_interactive() is False
+            with pytest.raises(runtime_mod.FirstHomeRefused, match="--home-confirmed"):
+                gate({"endpoint": "tcp://x:5560", "driver": "uno", "home_q": [0, 0, 0, 0]})
+
+    @pytest.mark.parametrize(
+        "info, state, needed",
+        [
+            ({"fake": False}, {"bridge_position_known": False}, True),
+            ({"fake": False}, {}, True),  # an older server that cannot say: cautious
+            ({"fake": False}, {"bridge_position_known": True}, False),
+            ({"fake": False}, {"bridge_position_known": True, "attached": True}, False),
+            # was False (no prompt) until the fixer, 2026-09-28: limp servos at a known pose
+            ({"fake": False}, {"bridge_position_known": True, "attached": False}, True),
+            ({"fake": False}, {"bridge_position_known": True, "attached": False, "host_lost": True}, True),
+            ({"fake": True}, {"bridge_position_known": True, "attached": False}, False),
+            ({"fake": True}, {"bridge_position_known": False}, False),
+            (None, None, True),
+        ],
+    )
+    def test_first_home_needs_operator_table(self, info, state, needed):
+        from mfw.hardware.runtime import first_home_needs_operator
+
+        assert first_home_needs_operator(info, state) is needed
+
+    def test_first_home_reason_names_the_case(self):
+        from mfw.hardware.runtime import FIRST_HOME_LIMP, FIRST_HOME_UNKNOWN, first_home_reason
+
+        assert first_home_reason({"fake": False}, {"bridge_position_known": False}) == FIRST_HOME_UNKNOWN
+        assert first_home_reason({"fake": False}, {"bridge_position_known": True, "attached": False}) == (
+            FIRST_HOME_LIMP)
+        assert first_home_reason({"fake": False}, {"bridge_position_known": True, "attached": True}) is None

@@ -11,7 +11,7 @@ quantized, on the Jetson. The laptop (`py -3.12`) orchestrates with `mfw`.
 > fakes; expect to correct it on the bench and write down what changed. What
 > *is* proven, on the laptop only:
 > - the whole demo flow on the fake lane (`py -3.12 scripts/run_assistant.py --fake-hardware --demo`: 5/5 commands ok, 2026-09-28);
-> - the three models on the laptop GPU (Canary Q4_K_M = bf16 on 30/30 commands; Qwen Q4_K_M hybrid parser 62/62 on the dev set; Florence FP16 = FP32 on 72/72 boxes) -- `docs/JETSON_MODELS_PLAN.md` section 0;
+> - the three models on the laptop GPU (Canary Q4_K_M = bf16 on 30/30 commands; Qwen Q4_K_M hybrid parser 61/62 on the dev set, 31/31 held-out, 34/34 fresh after the 2026-09-28 language changes -- the one dev miss, "drop the can next to the bowl", is a testset label that now disagrees with the parser by design (it is a pick-then-place transfer); Florence FP16 = FP32 on 72/72 boxes) -- `docs/JETSON_MODELS_PLAN.md` section 0;
 > - every safety path (placeholder guard, serial resync, host timeout, stale frames) against fakes that model the physical failure, in the pure test suite.
 
 Deeper references: `jetson/README.md` (Jetson install, builds, systemd,
@@ -71,7 +71,7 @@ Two people: one operates, one keeps a hand on the E-stop.
 2. Supply measured at 5.9-6.1 V with no load (S1). Polarity of the capacitor and of every servo plug checked.
 3. Exactly one ground wire servo bus (-) -> Uno GND; no arm wire on any Jetson pin.
 4. Workspace clear of hands, cables and anything that must not be knocked over; foam or a towel under the reach circle.
-5. The arm **hand-posed at home** (upper arm vertical, forearm folded ~35 deg back, jaws up; `robot.home_joint_positions`) **right before the first `home`**: after every robot_server start the bridge knows no position, and the first `home` request attaches all servos AT home at full speed. That request is `calibrate_servos.py` -> `home`, or -- with no prompt -- `run_assistant.py --hardware` connecting (HardwareRuntime homes on startup), which can be minutes after `jetson_mode.sh conversation` while an unpowered arm sags. Re-pose it just before you start run_assistant.
+5. The arm **hand-posed at home** (upper arm vertical, forearm folded ~35 deg back, jaws up; `robot.home_joint_positions`) **right before the first `home`**: after every robot_server start the bridge knows no position, and the first `home` request attaches all servos AT home at full speed. That request is `calibrate_servos.py` -> `home`, or `run_assistant.py --hardware` connecting (HardwareRuntime homes on startup), which can be minutes after `jetson_mode.sh conversation` while an unpowered arm sags. **run_assistant does not send it silently:** against a real driver with no known position it prints the hand-pose checklist (arm at home, E-stop in reach, hands clear), discards anything typed during bring-up, and waits for you to type **`home`** (a bare Enter is asked again); Ctrl-C or end of input aborts before anything moves (Ctrl-C also sends an estop: clear it with `calibrate_servos.py` -> `clear` before the next run, or the next run refuses and says so). Pose the arm at that prompt, not earlier. **A second run on the same robot_server prompts too**: 5 s after the previous run's last request the server's host timeout detaches the servos and the arm goes limp, and the next `home` re-attaches every servo AT ITS LAST POSE at full speed before moving slowly home -- a sagged arm snaps back there. The checklist then says "DETACHED (limp)" and prints that last pose: hand-pose the arm at that pose (not at home). A run with no terminal (piped input, a scheduled task, a service unit) refuses and exits 1 unless `--home-confirmed` is given -- pass it only when a person has just hand-posed the arm and is at the E-stop. Only the fake lane, and a real arm whose servos are still attached at a known position (a run started within the host timeout), never prompt.
 6. `jetson/robot_config.yaml` says `measured: true`, or robot_server is started with `--allow-placeholder-calibration` (first bring-up only).
 7. The laptop can reach the Jetson (`ping`), and nobody is about to start a second robot_server.
 8. After power-on: watch the first `home`. If anything strains, buzzes or heats, hit the E-stop, then investigate.
@@ -208,6 +208,9 @@ The camera `pose` step already writes the homography. Two cross-checks:
    `home`, then each pitch joint +-10 deg, `jaw 30`, `jaw 10`. Watch for `clamped`.
 3. `py -3.12 scripts/run_assistant.py --hardware --jetson <jetson-ip> --detector-server <jetson-ip>:5558 -c "what do you see"`
    -- check every object is reported where it is (distances from the base).
+   After a robot_server restart it first stops at the FIRST HOME prompt:
+   hand-pose the arm at home, then type `home`. On later runs the servos are
+   limp (host timeout) and the prompt shows the last pose instead: pose it there.
 4. `-c "scan the room"`: the base turns slowly (0.35 rad/s) toward each object and back home.
 5. One object, typed: `-c "pick up the marker" -c "open the gripper" -c "go home"`.
    Hand on the E-stop. The run stops at the first failed command (`--keep-going` overrides).
@@ -224,9 +227,13 @@ about 15 cm forward, 12 cm right. Never name anything "can" (the ASR hears "kin"
 **Start.** Hand on the E-stop, then on the Jetson
 `sudo scripts/jetson_mode.sh conversation` and `scripts/jetson_mode.sh status`
 (all five units active). Start `scripts/tegrastats_log.sh 500 0 demo`.
-**Then hand-pose the arm at home again, immediately before** starting
-run_assistant: its startup sends the first `home`, which attaches every servo
-AT home at full speed (robot_server's own start attaches nothing).
+Start run_assistant (below). Its startup sends the first `home`, which
+attaches every servo AT home at full speed (robot_server's own start attaches
+nothing), so it stops at a **FIRST HOME** checklist first: **hand-pose the arm
+at home at that prompt**, check the E-stop is in reach and hands are clear,
+then type `home` and press Enter. If an earlier run ended more than 5 s ago the
+servos are limp and the checklist asks for the arm at its printed last pose
+instead. For a run with no terminal add `--home-confirmed` (section 3 item 5).
 
 **Typed run (the scripted demo):**
 ```
@@ -315,6 +322,21 @@ robot_server always stays on the Jetson (it owns the USB serial and the webcam).
   2 s apart, but every reported box must include a frame grabbed by the
   current request: an object moved since the last request is reported where
   it is now, or not at all (never at its old place).
-- The first `home` after every robot_server start (run_assistant --hardware
-  sends it on startup, unprompted) and every E-stop recovery can jump the arm:
-  hand-pose it right before, every time.
+- **The scan's "seen in 2 of 3 looks" is not independent evidence.** The
+  three looks are `hardware.scan.frame_gap_s` (0.15 s) apart, inside that 2 s
+  history, so a look can confirm an object with one new frame plus the
+  previous look's last frame: a glare or phantom on three consecutive frames
+  is reported as seen (pinned against the real frame vote in
+  `tests/test_mvp_flow.py`, `TestScanIndependence`). Two knobs make the looks
+  independent, both shown working there and neither on by default because the
+  extra detector time is unmeasured on the Jetson: `--history-max-age 0` in
+  `MFW_DETECTOR_EXTRA` (every detect then votes on its own frames only: at
+  least two Florence inferences per detect, everywhere, not just in the scan),
+  or `hardware.scan.frame_gap_s` above 2.0 s (adds about 4 s to every scan).
+  Try the first if phantoms show up in scans; watch the detect time.
+- The first `home` after every robot_server start, every E-stop recovery and
+  every host-timeout detach (the previous run ended) can jump the arm:
+  hand-pose it right before, every time (at home after a server start, at its
+  last pose when the servos are limp). run_assistant --hardware asks for that
+  at its FIRST HOME prompt (type `home`; or refuses without a terminal unless
+  `--home-confirmed`); `calibrate_servos.py` asks too.

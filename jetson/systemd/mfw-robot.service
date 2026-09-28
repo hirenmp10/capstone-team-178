@@ -3,10 +3,13 @@
 # has frames. Part of mfw-conversation.target.
 #
 # Safety: after every start the bridge knows no position, and the FIRST `home`
-# request (run_assistant --hardware sends one on startup, unprompted;
-# calibrate_servos `home`) attaches every servo AT home at full speed. The
-# start itself attaches nothing. Hand-pose the arm at home right before that
-# first home, and keep the +6 V E-stop within reach.
+# request attaches every servo AT home at full speed. The start itself
+# attaches nothing. That home comes from run_assistant --hardware on startup
+# (it stops at a FIRST HOME prompt and waits for the word `home`; with no
+# terminal it refuses unless --home-confirmed) or from calibrate_servos `home`
+# (asks for `yes`). Hand-pose the arm at home at that prompt, and keep the
+# +6 V E-stop within reach. A later run prompts too once the host timeout has
+# left the servos limp: that home re-attaches AT the last pose first.
 
 [Unit]
 Description=mfw robot server (arm bridge + webcam, ZMQ :5560)

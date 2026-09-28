@@ -253,12 +253,78 @@ Modified: `mfw/config/schema.py` (`backend`, `hardware`, `robot.kinematics`,
 | 4 · wk 4 (stretch) | `run_assistant.py --hardware` on the Jetson itself. | 10-min continuous rehearsal, all processes resident. |
 | wk 4 | Buffer; 10-trial benchmark per object → CSV; demo rehearsed twice; video; slides. | |
 
-## 12. Work split (permute names by skill)
+## 12. Work split and status (as of 2026-09-28)
 
-- **Adyanth** — integration lead: `HardwareRuntime`, `Assistant`/`run_assistant.py` flags, fake e2e; `ParakeetEngine` (Stage 1); llama shim (Stage 3); owns every gate measurement; keeps GR00T slides honest.
-- **Hiren** — Jetson + electronics + arm bridge (safety owner): Jetson setup; `servo_bridge.ino`; `UnoSerialDriver`; power/E-stop/common ground; smoke S1–S6; `calibrate_servos.py`. Contract: serial + ZMQ protocol (frozen end of week 1).
-- **Gowtham** — mechanics + kinematics + calibration: assemble arm; measure links/limits → `configs/hardware.yaml`; `kinematics.py` + round-trip tests; camera mount; `calibrate_table.py --touch`; object size table. Contract: kinematics API + config names.
-- **Shivanand** — vision on Jetson + skills + evaluation + demo: NanoOWL `detector_service.py` (synonyms, thresholds, voting), validate on 50 saved frames per object **before** Stage 1; `TopDownGraspGenerator`, feedback-free verification, planner transit logic; 10-trial benchmark + CSV; demo script, video, report section. Contract: detector JSON (with Adyanth).
+Code citations are `file:line` at local commit 7046082. Status words: **DONE IN CODE** = written and passing tests on the laptop against
+fakes, stubs or real models on the laptop GPU (never on the Jetson, the Uno or
+the arm); **PENDING HARDWARE** = needs the Jetson, the arm, the C270 or the mic;
+**CHANGED** = the original assignment was superseded. Nothing below has run on
+real hardware. The local lane is committed on the local branch `capstone-work`
+(7046082); no remote branch contains it.
+
+- **Adyanth** — integration lead, speech, LLM, gate owner.
+  - DONE IN CODE: `HardwareRuntime`, the `run_assistant.py` hardware flags and
+    the fake end-to-end lane (`--fake-hardware --demo`: 5/5 commands, exit 0);
+    the hardware and fake-hardware lanes exit 1 on a failed command
+    (`lane_exit_code`, `scripts/run_assistant.py:298`).
+  - CHANGED: `ParakeetEngine` is superseded by `TranscribeCppEngine`
+    (`--asr canary-gguf`, `scripts/speech_worker.py:416`): the same
+    Canary-Qwen-2.5B as GGUF Q4_K_M, with native-rate capture and resampling.
+    Laptop run: 29/30 recorded WAV commands transcribed exactly; tests in
+    `tests/test_speech_gguf.py` and `tests/test_speech_logic.py::TestResampler`.
+  - DONE IN CODE: the 5557 shim (`jetson/llm_worker_llamacpp.py`, default
+    `--skills hardware`) tested against a real `llama-server`
+    running `qwen2.5-3b-instruct-q4_k_m.gguf` on the laptop GPU; hybrid mode
+    (rules first) is what `run_assistant.py` uses. Accuracy figures and their
+    caveats: `docs/JETSON_MODELS_PLAN.md` section 0.
+  - PENDING HARDWARE: day-1 `tegrastats` (`scripts/tegrastats_log.sh`) and the
+    memory go/no-go for conversation mode (`docs/MVP_RUNBOOK.md` section 11);
+    live-mic voice on the Jetson; Jetson builds of transcribe.cpp/llama.cpp.
+  - DONE: GR00T slide (`docs/slides/groot-bridge.html`) updated to the
+    2026-09-25 live-inference result (0/2 zero-shot picks, simulation only).
+- **Hiren** — Jetson, electronics, Uno bridge (safety owner).
+  - DONE IN CODE (local lane): sketch overlong-line fix (a long line gets one
+    reply and runs nothing), resync when a resent frame is also late,
+    refusal of a `measured: false` calibration without
+    `--allow-placeholder-calibration`, `jetson/serial_smoke.py` for S3 (waits
+    out the DTR reset), `Pca9685Driver` tests. The sketch is executed on the
+    laptop with g++ and a mock Arduino core (`tests/test_mvp_bridge.py`),
+    not flashed.
+  - PENDING HARDWARE: JetPack flash, `lsusb` genuine-Uno check, flashing
+    `servo_bridge.ino`, power/E-stop/common-ground wiring, bench S1-S6.
+  - See the integration note below: PR #2 carries a different bridge.
+- **Gowtham** — mechanics, kinematics, calibration.
+  - DONE IN CODE: camera calibration tool `scripts/calibrate_camera.py`
+    (checkerboard intrinsics, `pose` via `solvePnP`, `check`), measured only
+    on synthetic C270-class renders (`tests/test_camera_calibration.py`);
+    `calibrate_table.py --touch` now holds the arm with a bounded heartbeat.
+  - PENDING HARDWARE: assembly, link lengths and limits (all three copies:
+    `configs/hardware.yaml`, `jetson/robot_config.yaml`, the README
+    `--arm-geometry` line), S5 end-stops, `calibrate_servos.py`, the real
+    camera run that sets `exterior_camera.pose_measured: true`, object sizes.
+- **Shivanand** — vision, skills, evaluation, demo.
+  - CHANGED: NanoOWL is superseded by Florence-2-base FP16 ONNX
+    (`scripts/serve_detector.py --backend florence-onnx`), evaluated on Isaac
+    renders only (`tests/test_florence_backend.py`); the frame vote now needs
+    a frame from the current request.
+  - CHANGED: scan-then-act with a wrist camera became the fixed-camera sweep
+    for the MVP (`FixedCameraScan`, `mfw/skills/primitives.py:1077`,
+    registered as `scan_scene` in `mfw/hardware/runtime.py:73`); objects
+    outside the workspace are reported as "out of reach".
+  - PENDING HARDWARE: label list and prompts from real C270 frames
+    (`/etc/mfw/detector_labels.json`), demo objects that fit the 45 mm jaw,
+    the 10-trial benchmark CSV, video and report section.
+
+**Integration note (teammate PR #2).** GitHub PR #2 (branch
+`hiren/robot-server`, opened 2026-09-25, open against `main`) contains its own
+`jetson/robot_server.py` and a sketch at `firmware/servo_bridge/servo_bridge.ino`
+(protocol in its `docs/hardware/PROTOCOL.md`). Its serial protocol is
+space-separated: `P 1500 ...`, `T <ms> <pulses>`, `W <ms>`, `S` (status, also a
+keepalive) and `V` (version). The local lane's `jetson/arduino/servo_bridge/`
+sketch uses comma frames (`P1500,...`, `T<pulses>,<ms>`), `K` keepalive, `?` ->
+`Q...` status and `S<nonce>` resync echo, which `UnoSerialDriver._resync`
+depends on. The two cannot be mixed: flash the sketch that matches the
+`robot_server.py` you run. The team must pick one before bench day.
 
 Daily 15-min sync; run the fake e2e test before every push.
 
@@ -280,9 +346,15 @@ Daily 15-min sync; run the fake e2e test before every push.
 10. **Boot is a full-speed jump; later re-attaches are one slow move.** After
     every robot_server start (the port open resets the Uno) the bridge knows
     no position, so the first frame attaches every servo AT home instantly.
-    That frame is the first `home` request -- sent unprompted when
-    `run_assistant.py --hardware` connects, possibly minutes after the start:
-    **hand-pose the arm at home right before starting run_assistant.** Once a position is
+    That frame is the first `home` request -- sent when
+    `run_assistant.py --hardware` connects, possibly minutes after the start,
+    but only after its FIRST HOME gate (`FirstHomeGate`,
+    `mfw/hardware/runtime.py`): the operator types `home` at a terminal, or the
+    run passes `--home-confirmed`; with neither it refuses before moving.
+    **Hand-pose the arm at home at that prompt.** The gate also runs when the
+    position is known but the servos are limp (the server's host timeout
+    after the previous run), because that home re-attaches AT the last pulsed
+    pose first; the prompt then asks for the arm at that pose. Once a position is
     known, a re-attach after estop / torque off / watchdog is one slow move
     (`reattach_s` 1 s, `home_move_s` 2.5 s), including a jaw-only command
     (every frame carries all five channels). The jump nothing can remove is
