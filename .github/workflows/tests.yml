@@ -9,8 +9,10 @@
 # The install list is the ACTIVE block of requirements.txt with the headless
 # OpenCV build. It was checked by collecting the whole suite, and running the
 # GR00T/speech/config/vision files, with every other third-party import
-# blocked (a meta-path finder), so a test that silently needs torch,
-# sounddevice or PIL fails here instead of only on a developer machine.
+# blocked (a meta-path finder), so a test that silently needs torch or
+# sounddevice fails here instead of only on a developer machine. pillow is
+# installed on purpose: the hardware lane's Florence-2 detector preprocesses
+# frames with PIL (jetson/florence_onnx.py), and its tests exercise that path.
 name: tests
 
 on:
@@ -44,7 +46,7 @@ jobs:
         run: >
           python -m pip install --upgrade pip &&
           python -m pip install numpy scipy pyyaml pyzmq msgpack msgpack-numpy
-          opencv-python-headless pytest
+          opencv-python-headless pillow pytest
 
       - name: Pure-logic suite
         run: python -m pytest tests -q -m "not isaac" -p no:cacheprovider
