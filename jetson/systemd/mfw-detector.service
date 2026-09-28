@@ -1,0 +1,32 @@
+# Detector: Florence-2-base ONNX FP16 (scripts/serve_detector.py
+# --backend florence-onnx) on :5558. Loads LAST, after speech is serving. It
+# does not open the webcam: frames come from robot_server's get_frame.
+# Per-label prompts (colour + noun) come from MFW_DETECTOR_EXTRA in mfw.env,
+# e.g. "--label-config /etc/mfw/detector_labels.json".
+
+[Unit]
+Description=mfw detector (Florence-2-base ONNX FP16, :5558)
+PartOf=mfw-conversation.target
+Requires=mfw-robot.service
+After=mfw-robot.service mfw-llama.service mfw-speech.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=jetson
+EnvironmentFile=/etc/mfw/mfw.env
+WorkingDirectory=/home/jetson/mfw
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+ExecStart=/bin/sh -c 'exec "$$MFW_PYTHON" "$$MFW_HOME/scripts/serve_detector.py" --backend florence-onnx --model-dir "$$FLORENCE_DIR" --precision "$$FLORENCE_PRECISION" --jetson 127.0.0.1:5560 --host 0.0.0.0 --port 5558 $$MFW_DETECTOR_EXTRA'
+# serve_detector warms the model before it binds (main(): warm_backend, then
+# serve_forever), so an open port = loaded -- or a warm-up that failed and was
+# logged; `journalctl -u mfw-detector` says which.
+ExecStartPost=/bin/sh -c 'exec "$$MFW_HOME/jetson/systemd/wait_ready.sh" tcp 127.0.0.1 5558 240'
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=mfw-conversation.target

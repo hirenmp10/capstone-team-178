@@ -1,0 +1,27 @@
+# The laptop-facing LLM worker protocol on :5557 in front of llama-server
+# (jetson/llm_worker_llamacpp.py: JSON-schema-constrained intents, skill enum
+# = the hardware registry + "unknown"). No model of its own.
+
+[Unit]
+Description=mfw LLM shim (:5557 -> llama-server :8080)
+PartOf=mfw-conversation.target
+Requires=mfw-llama.service
+After=mfw-llama.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=jetson
+EnvironmentFile=/etc/mfw/mfw.env
+WorkingDirectory=/home/jetson/mfw
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+ExecStart=/bin/sh -c 'exec "$$MFW_PYTHON" "$$MFW_HOME/jetson/llm_worker_llamacpp.py" --host 0.0.0.0 --port 5557 --llama-url "http://127.0.0.1:$$LLAMA_PORT" --skills hardware'
+ExecStartPost=/bin/sh -c 'exec "$$MFW_HOME/jetson/systemd/wait_ready.sh" tcp 127.0.0.1 5557 60'
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=mfw-conversation.target

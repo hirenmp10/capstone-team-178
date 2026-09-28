@@ -88,8 +88,8 @@ from typing import Any, Callable, Iterable
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from mfw.core.errors import ObjectNotFound, SafetyViolation
-from mfw.core.types import Frame, ObjectHypothesis, Pose, SceneGraph, SkillResult
+from mfw.core.errors import ObjectNotFound, PerceptionError, SafetyViolation
+from mfw.core.types import Frame, JointState, ObjectHypothesis, Pose, SceneGraph, SkillResult
 from mfw.grasp.generator import generate_grasp_candidates
 from mfw.language.grounding import describe, resolve_reference
 from mfw.physics.contact import verify_grasp
@@ -113,6 +113,11 @@ __all__ = [
     "Stop",
     "EmergencyStop",
     "ALL_SKILLS",
+    "HardwareObserve",
+    "FixedCameraScan",
+    "where_on_table",
+    "scan_sweep_stops",
+    "out_of_reach_reason",
     "HeldGrasp",
     "PlaceTarget",
     "PlacementCheck",
@@ -185,9 +190,18 @@ def _resolve_object(
     excluded = set(exclude_ids)
     if reference in scene.objects and reference not in excluded:
         return scene.objects[reference]
-    return resolve_reference(
-        reference, scene, memory=ctx.memory, robot_xy=_robot_xy(ctx), exclude_ids=excluded
-    )
+    try:
+        return resolve_reference(
+            reference, scene, memory=ctx.memory, robot_xy=_robot_xy(ctx), exclude_ids=excluded
+        )
+    except ObjectNotFound as exc:
+        # Hardware lane: the camera saw it, the workspace filter dropped it.
+        # "There is no cube in view" sent the operator looking for an object
+        # that was plainly on the table (audit, live fake run).
+        reason = out_of_reach_reason(ctx, reference)
+        if reason is None:
+            raise
+        raise ObjectNotFound(reason, phrase=exc.phrase, visible=exc.visible) from exc
 
 
 def _resolve_target(
@@ -234,6 +248,117 @@ def _accepts_keyword(func: Any, name: str) -> bool:
     return name in parameters or any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
     )
+
+
+# ----------------------------------------------------------------------
+# hardware-lane reporting (pure; unit-tested in tests/test_mvp_flow.py)
+# ----------------------------------------------------------------------
+
+
+def where_on_table(xy: ArrayLike, robot_xy: tuple[float, float] = (0.0, 0.0)) -> str:
+    """Where an object lies as the robot faces it: "in front", "front-left", ...
+
+    Robot frame: +X straight ahead, +Y to the robot's left. Bearing bands, in
+    degrees from straight ahead: |b| <= 15 in front, 15-60 front-left/right,
+    60-120 on the left/right, beyond that behind.
+    """
+    dx = float(np.asarray(xy, dtype=np.float64)[0]) - float(robot_xy[0])
+    dy = float(np.asarray(xy, dtype=np.float64)[1]) - float(robot_xy[1])
+    bearing = math.degrees(math.atan2(dy, dx))
+    side = "left" if bearing > 0.0 else "right"
+    magnitude = abs(bearing)
+    if magnitude <= 15.0:
+        return "in front"
+    if magnitude <= 60.0:
+        return f"front-{side}"
+    if magnitude <= 120.0:
+        return f"on the {side}"
+    return f"behind, to the {side}"
+
+
+def _with_article(noun: str) -> str:
+    return f"{'an' if noun[:1].lower() in 'aeiou' else 'a'} {noun}"
+
+
+def _and_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _phrase_words(phrase: str) -> set[str]:
+    words = set(str(phrase or "").lower().replace("_", " ").replace("-", " ").split())
+    return words | {w[:-1] for w in words if w.endswith("s") and len(w) > 3}
+
+
+def out_of_reach_reason(ctx: Any, phrase: str) -> str | None:
+    """"the cube is out of reach: ..." when the camera saw ``phrase`` outside the workspace.
+
+    ``None`` when the perception backend keeps no such record (the sim lane)
+    or nothing it dropped matches the phrase's words, so the caller's own
+    "not in view" stands.
+    """
+    records = getattr(getattr(ctx, "vision", None), "last_out_of_reach", None)
+    if not isinstance(records, list) or not records:
+        return None
+    words = _phrase_words(phrase)
+    matches = [r for r in records if str(r.get("label", "")).lower() in words]
+    if not matches:
+        return None
+    nearest = min(matches, key=lambda r: float(r.get("distance_m", 0.0)))
+    label = str(nearest["label"])
+    x, y = (float(v) for v in nearest["position"][:2])
+    scene_cfg = getattr(getattr(ctx, "config", None), "scene", None)
+    low = getattr(scene_cfg, "robot_min_reach_m", None)
+    high = getattr(scene_cfg, "robot_reach_m", None)
+    band = (
+        f"; the arm works about {float(low) * 100:.0f}-{float(high) * 100:.0f} cm from its base"
+        if low is not None and high is not None else ""
+    )
+    return (
+        f"the {label} is out of reach: I can see it {where_on_table((x, y), _robot_xy(ctx))}, "
+        f"{float(nearest.get('distance_m', math.hypot(x, y))) * 100:.0f} cm from the base at "
+        f"({x:.2f}, {y:.2f}) m, outside the arm's workspace{band}. Move it closer and ask again"
+    )
+
+
+def scan_sweep_stops(
+    bearings: Iterable[float],
+    lower: float,
+    upper: float,
+    max_sweep: float,
+    min_sweep: float,
+    max_stops: int,
+    margin: float = 0.05,
+    merge: float = 0.12,
+) -> list[float]:
+    """Base-yaw stops for the visible sweep, right to left (ascending radians).
+
+    Each bearing is clamped to ``[-max_sweep, max_sweep]`` and to the base
+    joint's limits less ``margin``; bearings closer than ``merge`` collapse
+    into one stop; at most ``max_stops`` remain (the extremes are always kept,
+    so the sweep still spans what was found). With nothing found the sweep is
+    ``-min_sweep`` then ``+min_sweep`` (clamped the same way), so "look around"
+    still visibly looks around.
+    """
+    lo = max(float(lower) + margin, -float(max_sweep))
+    hi = min(float(upper) - margin, float(max_sweep))
+    if lo > hi:
+        return []
+    raw = [float(b) for b in bearings if math.isfinite(float(b))]
+    if not raw:
+        raw = [-float(min_sweep), float(min_sweep)]
+    stops: list[float] = []
+    for bearing in sorted(min(max(b, lo), hi) for b in raw):
+        if stops and bearing - stops[-1] < merge:
+            continue
+        stops.append(bearing)
+    if len(stops) > max_stops:
+        if max_stops == 1:
+            return [stops[len(stops) // 2]]
+        picks = np.linspace(0, len(stops) - 1, max_stops).round().astype(int)
+        stops = [stops[i] for i in sorted(set(int(p) for p in picks))]
+    return stops
 
 
 # ----------------------------------------------------------------------
@@ -893,6 +1018,313 @@ class ScanScene(Skill):
 
         return self._ok(f"scanned {len(offsets)} viewpoint(s), found {len(seen)} object(s)",
                         objects=seen)
+
+
+# ----------------------------------------------------------------------
+# perception, hardware lane (one fixed overhead camera, no wrist camera)
+# ----------------------------------------------------------------------
+
+
+def _nearest_per_label(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One out-of-reach record per label, the nearest, nearest label first."""
+    best: dict[str, dict[str, Any]] = {}
+    for record in records:
+        label = str(record.get("label", ""))
+        if label and (label not in best or record["distance_m"] < best[label]["distance_m"]):
+            best[label] = dict(record)
+    return sorted(best.values(), key=lambda r: r["distance_m"])
+
+
+def _out_of_reach_phrases(records: Iterable[dict[str, Any]], robot_xy: tuple[float, float]) -> list[str]:
+    """``["a cube on the left (36 cm away)", ...]``, one per label (nearest first)."""
+    return [
+        f"{_with_article(str(r['label']))} {where_on_table(r['position'], robot_xy)} "
+        f"({float(r['distance_m']) * 100:.0f} cm away)"
+        for r in _nearest_per_label(records)
+    ]
+
+
+class HardwareObserve(Observe):
+    """``observe`` on the hardware lane: the same scene, reported with directions.
+
+    "observed 2 object(s): marker (front-left, 19 cm away), bowl (front-right,
+    19 cm away); out of reach: a cube on the left (36 cm away)". The sim
+    lane's colour words mean nothing here (the depthless lane does not
+    measure colour), where the object is does.
+    """
+
+    def _run(self, params: dict[str, Any]) -> SkillResult:
+        result = super()._run(params)
+        robot_xy = _robot_xy(self.ctx)
+        described = []
+        for entry in result.data.get("objects") or []:
+            xy = entry["position"][:2]
+            distance = math.hypot(float(xy[0]) - robot_xy[0], float(xy[1]) - robot_xy[1])
+            entry["where"] = where_on_table(xy, robot_xy)
+            entry["distance_m"] = round(distance, 4)
+            described.append(f"{entry['description']} ({entry['where']}, {distance * 100:.0f} cm away)")
+        records = list(getattr(self.ctx.vision, "last_out_of_reach", None) or [])
+        message = f"observed {len(described)} object(s)"
+        if described:
+            message += ": " + ", ".join(described)
+        if records:
+            message += "; out of reach: " + ", ".join(_out_of_reach_phrases(records, robot_xy))
+        result.message = message
+        result.data["out_of_reach"] = records
+        return result
+
+
+class FixedCameraScan(Skill):
+    """"Scan the room" with one fixed overhead camera: look, sweep, report.
+
+    The overhead webcam already sees the whole table, so there is nothing to
+    gain from new viewpoints (that needs a wrist camera; see
+    ``docs/JETSON_MODELS_PLAN.md``). What the operator asked for is a robot
+    that visibly looks around and says what is there:
+
+    1. **Look** -- ``hardware.scan.frames`` detector frames from where the arm
+       is parked, ``frame_gap_s`` apart. An object counts as seen when it is
+       detected in at least ``min_frames`` of them; one seen fewer times is
+       reported as "not sure" rather than dropped or claimed. A frame the
+       detector fails on (timeout, dropped connection) is counted and
+       reported; only when every frame fails does the scan fail.
+    2. **Sweep** -- the base turns slowly (``sweep_speed_rad_s``) toward each
+       object's bearing, right to left, pausing ``dwell_s`` at each, then back
+       home, as ONE trajectory from and to the home posture: only the base
+       joint moves, the arm stays tucked at its home height, and every stop
+       is clamped to ``max_sweep_rad`` and the base joint's limits
+       (:func:`scan_sweep_stops`). If the arm is not at home it first goes
+       home, by the planner, in the same trajectory. Holding something, the
+       sweep is skipped (swinging a held object around is not what "look" means).
+    3. **Report** -- "I can see: a marker front-left (19 cm away) and a bowl
+       front-right (19 cm away)", plus "Not sure about: ..." and "Out of
+       reach: ..." when they apply. One more observe after the sweep refreshes
+       memory from the home pose.
+
+    A sweep that stops part-way (estop, detach, a chunk the Jetson did not
+    finish) is a FAILED result that still says what was seen, so the
+    operator knows the arm may not be home.
+    """
+
+    skill_name = "scan_scene"
+
+    def _settings(self) -> Any:
+        hardware = getattr(self.ctx.config, "hardware", None)
+        scan = getattr(hardware, "scan", None)
+        if scan is None:
+            from mfw.config.schema import HardwareScanConfig
+
+            scan = HardwareScanConfig()
+        return scan
+
+    def _run(self, params: dict[str, Any]) -> SkillResult:
+        scan = self._settings()
+        frames = max(1, int(params.get("frames", scan.frames)))
+        min_frames = min(frames, max(1, int(params.get("min_frames", scan.min_frames))))
+        dt = float(self.ctx.config.simulation.physics_dt)
+        gap_steps = max(1, int(round(float(scan.frame_gap_s) / dt)))
+        robot_xy = _robot_xy(self.ctx)
+
+        # 1. look ---------------------------------------------------------
+        tallies: dict[str, dict[str, Any]] = {}
+        far: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for _ in range(frames):
+            # Before every frame, the first too: each must be a new webcam
+            # frame, and a track last seen by an earlier observe at this same
+            # clock step would otherwise count as seen in this one.
+            self.ctx.sim.step(gap_steps)
+            try:
+                scene = self.ctx.vision.observe()
+            except PerceptionError as exc:
+                failures.append(str(exc).splitlines()[0])
+                continue
+            for obj in scene.objects.values():
+                if getattr(obj, "last_seen_step", scene.step_index) != scene.step_index:
+                    continue  # a remembered track, not a detection in this frame
+                entry = tallies.setdefault(obj.track_id, {"count": 0})
+                entry["count"] += 1
+                entry["obj"] = obj
+            far.extend(getattr(self.ctx.vision, "last_out_of_reach", None) or [])
+        far = _nearest_per_label(far)
+        if len(failures) == frames:
+            return self._fail(
+                f"could not look: the detector failed on all {frames} frame(s) ({failures[-1]})",
+                frames=frames, frame_failures=failures,
+                # The scan already retried `frames` times; the planner's
+                # retry would only repeat it against the same dead service.
+                retryable=False,
+            )
+
+        seen, unsure = [], []
+        for track_id, entry in tallies.items():
+            obj = entry["obj"]
+            xy = np.asarray(obj.pose.position[:2], dtype=np.float64)
+            distance = math.hypot(float(xy[0]) - robot_xy[0], float(xy[1]) - robot_xy[1])
+            record = {
+                "track_id": track_id,
+                "label": obj.label,
+                "description": describe(obj),
+                "position": np.round(obj.pose.position, 4).tolist(),
+                "size": np.round(obj.bbox.extents, 4).tolist(),
+                "confidence": round(float(obj.confidence), 3),
+                "where": where_on_table(xy, robot_xy),
+                "distance_m": round(distance, 4),
+                "bearing_rad": round(math.atan2(float(xy[1]) - robot_xy[1], float(xy[0]) - robot_xy[0]), 4),
+                "frames_seen": int(entry["count"]),
+            }
+            (seen if entry["count"] >= min_frames else unsure).append(record)
+        seen.sort(key=lambda r: -r["bearing_rad"])  # left to right, as read aloud
+        unsure.sort(key=lambda r: -r["bearing_rad"])
+
+        # 2. sweep --------------------------------------------------------
+        held = self.ctx.memory.get_held_object() if self.ctx.memory is not None else None
+        sweep_note, stops, swept_ok, sweep_error = "", [], True, ""
+        if held is not None:
+            sweep_note = "I kept still because I am holding something"
+        else:
+            stops, swept_ok, sweep_error = self._sweep([r["bearing_rad"] for r in seen], scan)
+            if swept_ok:
+                sweep_note = (
+                    f"looked around: turned toward {len(seen)} object(s) and back home"
+                    if seen else "looked around: turned left and right and back home"
+                )
+
+        # 3. report -------------------------------------------------------
+        if swept_ok:
+            try:
+                final = self.ctx.vision.observe()
+                if self.ctx.memory is not None:
+                    self.ctx.memory.update_scene(final)
+            except PerceptionError as exc:
+                failures.append(str(exc).splitlines()[0])
+        elif self.ctx.memory is not None and self.ctx.vision.last_scene_graph() is not None:
+            self.ctx.memory.update_scene(self.ctx.vision.last_scene_graph())
+
+        parts = []
+        if seen:
+            parts.append("I can see: " + _and_list(
+                [f"{_with_article(r['description'])} {r['where']} ({r['distance_m'] * 100:.0f} cm away)"
+                 for r in seen]))
+        else:
+            labels = list(getattr(getattr(self.ctx.config, "hardware", None), "labels", ()) or ())
+            parts.append("I can't see anything I know on the table"
+                         + (f" (I look for: {', '.join(labels)})" if labels else ""))
+        if unsure:
+            parts.append("Not sure about: " + _and_list(
+                [f"{_with_article(r['description'])} {r['where']} (seen in {r['frames_seen']} of {frames} frames)"
+                 for r in unsure]))
+        if far:
+            parts.append("Out of reach: " + _and_list(_out_of_reach_phrases(far, robot_xy)))
+        if failures:
+            parts.append(f"{len(failures)} of {frames} detector frame(s) failed ({failures[0]})")
+        if sweep_note:
+            parts.append(sweep_note[:1].upper() + sweep_note[1:])
+        data = dict(
+            objects=seen, unsure=unsure, out_of_reach=far, frames=frames, min_frames=min_frames,
+            frame_failures=failures, sweep_stops_rad=[round(s, 4) for s in stops],
+            swept=bool(swept_ok and held is None), held=held,
+        )
+        if not swept_ok:
+            parts.append(f"but the sweep stopped part-way ({sweep_error}); the arm may not be "
+                         "at home -- look at it, then say 'go home'")
+            # Never retried: after a detach the retry would re-energise a limp
+            # arm from wherever it fell, at full speed (review HS-3).
+            return self._fail(". ".join(parts), retryable=False, **data)
+        return self._ok(". ".join(parts), **data)
+
+    def _sweep(self, bearings: list[float], scan: Any) -> tuple[list[float], bool, str]:
+        """One slow trajectory home -> stops -> home; ``(stops, ok, why)``."""
+        robot = self.ctx.robot
+        planner = self.ctx.planner
+        home = np.asarray(self.ctx.config.robot.home_joint_positions, dtype=np.float64)
+        lower, upper = self._base_limits(home)
+        stops = scan_sweep_stops(
+            bearings, lower, upper, float(scan.max_sweep_rad), float(scan.min_sweep_rad),
+            int(scan.max_stops),
+        )
+        if not stops:
+            return [], False, "the base joint limits leave no room to turn"
+
+        scene = self.ctx.vision.require_fresh_scene()
+        start = robot.get_state().joint_state
+        legs: list[tuple[Any, bool]] = []  # (trajectory, dwell at its end)
+        current = np.asarray(start.positions, dtype=np.float64)
+        if float(np.max(np.abs(current - home))) > 0.02:
+            to_home = planner.plan_to_joint(start, home, scene)
+            if to_home is None:
+                return stops, False, "no path back to the home posture to start from"
+            legs.append((to_home, False))
+        previous = home
+        for index, yaw in enumerate([*stops, float(home[0])]):
+            goal = home.copy()
+            goal[0] = float(yaw)
+            leg = planner.plan_to_joint(JointState(positions=previous, names=start.names), goal, scene)
+            if leg is None:
+                return stops, False, f"no clear path for the base to turn to {math.degrees(yaw):.0f} deg"
+            legs.append((leg, index < len(stops)))
+            previous = goal
+
+        trajectory = self._slow(legs, float(scan.sweep_speed_rad_s), float(scan.dwell_s))
+        self.ctx.emit("scan.sweep", {"stops_rad": [round(s, 4) for s in stops],
+                                     "duration_s": round(trajectory.duration, 3)})
+        if not self.ctx.controller.follow_trajectory(trajectory):
+            notice = getattr(self.ctx.controller, "last_detach_notice", None)
+            return stops, False, f"the arm went limp: {notice}" if notice else "motion aborted"
+        return stops, True, ""
+
+    #: Radians kept inside the Jetson's enforced base limit, so a stop at the
+    #: edge is not clamped by rounding.
+    _SERVER_LIMIT_MARGIN_RAD = 0.02
+
+    def _base_limits(self, home: NDArray[np.float64]) -> tuple[float, float]:
+        """The base yaw band a sweep may use: ``hardware.arm`` intersected with
+        the Jetson's ENFORCED limits when the arm reported them (review: under
+        ``--allow-placeholder-calibration`` the Jetson allows +-50 deg while
+        the laptop says +-90, so a sweep toward an object past 50 deg ran a
+        clamped chunk, stopped, and failed with the arm off home)."""
+        arm = getattr(getattr(self.ctx.config, "hardware", None), "arm", None)
+        if arm is not None and len(arm.joint_lower) == len(home):
+            lower, upper = float(arm.joint_lower[0]), float(arm.joint_upper[0])
+        else:
+            lower, upper = -math.pi / 2.0, math.pi / 2.0
+        server = getattr(self.ctx.robot, "server_joint_limits", None)
+        if server is not None:
+            try:
+                s_lo, s_hi = float(server[0][0]), float(server[1][0])
+            except (TypeError, IndexError, ValueError):
+                return lower, upper
+            lower = max(lower, s_lo + self._SERVER_LIMIT_MARGIN_RAD)
+            upper = min(upper, s_hi - self._SERVER_LIMIT_MARGIN_RAD)
+        return lower, upper
+
+    def _slow(self, legs: list[tuple[Any, bool]], speed: float, dwell: float) -> Any:
+        """Concatenate planned legs, re-timed so no joint exceeds ``speed``, with dwells."""
+        from mfw.core.types import Trajectory, Waypoint
+        from mfw.motion.trajectory import time_parameterise
+
+        joint_names = tuple(legs[0][0].joint_names)
+        accel = float(getattr(self.ctx.config.motion, "max_joint_acceleration", 2.0))
+        waypoints: list[Any] = []
+        offset = 0.0
+        for leg, pause in legs:
+            path = np.stack([w.positions for w in leg.waypoints])
+            if waypoints:
+                path = path[1:] if len(path) > 1 else path
+                if len(path) == 0:
+                    continue
+                path = np.vstack([waypoints[-1].positions, path])
+            timed = time_parameterise(path, joint_names, max_velocity=speed, max_acceleration=accel,
+                                      planner_name="scan_sweep")
+            points = timed.waypoints if not waypoints else timed.waypoints[1:]
+            for w in points:
+                waypoints.append(Waypoint(w.positions, offset + w.time_from_start))
+            offset = waypoints[-1].time_from_start
+            if pause and dwell > 0.0:
+                offset += dwell
+                waypoints.append(Waypoint(waypoints[-1].positions, offset))
+        return Trajectory(waypoints=tuple(waypoints), joint_names=joint_names,
+                          planner_name="scan_sweep", planning_time_s=0.0)
 
 
 class LookAt(Skill):
@@ -1870,18 +2302,7 @@ class Place(Skill):
             self.ctx.sim.step(self.ctx.config.simulation.settle_steps)
 
             # Retreat straight up so the fingers clear what was just placed.
-            retreat_target = Pose(
-                _clamp_to_workspace(
-                    self.ctx, robot.tcp_pose().position + np.array([0.0, 0.0, 0.12])
-                ),
-                robot.tcp_pose().quat,
-                Frame.WORLD,
-            )
-            retreat = planner.plan_cartesian_line(
-                robot.get_state().joint_state, retreat_target, scene
-            )
-            if retreat is not None:
-                controller.follow_trajectory(retreat)
+            retreat_log = self._retreat_after_release(scene, feedback)
 
             self.ctx.memory.set_held_object(None)
             self.ctx.held_grasp = None
@@ -1908,13 +2329,25 @@ class Place(Skill):
                 "tolerance_m": tolerance,
                 "placement": check.to_log(),
                 "destination_refinement": refinement,
+                "retreat": retreat_log,
             }
             self.ctx.emit("place.verification", {"target": held_id, **check.to_log(),
                                                   "place_target": target.to_log()})
+            retreat_note = self._retreat_note(retreat_log)
+            if check.ok and retreat_log.get("arm_limp"):
+                # Review finding 5: the object is where it was sent, but the arm
+                # went limp during the retreat. Not a success: the next command
+                # (a scripted "go home") would re-attach a fallen arm -- a jump.
+                return self._fail(
+                    f"placed {target.description}, but {retreat_log['reason']}",
+                    released=True,
+                    retryable=False,
+                    **data,
+                )
             if check.ok:
                 return self._ok(
                     f"placed {target.description} (settled {check.offset_m * 1000:.0f} mm "
-                    "from the target, horizontally)",
+                    f"from the target, horizontally){retreat_note}",
                     **data,
                 )
             # Released but not where it was sent: a failure, with the numbers.
@@ -1922,13 +2355,78 @@ class Place(Skill):
             # could only say "not holding anything" and bury this message.
             return self._fail(
                 f"place missed {target.description}: {check.reason}; the gripper is open "
-                "and nothing is held",
+                f"and nothing is held{retreat_note}",
                 released=True,
                 retryable=False,
                 **data,
             )
         finally:
             planner.include_in_collision(held_id)
+
+    #: How far the jaw backs off straight up after the release.
+    _RETREAT_LIFT_M = 0.12
+    #: Shorter lifts tried, hardware lane only, when the full one has no
+    #: straight line: near the top of the placeholder arm's reach a 12 cm lift
+    #: above a bowl has no IK (live fake run, motion.cartesian_failed), while a
+    #: few centimetres still take the open fingers clear of the rim.
+    _RETREAT_FALLBACK_LIFTS_M = (0.08, 0.05, 0.03)
+
+    def _retreat_after_release(self, scene: Any, feedback: bool) -> dict[str, Any]:
+        """Back straight up from the release; say how far, or why not.
+
+        Returns ``{"done", "lift_m", "requested_m", "reason"}`` for the result
+        data and message. The retreat used to be skipped silently when it had
+        no plan (and its motion result ignored), so a place reported plain
+        success with the open jaw still down beside the object (audit, live
+        fake run: motion.cartesian_failed then "placed ...").
+        """
+        robot = self.ctx.robot
+        planner = self.ctx.planner
+        lifts = (self._RETREAT_LIFT_M,) if feedback else (
+            self._RETREAT_LIFT_M, *self._RETREAT_FALLBACK_LIFTS_M
+        )
+        log: dict[str, Any] = {"done": False, "lift_m": 0.0,
+                               "requested_m": self._RETREAT_LIFT_M, "reason": ""}
+        retreat = None
+        for lift in lifts:
+            retreat_target = Pose(
+                _clamp_to_workspace(self.ctx, robot.tcp_pose().position + np.array([0.0, 0.0, lift])),
+                robot.tcp_pose().quat,
+                Frame.WORLD,
+            )
+            retreat = planner.plan_cartesian_line(
+                robot.get_state().joint_state, retreat_target, scene
+            )
+            if retreat is not None:
+                log["lift_m"] = float(retreat_target.position[2] - robot.tcp_pose().position[2])
+                break
+        if retreat is None:
+            log["reason"] = "no straight path up from the release point"
+        elif not self.ctx.controller.follow_trajectory(retreat):
+            log["lift_m"] = 0.0
+            log["reason"] = self._motion_failure("the retreat aborted")
+            # Hardware lane: a detach (watchdog, host timeout, serial loss)
+            # left the arm limp. Place then fails so a script stops here
+            # instead of re-energising a fallen arm with the next command.
+            notice = getattr(self.ctx.controller, "last_detach_notice", None)
+            if notice:
+                log["arm_limp"] = str(notice)
+        else:
+            log["done"] = True
+        self.ctx.emit("place.retreat", log)
+        return log
+
+    @staticmethod
+    def _retreat_note(log: dict[str, Any]) -> str:
+        """The message suffix for a retreat that was skipped or shortened ("" if full)."""
+        if not log.get("done"):
+            return (
+                f"; the retreat up was skipped ({log.get('reason') or 'no plan'}), so the open "
+                "jaw is still down next to it -- say 'go home' before the next command"
+            )
+        if float(log.get("lift_m", 0.0)) < float(log.get("requested_m", 0.0)) - 0.005:
+            return f"; retreated only {float(log['lift_m']) * 100:.0f} cm up (no straight path higher)"
+        return ""
 
     # ------------------------------------------------------------------
     # destination

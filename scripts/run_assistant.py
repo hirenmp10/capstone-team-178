@@ -16,7 +16,9 @@ Modes:
 Hardware lane (no Isaac Sim; run with a plain ``py -3.12``):
 
     py -3.12 scripts/run_assistant.py --fake-hardware -c "pick up the marker"
+    py -3.12 scripts/run_assistant.py --fake-hardware --demo
     py -3.12 scripts/run_assistant.py --hardware --jetson 192.168.1.50 --interactive
+    py -3.12 scripts/run_assistant.py --hardware --jetson 192.168.1.50 --demo
 
   --hardware        drive the real arm through the Jetson robot server
                     (configs/hardware.yaml unless --config is given)
@@ -25,6 +27,13 @@ Hardware lane (no Isaac Sim; run with a plain ``py -3.12``):
                     jetson/detector_service.py --backend scripted
   --jetson HOST[:PORT], --detector-server HOST:PORT, --llm-server HOST:PORT
                     point the three services at another machine
+  --demo            on the hardware lane: scan the room -> what do you see ->
+                    pick up the marker -> put it in the bowl -> go home
+                    (hardware.demo_script in the YAML overrides it)
+
+Exit status: 0 when every -c/--demo command succeeded, 1 when any failed, 130
+on Ctrl-C. On the hardware lane the run stops at the first failure unless
+--keep-going; the sim lane runs every command, as it always has.
 
 ``sys.argv`` is cleared before the simulator starts: ``SimulationApp`` parses argv
 itself and exits on flags it does not recognise, so our own options must not still
@@ -36,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -61,6 +71,49 @@ DEMO_SCRIPT = [
     "place it",
     "go home",
 ]
+
+#: The hardware MVP demo (``--demo`` with ``--hardware``/``--fake-hardware``),
+#: in the words of configs/hardware.yaml's labels: marker (19 mm across the
+#: jaw) into the bowl. "can" is avoided on purpose -- Canary hears "kin".
+#: ``hardware.demo_script`` in the YAML replaces it without a code change.
+HARDWARE_DEMO_SCRIPT = [
+    "scan the room",
+    "what do you see",
+    "pick up the marker",
+    "put it in the bowl",
+    "go home",
+]
+
+#: Whole-clause phrases that mean "scan the room" on the hardware lane but
+#: that the rule parser maps elsewhere ("scan the table" -> observe) or not at
+#: all ("look around"). Rewritten before parsing, only when scan_scene is
+#: registered, so the sim lane's parse of the same words is untouched.
+_SCAN_PHRASE = re.compile(
+    r"(?:please )?(?:(?:can|could|will) you )?"
+    r"(?:(?:have a |take a )?look around(?: the (?:room|table|scene))?"
+    r"|scan (?:the )?(?:room|table|scene|area|workspace)"
+    r"|look at the table)"
+    r"(?: for me)?(?: please)?"
+)
+
+
+def route_hardware_phrase(utterance: str) -> str:
+    """``"look around"`` / ``"scan the table"`` -> ``"scan the room"``; else unchanged."""
+    text = re.sub(r"[^a-z0-9\s]", " ", str(utterance).lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    return "scan the room" if _SCAN_PHRASE.fullmatch(text) else utterance
+
+
+def route_clauses(
+    clauses_of: Callable[[str], list],
+    run_clause: Callable[[str], Any],
+    route: Callable[[str], str] = route_hardware_phrase,
+) -> tuple[Callable[[str], list], Callable[[str], Any]]:
+    """``(clauses_of, run_clause)`` that apply ``route`` to every clause first."""
+    return (
+        lambda utterance: [route(c) for c in clauses_of(utterance)],
+        lambda clause: run_clause(route(clause)),
+    )
 
 
 def format_outcome(utterance: str, outcome, show_remaining: bool = True) -> list[str]:
@@ -198,6 +251,59 @@ def format_report(report: CommandReport) -> str:
 
 def _print_report(report: CommandReport) -> None:
     print("\n" + format_report(report))
+
+
+def run_script(
+    commands: list[str],
+    run_one: Callable[[str], CommandReport],
+    keep_going: bool = False,
+    emit: Callable[[CommandReport], None] = _print_report,
+) -> tuple[list[CommandReport], tuple[str, ...]]:
+    """Run scripted (-c / --demo) commands in order; ``(reports, not_run)``.
+
+    Stops at the first command that is not ok unless ``keep_going``: "put it
+    in the bowl" after a failed pick has nothing to put, and on the real arm
+    every further motion is one more thing to go wrong unobserved.
+    """
+    reports: list[CommandReport] = []
+    for index, utterance in enumerate(commands):
+        report = run_one(utterance)
+        emit(report)
+        reports.append(report)
+        if not report.ok and not keep_going:
+            return reports, tuple(commands[index + 1:])
+    return reports, ()
+
+
+def script_summary(reports: list[CommandReport], not_run: tuple[str, ...]) -> str:
+    """One line for the end of a scripted run; names the first failure."""
+    failed = [r for r in reports if not r.ok]
+    line = (
+        f"commands : {len(reports) + len(not_run)} -> {len(reports) - len(failed)} ok, "
+        f"{len(failed)} failed, {len(not_run)} not run"
+    )
+    if failed:
+        first = failed[0]
+        line += f'\n  first failure: "{first.utterance}" -> {first.final.message or "(no message)"}'
+    if not_run:
+        line += f"\n  not run  : {' / '.join(not_run)}  (pass --keep-going to run them anyway)"
+    return line
+
+
+def script_exit_code(reports: list[CommandReport], not_run: tuple[str, ...]) -> int:
+    """0 only when every scripted command ran and succeeded."""
+    return 0 if not not_run and all(r.ok for r in reports) else 1
+
+
+def lane_exit_code(hardware_mode: bool, reports: list[CommandReport], not_run: tuple[str, ...]) -> int:
+    """The process exit status after a scripted run.
+
+    Hardware lanes (``--hardware``/``--fake-hardware``): :func:`script_exit_code`,
+    so a failed demo step is a non-zero exit. The sim lane keeps HEAD's
+    behaviour -- a scripted run exits 0 whatever its commands did (review:
+    the simulation's behaviour must not change); read its summary instead.
+    """
+    return script_exit_code(reports, not_run) if hardware_mode else 0
 
 
 def _listen_for_reply(recognizer: Any, attempts: int = 3) -> str | None:
@@ -393,7 +499,9 @@ def _is_loopback(host: str) -> bool:
 
 #: The scripted scene both fake services agree on: the robot server owns it
 #: (objects move when the fake jaw closes on them) and the detector reads it.
-FAKE_SCENE = "marker:0.18,0.05 bowl:0.15,-0.12"
+#: The cube sits 37 cm out, beyond the workspace, so the demo also shows the
+#: "out of reach" report (it is never picked or planned around).
+FAKE_SCENE = "marker:0.18,0.05 bowl:0.15,-0.12 cube:0.20,0.31"
 #: The Uno sketch's watchdog (servo_bridge.ino), mirrored by the spawned fake.
 FAKE_WATCHDOG_MS = 500
 
@@ -673,6 +781,22 @@ def _find_llm_python(user_override: str | None = None) -> str:
 
 
 
+def _apply_llm_mode(assistant: Any, mode: str) -> None:
+    """Set the LLM parser's policy (``--llm-mode``) on a built Assistant.
+
+    ``Assistant`` constructs ``LlmIntentParser`` itself; the planner holds the
+    same parser object, so setting ``mode`` here changes what every command
+    uses. Parsing has not started yet (construction only runs ``observe``).
+    """
+    from mfw.language.intent_parser import LlmIntentParser
+
+    parser = getattr(assistant, "parser", None)
+    if isinstance(parser, LlmIntentParser):
+        parser.mode = mode
+        print(f"  LLM parser mode   : {mode}"
+              + (" (rules first; LLM only when the rules refuse)" if mode == "hybrid" else ""))
+
+
 def _autostart_llm_server(
     llm_python: str,
     worker: Path,
@@ -775,7 +899,19 @@ def main() -> int:
         "always GPU. Worth it for scenes with hundreds of bodies; for a handful, "
         "kernel-launch and sync overhead usually makes it SLOWER than CPU.",
     )
-    parser.add_argument("--demo", action="store_true", help="run the scripted demo")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="run the scripted demo (hardware lane: scan the room, what do you see, pick up "
+        "the marker, put it in the bowl, go home)",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="with -c/--demo on the hardware lane: run every command even after one fails "
+        "(the exit status is still 1). Default there: stop at the first failure. The sim "
+        "lane always runs every command",
+    )
     parser.add_argument("--interactive", action="store_true", help="prompt for commands")
     parser.add_argument(
         "-c", "--command", action="append", default=[], help="run a command (repeatable)"
@@ -850,6 +986,14 @@ def main() -> int:
         choices=["cuda", "cpu"],
         help="device for the LLM intent model (default: cuda)",
     )
+    parser.add_argument(
+        "--llm-mode",
+        default="hybrid",
+        choices=["hybrid", "llm-first"],
+        help="with --llm: 'hybrid' (default) runs the rule parser first and asks the LLM "
+        "only when the rule parser refuses; the LLM never overrides a rule parse. "
+        "'llm-first' asks the LLM first and falls back to the rules.",
+    )
     args = parser.parse_args()
 
     hardware_mode = bool(args.hardware or args.fake_hardware)
@@ -885,13 +1029,22 @@ def main() -> int:
     # It also fails for a confusing reason: --asr selects which dependency set is
     # probed, so connecting to a running Canary server without repeating
     # `--asr canary` reports missing *whisper* packages.
+    # A speech server on another machine (the Jetson, :5556) is never started
+    # from here -- launching a local worker bound to the Jetson's address can
+    # only fail, and probing for a local ASR install would demand NeMo on a
+    # laptop that needs none. The voice block below waits for it instead.
+    remote_voice_server = bool(args.voice and args.voice_server and not _is_loopback(_host))
+    if remote_voice_server and not server_already_up:
+        print(f"\n  Speech server {_host}:{_port} is not answering yet (remote: not autostarted;"
+              " start it there, e.g. jetson_mode.sh conversation).")
+
     voice_python = None
-    if args.voice and not server_already_up:
+    if args.voice and not server_already_up and not remote_voice_server:
         # Needed either to spawn a one-shot worker, or to auto-start the resident
         # server when it is not already up.
         voice_python = _find_voice_python(args.voice_python, args.asr)
 
-    if args.voice and args.voice_server and not args.no_autostart:
+    if args.voice and args.voice_server and not args.no_autostart and not remote_voice_server:
         if not server_already_up:
             # Started before Isaac Sim so the ~39 s model load overlaps Isaac's
             # own ~60 s startup instead of running after it.
@@ -1029,7 +1182,14 @@ def main() -> int:
             llm_complete = None
 
     assistant = None
+    exit_code = 0
     stop_guard: HardwareStopGuard | None = None
+
+    def _route_if_hardware(clauses_of: Callable[[str], list], run_clause: Callable[[str], Any]):
+        """The hardware lane's "look around" -> "scan the room" rewrite (see :func:`route_clauses`)."""
+        if hardware_mode and assistant.runtime.skills.has("scan_scene"):
+            return route_clauses(clauses_of, run_clause)
+        return clauses_of, run_clause
     if hardware_mode:
         # Ctrl-C estops first -- during bring-up too (HS-4) -- then exits through
         # the finally below.
@@ -1043,6 +1203,8 @@ def main() -> int:
             assistant = stop_guard.construct(Assistant, config=config, llm_complete=llm_complete)
         else:
             assistant = Assistant(config=config, llm_complete=llm_complete)
+        if llm_complete is not None:
+            _apply_llm_mode(assistant, args.llm_mode)
         state = assistant.describe()
         print("\n" + "-" * 72)
         print("  Robot ready")
@@ -1055,10 +1217,25 @@ def main() -> int:
 
         commands = list(args.command)
         if args.demo or (not commands and not args.interactive and not args.voice):
-            commands = DEMO_SCRIPT
+            if hardware_mode:
+                commands = list(config.hardware.demo_script) or list(HARDWARE_DEMO_SCRIPT)
+                print(f"\n  demo     : {' -> '.join(commands)}")
+            else:
+                commands = DEMO_SCRIPT
 
-        for utterance in commands:
-            _print_report(run_command(utterance, assistant.clauses, assistant.command))
+        if commands:
+            reports, not_run = run_script(
+                commands,
+                lambda utterance: run_command(
+                    utterance, *_route_if_hardware(assistant.clauses, assistant.command)
+                ),
+                # Stop-at-first-failure is a hardware-lane safety rule (every
+                # further motion of a real arm is one more unobserved risk).
+                # The sim lane keeps running every command, as it always did.
+                keep_going=args.keep_going or not hardware_mode,
+            )
+            print("\n" + script_summary(reports, not_run))
+            exit_code = lane_exit_code(hardware_mode, reports, not_run)
 
         if args.voice:
             from mfw.language.speech import (
@@ -1128,7 +1305,9 @@ def main() -> int:
                     print("\n" + "*" * 72)
                     print("  MICROPHONE IS LIVE - SPEAK NOW")
                     print(f"  You have {seconds:.0f} seconds per command. Speak clearly.")
-                    print('  Try: "what do you see"  /  "pick up the can"  /  "place it"')
+                    print('  Try: "scan the room"  /  "pick up the marker"  /  "put it in the bowl"'
+                          if hardware_mode else
+                          '  Try: "what do you see"  /  "pick up the can"  /  "place it"')
                     print("  Say 'quit' to stop.")
                     print("*" * 72, flush=True)
                     speak("Robot ready. Give me your command.", talk)
@@ -1185,9 +1364,11 @@ def main() -> int:
                 print(f'\n  [heard] "{text}"')
                 report = run_command(
                     text,
-                    assistant.clauses,
-                    lambda clause: assistant.command_with_clarification(
-                        clause, ask_by_voice, notify=tell
+                    *_route_if_hardware(
+                        assistant.clauses,
+                        lambda clause: assistant.command_with_clarification(
+                            clause, ask_by_voice, notify=tell
+                        ),
                     ),
                 )
                 _print_report(report)
@@ -1211,6 +1392,9 @@ def main() -> int:
                 "shift/nudge", "turn", "survey", "look at", "return home",
                 "squeeze" and "let go" through unconfirmed.
                 """
+                if hardware_mode:
+                    # "look around" moves the base once routed to scan_scene.
+                    text = route_hardware_phrase(text)
                 if args.no_confirm or not assistant.needs_confirmation(text):
                     return True
 
@@ -1294,8 +1478,12 @@ def main() -> int:
         if args.interactive:
             print("\n" + "=" * 72)
             print("  Interactive mode. Try:")
-            print('    "what do you see"      "pick up the can"     "place it"')
-            print('    "move left 5 cm"       "open the gripper"    "go home"')
+            if hardware_mode:
+                print('    "scan the room"        "what do you see"     "pick up the marker"')
+                print('    "put it in the bowl"   "open the gripper"    "go home"')
+            else:
+                print('    "what do you see"      "pick up the can"     "place it"')
+                print('    "move left 5 cm"       "open the gripper"    "go home"')
             print("  Type 'quit' to exit.")
             print("=" * 72)
             while True:
@@ -1314,9 +1502,11 @@ def main() -> int:
                 _print_report(
                     run_command(
                         utterance,
-                        assistant.clauses,
-                        lambda clause: assistant.command_with_clarification(
-                            clause, _typed_ask, notify=lambda text: print(f"  {text}")
+                        *_route_if_hardware(
+                            assistant.clauses,
+                            lambda clause: assistant.command_with_clarification(
+                                clause, _typed_ask, notify=lambda text: print(f"  {text}")
+                            ),
                         ),
                     )
                 )
@@ -1332,6 +1522,7 @@ def main() -> int:
                   "acknowledged estop keeps the servos detached until clear_estop.")
         else:
             print("\nInterrupted.")
+        exit_code = 130
     finally:
         if assistant is not None:
             assistant.close()
@@ -1344,7 +1535,7 @@ def main() -> int:
         if stop_guard is not None:
             stop_guard.restore()
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

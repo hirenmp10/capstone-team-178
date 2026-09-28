@@ -8,7 +8,7 @@ on Windows and takes the simulator with it, and torch has no business sharing a
 process with the renderer. A crash here costs one transcription instead of the
 session.
 
-Three engines, same output protocol, chosen with ``--asr``:
+Four engines, same output protocol, chosen with ``--asr``:
 
 * ``whisper``  -- faster-whisper. Light, CPU-friendly, returns a per-segment
   confidence that the caller's low-confidence gate can act on.
@@ -17,15 +17,22 @@ Three engines, same output protocol, chosen with ``--asr``:
   It exposes **no per-utterance confidence**, so it reports a fixed 1.0 and the
   caller's confidence gate is effectively inert -- see ``CANARY_CONFIDENCE``.
 * ``parakeet`` -- NVIDIA Parakeet-TDT-0.6B-v2, INT8, through sherpa-onnx on the
-  CPU. This is the engine that runs on the Jetson Orin Nano (1-1.5 GB RSS where
-  Canary needs > 8 GB) at a published +0.09 pp WER cost, and it is the only one
-  of the three that can report a real per-utterance confidence.
+  CPU. The CPU-only fallback for the Jetson Orin Nano (1-1.5 GB RSS where NeMo
+  Canary needs > 8 GB) at a published +0.09 pp WER cost, and the only engine
+  here that can report a real per-utterance confidence.
+* ``canary-gguf`` -- the SAME Canary-Qwen-2.5B, quantised to GGUF Q4_K_M and run
+  by transcribe.cpp (``transcribe_cpp`` Python binding, v0.2.4). No torch, no
+  NeMo; ~3 GB of GPU memory. Measured on the laptop it matched bf16 Canary on
+  30/30 commands, and it is the engine the Jetson Orin Nano runs (CUDA, sm_87).
+  Like Canary it has no per-utterance confidence and reports a fixed 1.0.
 
 Launch with a system Python, not ``python.bat``:
 
     python scripts/speech_worker.py --asr whisper --model base.en
     python scripts/speech_worker.py --asr canary --device cuda
     python scripts/speech_worker.py --asr parakeet --serve --host 0.0.0.0
+    python scripts/speech_worker.py --asr canary-gguf --gguf canary-qwen-2.5b-Q4_K_M.gguf \\
+        --serve --host 0.0.0.0 --port 5556 --mic 0
     python scripts/speech_worker.py --stdin            # typed lines, no audio
     python scripts/speech_worker.py --asr whisper --model small.en --wav cmd.wav
 
@@ -42,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import socket
 import sys
 import tempfile
 import wave
@@ -266,9 +274,11 @@ class CanaryEngine:
 class ParakeetEngine:
     """NVIDIA Parakeet-TDT-0.6B-v2 (INT8) via sherpa-onnx's offline transducer.
 
-    Chosen for the Jetson: Canary cannot be quantised for it and does not fit in
-    8 GB, whereas this model runs on four Cortex-A78 cores at a real-time factor
-    around 0.09 (published for the A76) -- 0.3-1.6 s per spoken command -- inside
+    The CPU fallback for the Jetson. (The earlier claim that Canary cannot be
+    quantised for the Jetson was wrong: see ``canary-gguf``, the same
+    checkpoint at Q4_K_M in ~3 GB, which is the Jetson's primary engine.) This
+    model runs on four Cortex-A78 cores at a real-time factor around 0.09
+    (published for the A76) -- 0.3-1.6 s per spoken command -- inside
     1-1.5 GB. The published accuracy cost against Canary is +0.09 pp WER on
     LibriSpeech, which is far below the noise a cheap USB microphone adds.
 
@@ -373,18 +383,223 @@ class ParakeetEngine:
         return float(min(1.0, max(0.0, math.exp(sum(values) / len(values)))))
 
 
+#: transcribe.cpp's context window for the Canary LLM half. 1024 tokens covers
+#: the audio tokens of a spoken command (the worker caps an utterance at
+#: ``--chunk-seconds``, 4 s by default) plus the transcript, and keeps the KV
+#: cache small on the Jetson's shared 8 GB.
+CANARY_GGUF_N_CTX = 1024
+
+#: Length of the start-up warm-up call. The first run on a fresh process pays
+#: for kernel compilation/loading (measured on the laptop: 55 s for the first
+#: file, ~0.12 s afterwards), and that cost must land before "ready", not on
+#: the operator's first spoken command.
+CANARY_GGUF_WARMUP_SECONDS = 1.0
+
+
+def _transcribe_cpp_hint(exc: BaseException) -> str:
+    return (
+        "transcribe.cpp could not be loaded, so --asr canary-gguf cannot start.\n"
+        f"  {type(exc).__name__}: {exc}\n\n"
+        "Needs BOTH:\n"
+        "  1. the Python binding in THIS interpreter:\n"
+        "       python -m pip install transcribe-cpp==0.2.4\n"
+        "  2. the native library it drives. Point TRANSCRIBE_LIBRARY at the built\n"
+        "     SHARED library (cmake -DTRANSCRIBE_BUILD_SHARED=ON; the ggml backend\n"
+        "     modules must sit next to it):\n"
+        "       Linux/Jetson:  export TRANSCRIBE_LIBRARY=<build>/bin/libtranscribe.so\n"
+        "                      (or <build>/src/libtranscribe.so)\n"
+        "       Windows:       set TRANSCRIBE_LIBRARY=<dir>\\transcribe.dll\n"
+        "     The binding and the library must be the same base version (0.2.4)."
+    )
+
+
+class TranscribeCppEngine:
+    """Canary-Qwen-2.5B as GGUF (Q4_K_M) through transcribe.cpp.
+
+    The Jetson engine. Canary's bf16 NeMo build needs > 8 GB and torch; the
+    GGUF build runs in ~3 GB on ggml's CUDA backend and, measured on 30 spoken
+    commands on the laptop, produced the same normalised transcript as bf16 on
+    all 30 (29/30 exact against the reference, both mishearing "can" as "kin").
+
+    Backend policy -- fail loudly rather than slowly: the CUDA backend is
+    required. A missing/CPU-only native build would still "work", at many
+    seconds per command on the Jetson's A78 cores, and the operator would
+    discover that as a robot that ignores them. ``allow_cpu=True`` is the
+    explicit opt-in for development machines without a GPU.
+
+    The model is loaded once and one session is kept for the life of the
+    process; a warm-up call runs at start-up so the first real command does
+    not pay the first-call compile cost.
+
+    Confidence: like :class:`CanaryEngine`, none is available, so the fixed
+    :data:`CANARY_CONFIDENCE` is reported -- which keeps the caller's
+    confirmation step for voice motion commands in force.
+    """
+
+    name = "canary-gguf"
+
+    def __init__(
+        self,
+        gguf_path: str | Path,
+        n_ctx: int = CANARY_GGUF_N_CTX,
+        allow_cpu: bool = False,
+        n_threads: int = 0,
+        warmup_seconds: float = CANARY_GGUF_WARMUP_SECONDS,
+    ) -> None:
+        import time as _time
+
+        import numpy as np
+
+        self.gguf_path = Path(gguf_path).expanduser()
+        if not self.gguf_path.is_file():
+            raise SystemExit(
+                f"--gguf {self.gguf_path} does not exist.\n"
+                "Expected the Canary-Qwen-2.5B GGUF, e.g. canary-qwen-2.5b-Q4_K_M.gguf."
+            )
+        try:
+            import transcribe_cpp as tc
+        except Exception as exc:  # ImportError, or TranscribeError from the DLL load
+            raise SystemExit(_transcribe_cpp_hint(exc)) from exc
+        self._tc = tc
+
+        if self.cuda_available(tc):
+            backend = "cuda"
+        elif allow_cpu:
+            backend = "cpu"
+            log("WARNING: transcribe.cpp has no CUDA backend here; running Canary GGUF "
+                "on the CPU because --allow-cpu was given (expect seconds per command)")
+        else:
+            raise SystemExit(self.no_cuda_message(tc))
+
+        log(f"loading {self.gguf_path.name} with transcribe.cpp "
+            f"({self._native_version(tc)}, backend={backend}, n_ctx={n_ctx})...")
+        started = _time.perf_counter()
+        self._model = tc.Model(str(self.gguf_path), backend=backend)
+        loaded_backend = str(getattr(self._model, "backend", backend) or backend).lower()
+        if backend == "cuda" and "cuda" not in loaded_backend:
+            # Asked for CUDA, got something else: the same silent slowdown the
+            # check above exists to prevent.
+            self._model.close()
+            raise SystemExit(
+                f"transcribe.cpp loaded the model on {loaded_backend!r}, not CUDA.\n"
+                + self.no_cuda_message(tc)
+            )
+        self.backend = loaded_backend
+        self._session = self._model.session(n_threads=n_threads, n_ctx=n_ctx)
+        self.load_seconds = _time.perf_counter() - started
+        self.max_samples = self._max_samples()
+
+        # One warm-up run: a quiet tone, output discarded.
+        started = _time.perf_counter()
+        count = max(1, int(warmup_seconds * SAMPLE_RATE))
+        t = np.arange(count, dtype=np.float32) / SAMPLE_RATE
+        warm = (0.05 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)
+        self._session.run(warm)
+        self.warmup_seconds = _time.perf_counter() - started
+        log(
+            f"canary-gguf ready (backend={self.backend}, load {self.load_seconds:.1f} s, "
+            f"warm-up {self.warmup_seconds:.1f} s"
+            + (f", max audio {self.max_samples / SAMPLE_RATE:.1f} s" if self.max_samples else "")
+            + ")"
+        )
+
+    @staticmethod
+    def _native_version(tc) -> str:
+        try:
+            return f"native {tc.native_version()}"
+        except Exception:  # noqa: BLE001 - version is cosmetic
+            return "native version unknown"
+
+    @staticmethod
+    def cuda_available(tc) -> bool:
+        """Whether the loaded native library can run on a CUDA device."""
+        try:
+            if tc.backend_available("cuda"):
+                return True
+        except Exception:  # noqa: BLE001, S110 - fall through to the device list
+            pass
+        try:
+            return any(str(dev.kind).lower() == "cuda" for dev in tc.backends())
+        except Exception:  # noqa: BLE001 - no device list means no CUDA
+            return False
+
+    @staticmethod
+    def no_cuda_message(tc) -> str:
+        try:
+            devices = ", ".join(f"{d.name} ({d.kind})" for d in tc.backends()) or "none"
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - defensive
+            devices = f"unknown ({exc})"
+        return (
+            "transcribe.cpp has NO CUDA backend in this process -- refusing to run\n"
+            "Canary GGUF on the CPU (seconds per command; the robot would appear\n"
+            "to ignore speech).\n"
+            f"  devices the native library registered: {devices}\n\n"
+            "Fix: point TRANSCRIBE_LIBRARY at a CUDA build of transcribe.cpp v0.2.4\n"
+            "(Jetson: cmake -DTRANSCRIBE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87\n"
+            "-DTRANSCRIBE_BUILD_SHARED=ON), with ggml-cuda next to the library and the\n"
+            "CUDA runtime on the loader path. Without TRANSCRIBE_LIBRARY the binding\n"
+            "loads a pip-installed native provider, which need not have CUDA (the\n"
+            "v0.2.4 aarch64 release asset is CPU/Vulkan only).\n"
+            "Or pass --allow-cpu to run on the CPU deliberately."
+        )
+
+    def _max_samples(self) -> int | None:
+        # ``Session.limits`` is a property in transcribe_cpp 0.2.4; tolerate a
+        # method form too so a binding bump does not silently drop the guard.
+        try:
+            limits = self._session.limits
+            if callable(limits):
+                limits = limits()
+            limit_ms = int(limits.effective_max_audio_ms)
+        except Exception:  # noqa: BLE001 - no limits means no guard, not no engine
+            return None
+        return limit_ms * SAMPLE_RATE // 1000 if limit_ms > 0 else None
+
+    def transcribe(self, samples) -> list[tuple[str, float]]:
+        """Decode one float32, 16 kHz, mono utterance."""
+        import numpy as np
+
+        pcm = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if pcm.size == 0:
+            return []
+        if self.max_samples is not None and pcm.size > self.max_samples:
+            raise ValueError(
+                f"utterance is {pcm.size / SAMPLE_RATE:.1f} s but this session's n_ctx "
+                f"allows {self.max_samples / SAMPLE_RATE:.1f} s; lower --chunk-seconds "
+                "or raise --n-ctx"
+            )
+        pcm = np.clip(normalise_audio(np, pcm), -1.0, 1.0)
+        pcm = np.ascontiguousarray(pcm, dtype=np.float32)
+        result = self._session.run(pcm)
+        text = (getattr(result, "text", "") or "").strip()
+        return [(text, CANARY_CONFIDENCE)] if text else []
+
+    def close(self) -> None:
+        for handle in (getattr(self, "_session", None), getattr(self, "_model", None)):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:  # noqa: BLE001, S110 - best-effort release
+                    pass
+
+
 def build_engine(
     asr: str,
     model: str = "base.en",
     device: str = "cpu",
     model_dir: str | Path | None = None,
+    gguf: str | Path | None = None,
+    n_ctx: int = CANARY_GGUF_N_CTX,
+    allow_cpu: bool = False,
 ):
     """Construct the engine named by ``--asr``.
 
     ``model`` is whisper's size name; ``model_dir`` is Parakeet's export folder;
     ``device`` is honoured by whisper and Canary and selects Parakeet's
     onnxruntime provider (``cuda`` only if a GPU build of sherpa-onnx is installed
-    -- the CPU build is the one measured for the Jetson budget).
+    -- the CPU build is the one measured for the Jetson budget). ``gguf``,
+    ``n_ctx`` and ``allow_cpu`` belong to ``canary-gguf``, which picks its own
+    backend (CUDA, or CPU only when ``allow_cpu``) and ignores ``device``.
     """
     if asr == "whisper":
         return WhisperEngine(model, device)
@@ -393,6 +608,10 @@ def build_engine(
     if asr == "parakeet":
         provider = "cuda" if device == "cuda" else "cpu"
         return ParakeetEngine(model_dir=model_dir, num_threads=4, provider=provider)
+    if asr == "canary-gguf":
+        if not gguf:
+            raise SystemExit("--asr canary-gguf needs --gguf PATH (canary-qwen-2.5b-Q4_K_M.gguf)")
+        return TranscribeCppEngine(gguf, n_ctx=n_ctx, allow_cpu=allow_cpu)
     raise SystemExit(f"unknown ASR engine {asr!r}")
 
 
@@ -401,16 +620,141 @@ def build_engine(
 # ----------------------------------------------------------------------
 
 
+#: Rates tried, after the device's own default, when a microphone refuses
+#: 16 kHz. All are >= 16 kHz: capturing below the model rate and upsampling
+#: cannot restore the missing band.
+FALLBACK_CAPTURE_RATES = (48000, 44100, 32000, 24000, 22050)
+
+#: Output samples computed per block by the NumPy resampler (bounds memory).
+_RESAMPLE_BLOCK = 8192
+
+
+def _resample_poly_numpy(np, x, up: int, down: int):
+    """Polyphase FIR resampling by ``up/down`` in NumPy -- the same filter and
+    alignment as ``scipy.signal.resample_poly`` (Kaiser beta 5 windowed sinc,
+    ``10 * max(up, down)`` half-length, gain ``up``, output ``ceil(n*up/down)``).
+
+    The fallback for interpreters without SciPy (the Jetson image need not
+    carry it). The anti-alias low-pass is the point: plain decimation or
+    linear interpolation folds 8-24 kHz room noise and fan whine into the
+    speech band, which a speech-LLM hears as words.
+    """
+    n = int(x.shape[0])
+    n_out = -(-n * up // down)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    max_rate = max(up, down)
+    half_len = 10 * max_rate
+    n_taps = 2 * half_len + 1
+    cutoff = 1.0 / max_rate
+    k = np.arange(n_taps) - half_len
+    h = cutoff * np.sinc(cutoff * k) * np.kaiser(n_taps, 5.0)
+    h = h * (up / h.sum())
+
+    taps_per_phase = -(-n_taps // up)
+    tap_offsets = up * np.arange(taps_per_phase)
+    out = np.empty(n_out, dtype=np.float64)
+    xd = np.asarray(x, dtype=np.float64)
+    for start in range(0, n_out, _RESAMPLE_BLOCK):
+        stop = min(n_out, start + _RESAMPLE_BLOCK)
+        j = np.arange(start, stop) * down + half_len  # index in the upsampled, filtered signal
+        kk = (j % up)[:, None] + tap_offsets[None, :]  # filter taps that hit real samples
+        ii = (j[:, None] - kk) // up  # the input samples they hit
+        valid = (kk < n_taps) & (ii >= 0) & (ii < n)
+        taps = np.where(valid, h[np.minimum(kk, n_taps - 1)], 0.0)
+        values = np.where(valid, xd[np.clip(ii, 0, n - 1)], 0.0)
+        out[start:stop] = (taps * values).sum(axis=1)
+    return out
+
+
+def resample_audio(samples, from_rate: int, to_rate: int = SAMPLE_RATE, use_scipy: bool | None = None):
+    """Band-limited resampling of mono audio to ``to_rate`` (float32 out).
+
+    ``scipy.signal.resample_poly`` when SciPy imports (``use_scipy=None``),
+    else the identical NumPy polyphase filter. ``use_scipy`` forces a path
+    (tests use it to exercise both).
+    """
+    import numpy as np
+
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    from_rate, to_rate = int(from_rate), int(to_rate)
+    if from_rate <= 0 or to_rate <= 0:
+        raise ValueError(f"sample rates must be positive (got {from_rate} -> {to_rate})")
+    if from_rate == to_rate or data.size == 0:
+        return np.ascontiguousarray(data, dtype=np.float32)
+    g = math.gcd(from_rate, to_rate)
+    up, down = to_rate // g, from_rate // g
+
+    result = None
+    if use_scipy is not False:
+        try:
+            from scipy.signal import resample_poly
+        except ImportError:
+            if use_scipy:
+                raise
+        else:
+            result = resample_poly(data.astype(np.float64), up, down)
+    if result is None:
+        result = _resample_poly_numpy(np, data, up, down)
+    return np.ascontiguousarray(result, dtype=np.float32)
+
+
+class CaptureRateError(RuntimeError):
+    """No sample rate usable for 16 kHz ASR was accepted by the input device."""
+
+
+def choose_capture_rate(sd, device=None) -> int:
+    """The rate to open ``device`` at: 16 kHz if it accepts it, else its native rate.
+
+    Many microphones refuse 16 kHz outright -- WASAPI entries on Windows, and
+    on the Jetson a USB mic opened as a raw ALSA ``hw:`` device that only
+    clocks 48 or 44.1 kHz. Before, that ended the worker at start-up; now the
+    device is opened at a rate it does accept and each utterance is resampled
+    to 16 kHz (:func:`resample_audio`) before it reaches the model.
+
+    Raises :class:`CaptureRateError` listing every refusal when nothing works.
+    """
+    refusals: list[str] = []
+
+    def accepts(rate: int) -> bool:
+        try:
+            sd.check_input_settings(device=device, channels=1, samplerate=rate, dtype="float32")
+            return True
+        except Exception as exc:  # noqa: BLE001 - PortAudio raises its own types
+            refusals.append(f"{rate} Hz: {exc}")
+            return False
+
+    if accepts(SAMPLE_RATE):
+        return SAMPLE_RATE
+
+    candidates: list[int] = []
+    try:
+        info = sd.query_devices(device, "input") if device is None else sd.query_devices(device)
+        native = round(float(info["default_samplerate"]))
+        candidates.append(native)
+    except Exception:  # noqa: BLE001, S110 - a missing rate falls back to the list
+        pass
+    candidates.extend(FALLBACK_CAPTURE_RATES)
+    seen = {SAMPLE_RATE}
+    for rate in candidates:
+        if rate in seen or rate < SAMPLE_RATE:
+            continue
+        seen.add(rate)
+        if accepts(rate):
+            return rate
+    raise CaptureRateError("; ".join(refusals) or "no rate accepted")
+
+
 def load_wav(path: str | Path):
     """Read a PCM WAV file as float32 mono at :data:`SAMPLE_RATE`.
 
     Every engine here takes 16 kHz mono float32 in [-1, 1]; a SAPI or phone
     recording is typically 22.05/44.1 kHz and may be stereo. Channels are
-    averaged and the signal is resampled by linear interpolation -- adequate for
-    speech (the energy of interest sits well below the 8 kHz Nyquist limit) and
-    free of any dependency beyond NumPy, so the loader is testable without an
-    ASR stack. 8-bit (unsigned), 16-, 24- and 32-bit PCM are accepted;
-    compressed WAV variants (float, ADPCM) are rejected by :mod:`wave` itself.
+    averaged and the signal is resampled with the same band-limited polyphase
+    filter the live microphone path uses (:func:`resample_audio`), so a
+    ``--wav`` run at 44.1 kHz exercises exactly what a 44.1 kHz microphone
+    does. 8-bit (unsigned), 16-, 24- and 32-bit PCM are accepted; compressed
+    WAV variants (float, ADPCM) are rejected by :mod:`wave` itself.
     """
     import numpy as np
 
@@ -442,11 +786,7 @@ def load_wav(path: str | Path):
         data = data.reshape(-1, channels).mean(axis=1)
 
     if rate != SAMPLE_RATE and data.size:
-        duration = data.size / rate
-        count = max(1, int(round(duration * SAMPLE_RATE)))
-        source_t = np.arange(data.size) / rate
-        target_t = np.arange(count) / SAMPLE_RATE
-        data = np.interp(target_t, source_t, data)
+        data = resample_audio(data, rate, SAMPLE_RATE)
 
     return np.ascontiguousarray(data, dtype=np.float32)
 
@@ -457,6 +797,7 @@ def run_wav_mode(
     model_name: str,
     device: str,
     model_dir: str | None = None,
+    engine_options: dict | None = None,
 ) -> int:
     """Transcribe WAV files through the real engine and emit protocol lines.
 
@@ -473,7 +814,7 @@ def run_wav_mode(
             log(f"cannot read {name}: {exc}")
             return 2
 
-    engine = build_engine(asr, model_name, device, model_dir)
+    engine = build_engine(asr, model_name, device, model_dir, **(engine_options or {}))
     for name, samples in audio:
         emit_event("file", path=str(name), seconds=round(len(samples) / SAMPLE_RATE, 2))
         results = engine.transcribe(samples)
@@ -544,21 +885,21 @@ def scan_microphones(seconds: float = 1.5) -> int:
     for index, device in devices:
         name = device["name"][:44]
         try:
-            sd.check_input_settings(
-                device=index, channels=1, samplerate=SAMPLE_RATE, dtype="float32"
-            )
+            rate = choose_capture_rate(sd, index)
+            block = int(0.1 * rate)
             with sd.InputStream(
-                device=index, samplerate=SAMPLE_RATE, channels=1,
-                dtype="float32", blocksize=1600
+                device=index, samplerate=rate, channels=1,
+                dtype="float32", blocksize=block
             ) as stream:
                 frames = []
                 for _ in range(int(seconds / 0.1)):
-                    data, _ = stream.read(1600)
+                    data, _ = stream.read(block)
                     frames.append(data.reshape(-1))
             peak = float(np.abs(np.concatenate(frames)).max())
             results.append((peak, index, name))
             verdict = "GOOD" if peak > 0.25 else ("weak" if peak > 0.04 else "silent")
-            print(f"  [{index:>2}] {name:<44} peak={peak:.4f}  {verdict}")
+            rate_note = "" if rate == SAMPLE_RATE else f"  (at {rate} Hz, resampled)"
+            print(f"  [{index:>2}] {name:<44} peak={peak:.4f}  {verdict}{rate_note}")
         except Exception as exc:
             print(f"  [{index:>2}] {name:<44} unusable ({str(exc)[:28]})")
 
@@ -607,7 +948,7 @@ def scan_microphones(seconds: float = 1.5) -> int:
     return 0
 
 
-def check_microphone(seconds: float = 6.0) -> int:
+def check_microphone(seconds: float = 6.0, capture_rate: int | None = None) -> int:
     """Report live input levels so a mic can be positioned before it matters.
 
     Placement and gain dominate ASR accuracy far more than model choice, and both
@@ -621,11 +962,13 @@ def check_microphone(seconds: float = 6.0) -> int:
         print(f"audio dependencies missing: {exc}", file=sys.stderr)
         return 2
 
+    if capture_rate is None:
+        capture_rate = resolve_default_capture_rate(sd)
     print(f"Speak normally for {seconds:.0f} seconds. Watching input level...\n")
-    block = int(0.1 * SAMPLE_RATE)
+    block = int(0.1 * capture_rate)
     peak_overall = 0.0
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+    with sd.InputStream(samplerate=capture_rate, channels=1, dtype="float32",
                         blocksize=block) as stream:
         for _ in range(int(seconds / 0.1)):
             data, _ = stream.read(block)
@@ -647,7 +990,9 @@ def check_microphone(seconds: float = 6.0) -> int:
     return 0
 
 
-def calibrate_noise_floor(sd, np, seconds: float = 2.0, block_seconds: float = 0.05):
+def calibrate_noise_floor(
+    sd, np, seconds: float = 2.0, block_seconds: float = 0.05, capture_rate: int = SAMPLE_RATE
+):
     """Measure the room's noise floor and derive a speech threshold from it.
 
     A fixed threshold cannot work: a quiet desktop mic idles near 0.0005 while a
@@ -660,10 +1005,14 @@ def calibrate_noise_floor(sd, np, seconds: float = 2.0, block_seconds: float = 0
     the robot as a command. Silence that never gets transcribed is the only real
     defence, so the gate is calibrated to the actual room.
 
+    Levels are mean absolute amplitudes per ``block_seconds``, which do not
+    depend on the sample rate, so a threshold measured at a device's native
+    ``capture_rate`` gates that same stream correctly.
+
     Returns ``(threshold, ambient_median, ambient_peak)``.
     """
-    block = max(1, int(block_seconds * SAMPLE_RATE))
-    samples = sd.rec(int(seconds * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1,
+    block = max(1, int(block_seconds * capture_rate))
+    samples = sd.rec(int(seconds * capture_rate), samplerate=capture_rate, channels=1,
                      dtype="float32")
     sd.wait()
     flat = samples.reshape(-1)
@@ -693,6 +1042,7 @@ def record_utterance(
     min_speech_seconds: float = 0.45,
     block_seconds: float = 0.05,
     pre_roll_seconds: float = 0.5,
+    capture_rate: int = SAMPLE_RATE,
 ):
     """Record one utterance, stopping as soon as the speaker stops.
 
@@ -715,11 +1065,16 @@ def record_utterance(
     parse. A rolling buffer of recent audio is kept at all times and prepended the
     moment speech is detected, so the onset is never lost.
 
-    Returns the samples, or ``None`` if nothing was said.
+    ``capture_rate`` is the rate the device was opened at (see
+    :func:`choose_capture_rate`). Gating runs on the raw stream; the finished
+    utterance is resampled to :data:`SAMPLE_RATE` once, as a whole, so there
+    are no filter edges at 50 ms block boundaries.
+
+    Returns 16 kHz float32 samples, or ``None`` if nothing was said.
     """
     from collections import deque
 
-    block = max(1, int(block_seconds * SAMPLE_RATE))
+    block = max(1, int(block_seconds * capture_rate))
     collected = []
     # Always-on lookback so the attack of the first word is available when the
     # threshold finally trips.
@@ -730,7 +1085,7 @@ def record_utterance(
     elapsed = 0.0
 
     with sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=block
+        samplerate=capture_rate, channels=1, dtype="float32", blocksize=block
     ) as stream:
         while elapsed < max_seconds:
             data, _overflowed = stream.read(block)
@@ -763,7 +1118,10 @@ def record_utterance(
 
     if not started or speech_blocks * block_seconds < min_speech_seconds:
         return None
-    return np.concatenate(collected)
+    utterance = np.concatenate(collected)
+    if capture_rate != SAMPLE_RATE:
+        utterance = resample_audio(utterance, capture_rate, SAMPLE_RATE)
+    return utterance
 
 
 def run_microphone_mode(
@@ -773,6 +1131,8 @@ def run_microphone_mode(
     chunk_seconds: float,
     silence_threshold: float,
     model_dir: str | None = None,
+    engine_options: dict | None = None,
+    capture_rate: int | None = None,
 ) -> int:
     try:
         import numpy as np
@@ -787,17 +1147,45 @@ def run_microphone_mode(
         return 2
 
     emit_event("loading", engine=asr)
-    engine = build_engine(asr, model_name, device, model_dir)
+    engine = build_engine(asr, model_name, device, model_dir, **(engine_options or {}))
+    if capture_rate is None:
+        capture_rate = resolve_default_capture_rate(sd)
 
     # The operator's cue that the microphone is genuinely live.
-    emit_event("ready", engine=asr, chunk_seconds=chunk_seconds, warm=False)
+    emit_event("ready", engine=asr, chunk_seconds=chunk_seconds, warm=False,
+               capture_rate=capture_rate)
     log("listening - speak a command")
 
-    _capture_loop(sd, np, engine, chunk_seconds, silence_threshold)
+    _capture_loop(sd, np, engine, chunk_seconds, silence_threshold, capture_rate=capture_rate)
     return 0
 
 
-def _capture_loop(sd, np, engine, chunk_seconds: float, silence_threshold: float) -> None:
+def resolve_default_capture_rate(sd) -> int:
+    """:func:`choose_capture_rate` for the default input device.
+
+    Without ``--mic`` nothing was checked at start-up, so this runs just before
+    capture. If even that probe fails, 16 kHz is kept -- the stream then fails
+    to open inside the capture loop with PortAudio's own error, as before.
+    """
+    try:
+        rate = choose_capture_rate(sd, None)
+    except CaptureRateError as exc:
+        log(f"default input device accepted no usable rate ({exc}); trying {SAMPLE_RATE} Hz")
+        return SAMPLE_RATE
+    if rate != SAMPLE_RATE:
+        log(f"default input device refuses {SAMPLE_RATE} Hz; capturing at {rate} Hz "
+            f"and resampling to {SAMPLE_RATE} Hz")
+    return rate
+
+
+def _capture_loop(
+    sd,
+    np,
+    engine,
+    chunk_seconds: float,
+    silence_threshold: float,
+    capture_rate: int = SAMPLE_RATE,
+) -> None:
     """Record, transcribe, emit -- forever.
 
     Shared verbatim by the one-shot subprocess and the persistent server: they
@@ -811,7 +1199,9 @@ def _capture_loop(sd, np, engine, chunk_seconds: float, silence_threshold: float
     if silence_threshold <= 0:
         emit_event("calibrating")
         log("measuring the noise floor - stay quiet for 2 seconds...")
-        silence_threshold, ambient, peak = calibrate_noise_floor(sd, np)
+        silence_threshold, ambient, peak = calibrate_noise_floor(
+            sd, np, capture_rate=capture_rate
+        )
         emit_event(
             "calibrated",
             threshold=round(silence_threshold, 5),
@@ -827,7 +1217,8 @@ def _capture_loop(sd, np, engine, chunk_seconds: float, silence_threshold: float
         emit_event("listening")
         try:
             samples = record_utterance(
-                sd, np, silence_threshold=silence_threshold, max_seconds=chunk_seconds
+                sd, np, silence_threshold=silence_threshold, max_seconds=chunk_seconds,
+                capture_rate=capture_rate,
             )
         except Exception as exc:  # pragma: no cover - hardware dependent
             log(f"audio capture failed: {exc}")
@@ -938,6 +1329,8 @@ def serve_forever(
     silence_threshold: float,
     model_dir: str | None = None,
     server_socket=None,
+    engine_options: dict | None = None,
+    capture_rate: int | None = None,
 ) -> int:
     """Load the model once and serve transcripts to clients over TCP.
 
@@ -975,7 +1368,9 @@ def serve_forever(
 
     try:
         log(f"port {host}:{port} reserved; loading {asr} model (one time)...")
-        engine = build_engine(asr, model_name, device, model_dir)
+        engine = build_engine(asr, model_name, device, model_dir, **(engine_options or {}))
+        if capture_rate is None:
+            capture_rate = resolve_default_capture_rate(sd)
         log("model resident - clients now attach instantly")
         try:
             server.listen(1)
@@ -1002,8 +1397,10 @@ def serve_forever(
             try:
                 # The model is already loaded, so "ready" is immediate -- which is
                 # the entire point of this mode.
-                emit_event("ready", engine=asr, chunk_seconds=chunk_seconds, warm=True)
-                _capture_loop(sd, np, engine, chunk_seconds, silence_threshold)
+                emit_event("ready", engine=asr, chunk_seconds=chunk_seconds, warm=True,
+                           capture_rate=capture_rate)
+                _capture_loop(sd, np, engine, chunk_seconds, silence_threshold,
+                              capture_rate=capture_rate)
             except (ConnectionError, OSError) as exc:
                 log(f"client disconnected: {exc}")
             finally:
@@ -1023,9 +1420,30 @@ def serve_forever(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Speech recognition worker")
-    parser.add_argument("--asr", default="whisper", choices=["whisper", "canary", "parakeet"])
     parser.add_argument(
-        "--model", default="base.en", help="whisper model (ignored for canary/parakeet)"
+        "--asr", default="whisper", choices=["whisper", "canary", "parakeet", "canary-gguf"]
+    )
+    parser.add_argument(
+        "--model", default="base.en", help="whisper model (ignored for the other engines)"
+    )
+    parser.add_argument(
+        "--gguf",
+        default=None,
+        metavar="PATH",
+        help="canary-gguf only: the Canary-Qwen-2.5B GGUF (e.g. canary-qwen-2.5b-Q4_K_M.gguf). "
+        "transcribe.cpp's native library is found through TRANSCRIBE_LIBRARY",
+    )
+    parser.add_argument(
+        "--n-ctx",
+        type=int,
+        default=CANARY_GGUF_N_CTX,
+        help=f"canary-gguf only: session context in tokens (default {CANARY_GGUF_N_CTX})",
+    )
+    parser.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="canary-gguf only: run on the CPU when transcribe.cpp has no CUDA backend "
+        "(default: refuse and exit, because CPU decoding is seconds per command)",
     )
     parser.add_argument(
         "--model-dir",
@@ -1078,13 +1496,19 @@ def main(argv: list[str] | None = None) -> int:
         help="show a live input-level meter so you can position the mic, then exit",
     )
     args = parser.parse_args(argv)
+    if args.asr == "canary-gguf" and not args.gguf and not (args.stdin or args.list_mics):
+        parser.error("--asr canary-gguf needs --gguf PATH")
+    args.engine_options = engine_options_from_args(args)
 
     if args.list_mics:
         return list_microphones()
 
     # Before any microphone handling: offline files need no audio device.
     if args.wav:
-        return run_wav_mode(args.wav, args.asr, args.model, args.device, args.model_dir)
+        return run_wav_mode(
+            args.wav, args.asr, args.model, args.device, args.model_dir,
+            engine_options=args.engine_options,
+        )
 
     # Before --mic validation: the whole point is to find a working index when
     # the one you picked is silent.
@@ -1116,34 +1540,40 @@ def main(argv: list[str] | None = None) -> int:
                 pass
 
 
+def engine_options_from_args(args) -> dict:
+    """The engine-specific keyword arguments :func:`build_engine` takes."""
+    if getattr(args, "asr", None) != "canary-gguf":
+        return {}
+    return {"gguf": args.gguf, "n_ctx": args.n_ctx, "allow_cpu": args.allow_cpu}
+
+
 def _run_selected_mode(args, server_socket) -> int:
     """Everything after argument parsing and the --serve port claim."""
+    engine_options = getattr(args, "engine_options", None) or engine_options_from_args(args)
+    capture_rate = None
     if args.mic is not None:
         import sounddevice as sd
 
         # Fail here, with an explanation, rather than deep inside the capture
         # loop. The same physical mic is listed once per audio API, and the WASAPI
-        # entry refuses 16 kHz outright -- it will not resample in shared mode --
-        # so the "obvious" highest-numbered choice is often the one that cannot
-        # work. PortAudio reports that as "Invalid sample rate [PaErrorCode -9997]",
-        # which tells the operator nothing actionable.
+        # entry refuses 16 kHz outright -- it will not resample in shared mode.
+        # Such a device is now opened at a rate it accepts (its native rate) and
+        # every utterance is resampled to 16 kHz; only a device that accepts no
+        # usable rate at all stops the worker.
         try:
-            sd.check_input_settings(
-                device=args.mic, channels=1, samplerate=SAMPLE_RATE, dtype="float32"
-            )
-        except Exception as exc:
+            capture_rate = choose_capture_rate(sd, args.mic)
+        except CaptureRateError as exc:
             name = "unknown"
             try:
                 name = sd.query_devices(args.mic)["name"]
             except Exception:
                 pass
             print(
-                f"Input device {args.mic} ({name}) cannot record at "
-                f"{SAMPLE_RATE} Hz mono, which this model requires.\n"
+                f"Input device {args.mic} ({name}) cannot record mono audio at "
+                f"{SAMPLE_RATE} Hz or at any rate that can be resampled to it.\n"
                 f"  {exc}\n\n"
                 "The same microphone is usually listed several times, once per audio\n"
-                "API. WASAPI entries reject non-native rates; the DirectSound or MME\n"
-                "entry for the same device normally works.\n"
+                "API; another entry for the same device normally works.\n"
                 "Run --list-mics and try another index for the same name.",
                 file=sys.stderr,
             )
@@ -1153,9 +1583,12 @@ def _run_selected_mode(args, server_socket) -> int:
         # playback, which is what carries the assistant's spoken replies.
         sd.default.device = (args.mic, sd.default.device[1])
         log(f"using input device {args.mic}: {sd.query_devices(args.mic)['name']}")
+        if capture_rate != SAMPLE_RATE:
+            log(f"input device {args.mic} refuses {SAMPLE_RATE} Hz; capturing at "
+                f"{capture_rate} Hz and resampling each utterance to {SAMPLE_RATE} Hz")
 
     if args.check_mic:
-        return check_microphone()
+        return check_microphone(capture_rate=capture_rate)
 
     if args.stdin:
         return run_stdin_mode()
@@ -1170,6 +1603,8 @@ def _run_selected_mode(args, server_socket) -> int:
             args.silence_threshold,
             args.model_dir,
             server_socket=server_socket,
+            engine_options=engine_options,
+            capture_rate=capture_rate,
         )
     return run_microphone_mode(
         args.asr,
@@ -1178,6 +1613,8 @@ def _run_selected_mode(args, server_socket) -> int:
         args.chunk_seconds,
         args.silence_threshold,
         args.model_dir,
+        engine_options=engine_options,
+        capture_rate=capture_rate,
     )
 
 

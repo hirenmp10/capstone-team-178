@@ -3,7 +3,7 @@
 Practical notes for whoever runs or continues this branch (`capstone-completion`). How to install
 and run everything is in [README.md](README.md); the dated run record is in
 [SYSTEM_VERIFICATION.md](SYSTEM_VERIFICATION.md); design is in [ARCHITECTURE.md](ARCHITECTURE.md).
-The physical-hardware lane is in development and is not part of this branch.
+The hardware MVP lane is on this branch; its operator notes are in [docs/MVP_RUNBOOK.md](docs/MVP_RUNBOOK.md) (start here), [jetson/README.md](jetson/README.md) (Jetson setup), [docs/JETSON_MODELS_PLAN.md](docs/JETSON_MODELS_PLAN.md) (models and memory) and [docs/HARDWARE_BRIEF.md](docs/HARDWARE_BRIEF.md) (contracts, team split).
 
 ## Current state (2026-09-25)
 

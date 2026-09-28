@@ -170,6 +170,15 @@ _CLASS_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"banana"}),
 )
 
+#: Speech-recognition mishearings of a class word, measured on the ASR itself:
+#: Canary-Qwen-2.5B (bf16 and Q4_K_M alike) transcribes "pick up the can" as
+#: "pick up the kin" (2026-09-26, 30-command set). Applied only while no
+#: visible object's label contains the misheard word itself, so a scene that
+#: really has a "kin" keeps it; the rewrite then behaves exactly as if the
+#: operator had said the class word (exact class before synonym: "kin" with a
+#: can and a tin in view is the can, not a question).
+_ASR_ALIASES: dict[str, str] = {"kin": "can", "kins": "cans"}
+
 #: Words that name a container family without naming one class. A box is not
 #: in the family: in these scenes a box is an object to pick (pudding box, the
 #: default scene's green box), and "the container" must not make it ambiguous.
@@ -537,13 +546,19 @@ def _find_class(query: ReferentQuery, scene: SceneGraph) -> _ClassMatch:
     head: str | None = None
     partial: str | None = None
     unknown: list[str] = []
+    nouns = [
+        _ASR_ALIASES[w]
+        if w in _ASR_ALIASES and w not in label_words and _singular(w) not in label_words
+        else w
+        for w in query.nouns
+    ]
     # Multi-word labels ("picture frame") matched as a whole first.
-    joined = " ".join(query.nouns)
+    joined = " ".join(nouns)
     for label in sorted(labels, key=len, reverse=True):
         if " " in label and re.search(rf"\b{re.escape(label)}s?\b", joined):
             head = label
             break
-    for word in query.nouns:
+    for word in nouns:
         singular = _singular(word)
         if head is not None and (word in head.split() or singular in head.split()):
             continue
@@ -987,6 +1002,9 @@ def _canonical_tokens(text: str) -> set[str]:
         if word in _FILLER or word in GENERIC_NOUNS:
             continue
         word = _COLOUR_SYNONYMS.get(word, word)
+        # Symmetric (options and answer both pass through here), so an option
+        # that really is a "kin" still matches an answer that says "kin".
+        word = _ASR_ALIASES.get(word, word)
         singular = _singular(word)
         groups = _groups_for(word) or _groups_for(singular)
         if groups:

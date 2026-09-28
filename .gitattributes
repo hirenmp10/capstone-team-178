@@ -1,0 +1,7 @@
+# Files that run on the Jetson (Linux) must keep LF endings on every checkout,
+# including Windows checkouts with core.autocrlf=true (CRLF breaks bash and systemd).
+*.sh      text eol=lf
+*.service text eol=lf
+*.target  text eol=lf
+*.ino     text eol=lf
+jetson/** text eol=lf

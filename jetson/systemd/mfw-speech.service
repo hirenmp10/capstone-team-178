@@ -1,0 +1,30 @@
+# Speech server: Canary-Qwen-2.5B GGUF Q4_K_M through transcribe.cpp
+# (scripts/speech_worker.py --asr canary-gguf), resident on :5556. Loads
+# SECOND, after llama-server reports its model loaded.
+
+[Unit]
+Description=mfw speech server (Canary-Qwen-2.5B GGUF Q4_K_M, :5556)
+PartOf=mfw-conversation.target
+After=mfw-llama.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=jetson
+# The USB microphone is an ALSA device.
+SupplementaryGroups=audio
+EnvironmentFile=/etc/mfw/mfw.env
+WorkingDirectory=/home/jetson/mfw
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+# TRANSCRIBE_LIBRARY (from mfw.env) is how the transcribe_cpp binding finds
+# the native CUDA build; without CUDA the worker refuses to start (no --allow-cpu).
+ExecStart=/bin/sh -c 'exec "$$MFW_PYTHON" "$$MFW_HOME/scripts/speech_worker.py" --asr canary-gguf --gguf "$$CANARY_GGUF" --serve --host 0.0.0.0 --port 5556 --mic "$$MFW_MIC"'
+ExecStartPost=/bin/sh -c 'exec "$$MFW_HOME/jetson/systemd/wait_ready.sh" tcp 127.0.0.1 5556 240'
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=mfw-conversation.target

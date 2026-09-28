@@ -14,9 +14,12 @@ is ambiguous, and refuses honestly when an object is absent or too wide to grasp
 vision-language-action policy can be swapped in for the pick skill as an optional, out-of-process
 backend; it runs but does not yet complete tasks (see [GR00T / VLA status](#gr00t--vla-status)).
 
-This branch (`capstone-completion`) contains the **simulation lane only**. A physical-hardware lane
-is in development and is not part of this branch; the `--hardware`, `--fake-hardware`, `--jetson`
-and `--detector-server` flags that `run_assistant.py --help` shows belong to it and do not work here.
+This branch (`Adyanth`) adds the **hardware MVP lane** to the simulation: the team's hobby arm
+(PWM servos through an Arduino Uno bridge), one fixed overhead camera, and a Jetson Orin Nano 8 GB
+running the simulation's own models in quantized form (Canary-Qwen-2.5B GGUF Q4_K_M, Qwen2.5-3B-Instruct
+GGUF Q4_K_M, Florence-2-base FP16 ONNX). It is verified on the laptop against fakes that model the
+physical failures, and the quantized models were checked on the laptop GPU, but it has **not yet run on
+real hardware**. See [docs/MVP_RUNBOOK.md](docs/MVP_RUNBOOK.md) (start here), [jetson/README.md](jetson/README.md) (Jetson setup), [docs/JETSON_MODELS_PLAN.md](docs/JETSON_MODELS_PLAN.md) (models and memory) and [docs/HARDWARE_BRIEF.md](docs/HARDWARE_BRIEF.md) (contracts, team split).
 
 ## Status at a glance
 
@@ -100,9 +103,9 @@ Design details, the state machine and the recovery policy are in [ARCHITECTURE.m
 - Optional: a separate Python 3.12 GR00T environment (`groot_env`) with the Isaac-GR00T package
   and the `nvidia/GR00T-N1.7-3B` checkpoint in the HuggingFace cache.
 
-`requirements.txt` lists what each interpreter needs; only block A installs with `pip`. Blocks C
-and G refer to files that are not on this branch, and for Canary follow [Voice mode](#running) below
-(the canary venv's own python), not block E.
+`requirements.txt` lists what each interpreter needs; only block A installs with `pip`. Block G is
+the Jetson stack (see [jetson/README.md](jetson/README.md)), and for Canary on the laptop follow
+[Voice mode](#running) below (the canary venv's own python), not block E.
 
 ## Installation & setup
 
@@ -256,7 +259,12 @@ If the server is unreachable the assistant logs a warning and continues with the
 py -3.12 -m pytest tests -q -m "not isaac" -p no:cacheprovider
 ```
 
-Recorded result: **1069 passed, 3 skipped** (the 3 skips need files that are not on this branch).
+Recorded result: **3252 passed** on this branch (the simulation-only branch recorded 1069 passed,
+3 skipped; the hardware lane adds its tests and un-skips those 3).
+
+**Hardware lane without hardware**: `py -3.12 scripts/run_assistant.py --fake-hardware --demo` runs
+scan the room -> what do you see -> pick up the marker -> put it in the bowl -> go home against a fake
+Jetson robot server and a scripted detector (recorded 5/5 ok).
 
 **Isaac integration suite** (99 tests, about 6 minutes):
 
@@ -344,6 +352,12 @@ scripts/
   llm_worker.py               resident LLM worker for --llm
   groot_server.py, start_groot_server.ps1, start_groot_server.bat   GR00T policy server
   validate_scene.py, render_cameras.py, measure_assets.py, capture_grasp.py, probe_contact_gap.py
+  hardware/                   hardware lane: Jetson client, planar kinematics, perception, planner, runtime
+jetson/                       runs on the Jetson: robot_server.py, detector_service.py, florence_onnx.py,
+                              llm_worker_llamacpp.py, serial_smoke.py, arduino/servo_bridge/, systemd/
+scripts/ (hardware)           calibrate_servos.py, calibrate_table.py, calibrate_camera.py, serve_detector.py,
+                              jetson_mode.sh, tegrastats_log.sh
+docs/                         MVP_RUNBOOK.md, JETSON_MODELS_PLAN.md, HARDWARE_BRIEF.md, HARDWARE_REVIEW.md
 tests/                        pure-logic tests + test_phase*_isaac.py integration tests
 renders/                      camera captures from earlier development (not part of the dated record)
 requirements.txt              per-interpreter dependency recipes

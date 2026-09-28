@@ -510,4 +510,4 @@ Kept because most were silent: the API returned plausible values while the robot
   generation to fine-tune GR00T on this embodiment.
 - **ROS 2**: no ROS 2 code exists. The layer boundaries are ABCs (`ICamera`, `IController`,
   `IPerception`, ...), which is where a ROS 2 adapter would plug in. PLANNED.
-- **Physical hardware**: a hardware lane is in development and is not part of this branch.
+- **Physical hardware**: the hardware MVP lane (`mfw/hardware/`, `jetson/`) is on this branch; see [docs/MVP_RUNBOOK.md](docs/MVP_RUNBOOK.md) (start here), [jetson/README.md](jetson/README.md) (Jetson setup), [docs/JETSON_MODELS_PLAN.md](docs/JETSON_MODELS_PLAN.md) (models and memory) and [docs/HARDWARE_BRIEF.md](docs/HARDWARE_BRIEF.md) (contracts, team split). Not yet run on real hardware.

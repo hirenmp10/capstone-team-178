@@ -37,6 +37,7 @@ __all__ = [
     "RandomizationConfig",
     "SceneConfig",
     "HardwareArmConfig",
+    "HardwareScanConfig",
     "HardwareConfig",
     "FrameworkConfig",
     "load_config",
@@ -266,6 +267,13 @@ class CameraConfig:
     distortion: tuple[float, ...] = ()
     """OpenCV distortion coefficients ``(k1, k2, p1, p2[, k3[, k4, k5, k6]])``.
     Empty means an ideal pinhole, which is what every sim camera is."""
+    intrinsics_rms_px: float = 0.0
+    """RMS reprojection error, pixels, of the checkerboard calibration that
+    produced ``fx``/``fy``/``cx``/``cy``/``distortion``
+    (``scripts/calibrate_camera.py intrinsics`` writes it; it refuses to save
+    above 1.0 px). 0 = the intrinsics were not measured by that tool; its
+    ``pose`` step then refuses to set ``pose_measured`` on placeholder
+    intrinsics. Provenance only: nothing at runtime reads it."""
     homography: tuple[float, ...] = ()
     """Row-major 3x3 pixel -> table-plane (x, y) map for an overhead camera
     with no depth. Empty means "not calibrated"; the hardware runtime refuses
@@ -328,6 +336,11 @@ class CameraConfig:
         for name in ("fx", "fy", "cx", "cy"):
             if getattr(self, name) < 0.0:
                 raise ConfigError(f"camera[{self.name}].{name} must be >= 0 (0 = derive)")
+        if not self.intrinsics_rms_px >= 0.0:
+            raise ConfigError(
+                f"camera[{self.name}].intrinsics_rms_px must be >= 0 (0 = not measured), "
+                f"got {self.intrinsics_rms_px}"
+            )
         if len(self.distortion) not in self.DISTORTION_LENGTHS:
             raise ConfigError(
                 f"camera[{self.name}].distortion must have {list(self.DISTORTION_LENGTHS)} "
@@ -1029,6 +1042,50 @@ class HardwareArmConfig:
 
 
 @dataclass(frozen=True)
+class HardwareScanConfig:
+    """"Scan the room" on the fixed-camera arm (``mfw.skills.primitives.FixedCameraScan``).
+
+    The overhead camera already sees the whole table, so the scan is: look
+    ``frames`` times from the parked pose (an object counts when seen in at
+    least ``min_frames`` of them), then turn the base slowly toward what was
+    found and back home -- a visible sweep, not extra views.
+    """
+
+    frames: int = 3
+    """Detector frames taken from the parked pose before the sweep."""
+    min_frames: int = 2
+    """Frames an object must be seen in to be reported as seen (else "not sure")."""
+    frame_gap_s: float = 0.15
+    """Clock time between those frames, so each is a new webcam frame."""
+    sweep_speed_rad_s: float = 0.35
+    """Base-yaw speed of the sweep (about 20 deg/s): slow enough to watch."""
+    max_sweep_rad: float = 1.0
+    """Largest base turn from straight ahead the sweep may make, either side."""
+    min_sweep_rad: float = 0.35
+    """Turn either side when nothing was found, so the sweep is still visible."""
+    dwell_s: float = 0.6
+    """Pause at each object's bearing."""
+    max_stops: int = 4
+    """Most bearings visited in one sweep (the widest spread is kept)."""
+
+    def validate(self) -> None:
+        if self.frames < 1:
+            raise ConfigError("hardware.scan.frames must be >= 1")
+        if not 1 <= self.min_frames <= self.frames:
+            raise ConfigError("hardware.scan.min_frames must be in [1, frames]")
+        if self.frame_gap_s < 0.0 or self.dwell_s < 0.0:
+            raise ConfigError("hardware.scan.frame_gap_s and dwell_s must be >= 0")
+        if not 0.0 < self.sweep_speed_rad_s <= 1.5:
+            raise ConfigError("hardware.scan.sweep_speed_rad_s must be in (0, 1.5] rad/s")
+        if not 0.0 < self.min_sweep_rad <= self.max_sweep_rad <= 1.5708:
+            raise ConfigError(
+                "hardware.scan needs 0 < min_sweep_rad <= max_sweep_rad <= pi/2"
+            )
+        if self.max_stops < 1:
+            raise ConfigError("hardware.scan.max_stops must be >= 1")
+
+
+@dataclass(frozen=True)
 class HardwareConfig:
     """The hardware lane: a Jetson-hosted arm bridge and detector, driven from mfw.
 
@@ -1097,6 +1154,11 @@ class HardwareConfig:
     request, so a dead laptop cannot leave the servos holding; the heartbeat
     keeps an idle but alive laptop attached. Must stay well under the server's
     bound (validated < 2.5 s, half of the default)."""
+    scan: HardwareScanConfig = field(default_factory=HardwareScanConfig)
+    """"Scan the room" timing and bounds (see :class:`HardwareScanConfig`)."""
+    demo_script: tuple[str, ...] = ()
+    """Commands ``run_assistant.py --hardware --demo`` runs, in order. Empty:
+    the script's built-in hardware demo."""
 
     ARM_BRIDGES = ("uno_serial", "pca9685", "fake")
     PIXEL_ANCHORS = ("bottom_center", "center")
@@ -1123,6 +1185,9 @@ class HardwareConfig:
                 "after host_timeout_s (default 5 s) without a request"
             )
         self.arm.validate()
+        self.scan.validate()
+        if any(not str(command).strip() for command in self.demo_script):
+            raise ConfigError("hardware.demo_script entries must be non-empty commands")
         for label, size in self.object_sizes.items():
             if len(size) != 3 or any(s <= 0.0 for s in size):
                 raise ConfigError(

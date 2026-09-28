@@ -1156,3 +1156,64 @@ class TestNotFoundExplainsTheMismatch:
         message, exc = _not_found("the blue one", default_scene(), allowed_ids=("obj_001", "obj_003"))
         assert message.endswith(self.ALL)
         assert exc.visible == ("red block", "blue can", "green box")
+
+
+# ----------------------------------------------------------------------
+# ASR alias: Canary hears "can" as "kin" (language stream, 2026-09-26)
+# ----------------------------------------------------------------------
+
+
+class TestAsrKinAlias:
+    """Canary-Qwen-2.5B (bf16 and Q4_K_M) transcribed "can" as "kin" on the
+    30-command set; "pick up the kin" must ground exactly as "pick up the can"
+    would, and never where a real "kin" label or a lookalike word exists."""
+
+    def test_kin_grounds_to_the_can(self):
+        assert _ground("kin", default_scene()) == "obj_002"
+        assert _ground("the blue kin", default_scene()) == "obj_002"
+
+    def test_plural_kins(self):
+        assert _ground("kins", default_scene()) == "obj_002"
+
+    def test_kin_prefers_the_exact_can_over_a_tin_like_can_does(self):
+        """A synonym-group alias would make this a question (can AND tin); the
+        rewrite behaves exactly like the word "can"."""
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", "tin", "red", (0.5, -0.2, 0.45)))
+        assert _ground("can", scene) == "obj_001"
+        assert _ground("kin", scene) == "obj_001"
+
+    def test_multi_word_label(self):
+        assert _ground("soup kin", benchmark_scene()) == "obj_001"
+
+    def test_a_real_kin_label_is_never_rewritten(self):
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", "kin", "red", (0.5, -0.2, 0.45)))
+        assert _ground("kin", scene) == "obj_002"
+        assert _ground("can", scene) == "obj_001"
+
+    def test_a_label_containing_kin_as_a_word_is_never_rewritten(self):
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", "kin doll", "red", (0.5, -0.2, 0.45)))
+        assert _ground("kin", scene) == "obj_002"
+
+    @pytest.mark.parametrize("label", ["napkin", "pumpkin", "skin cream"])
+    def test_lookalike_words_do_not_collide(self, label):
+        """Word-level only: "napkin" / "pumpkin" are not the word "kin"."""
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", label, "white", (0.5, -0.2, 0.45)))
+        assert _ground("kin", scene) == "obj_001"
+        assert _ground(label, scene) == "obj_002"
+
+    def test_no_can_in_view_is_still_not_found_and_names_the_can(self):
+        scene = _scene(_obj("obj_001", "block", "red", (0.5, 0.2, 0.45)))
+        with pytest.raises(ObjectNotFound, match="can"):
+            resolve_reference("kin", scene)
+
+    def test_clarification_answer_kin_picks_the_can_option(self):
+        assert interpret_clarification("the kin", OPTIONS).index == 1
+
+    def test_the_grammar_keeps_the_word_for_grounding(self):
+        """The alias lives in grounding only: the parser must pass "kin" through."""
+        intent = RuleBasedIntentParser(SKILLS).parse("pick up the kin")
+        assert intent.skill == "pick" and intent.params == {"target": "kin"}

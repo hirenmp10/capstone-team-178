@@ -33,7 +33,7 @@ development checkout `manipulation_framework/` and are marked as such.
 
 | Suite | Command | Result | Evidence |
 |---|---|---|---|
-| Pure logic (no GPU, no Isaac) | `py -3.12 -m pytest tests -q -m "not isaac" -p no:cacheprovider` (from the repo root) | **1069 passed, 3 skipped** (the skips need hardware-lane files that are not on this branch) | Console output; also stated in the `8c397b3` and `38cfee9` commit messages |
+| Pure logic (no GPU, no Isaac) | `py -3.12 -m pytest tests -q -m "not isaac" -p no:cacheprovider` (from the repo root) | **1069 passed, 3 skipped** on the simulation-only branch; **3252 passed** on the `Adyanth` branch with the hardware lane (2026-09-28) | Console output; also stated in the `8c397b3` and `38cfee9` commit messages |
 | Isaac integration | `..\python.bat scripts\run_isaac_tests.py` | **99/99 passed**, about 6 min | `logs/isaac_test_report.txt` (99 of 99 selected tests PASSED, none FAILED; the report has no final pytest summary line because Isaac teardown ends the process); `logs/e2e/isaac_suite.txt` |
 | CI | `.github/workflows/tests.yml`: pure-logic suite on ubuntu-latest and windows-latest, Python 3.12 | `38cfee9` passed: pure-logic (ubuntu-latest, py3.12) and pure-logic (windows-latest, py3.12) both success, on the push run and the PR #1 run (2026-09-25). `8c397b3` had failed on ubuntu only (3 Windows-launcher tests and a Linux port-claim test), fixed in `38cfee9` | GitHub Actions runs 36095172081, 36095172011 |
 

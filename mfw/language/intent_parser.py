@@ -14,10 +14,28 @@ Two implementations behind one interface:
   default. Manipulation commands are a small, closed vocabulary ("pick X",
   "move left", "open gripper"), and for that a grammar is more reliable and far
   faster than a model, with no risk of a language model inventing an extra step.
-* :class:`LlmIntentParser` -- delegates to a language model for open-ended
-  phrasing, constrained to emit one skill from the registry. Falls back to the
-  rule-based parser when the model is unavailable or returns something invalid,
-  so language understanding degrades rather than failing.
+* :class:`LlmIntentParser` -- adds a language model for open-ended phrasing,
+  constrained to emit one skill from the registry. Two policies
+  (:data:`LLM_MODES`):
+
+  - ``"hybrid"`` (:data:`DEFAULT_LLM_MODE`, what ``scripts/run_assistant.py
+    --llm`` uses): the grammar FIRST; the model is asked only when the grammar
+    refuses, and a model failure keeps the grammar's refusal. A successful
+    rule parse is never overridden. Measured 2026-09-26 with Qwen2.5-3B Q4_K_M
+    on the 62-utterance set: the model alone was right 46/62, the grammar
+    48/62, and the model agreed with only 35 of the 48 rule-correct parses --
+    so letting it override the grammar loses more than it gains. After the
+    2026-09-27 prompt, validation and grammar changes (hardware skill enum):
+    hybrid 62/62, 31/31 and 33/34 on three sets; llm-first 60/62 and 31/34.
+    All three sets were seen while tuning, so treat these as optimistic; the
+    one untuned run (fresh set, before the last round) was hybrid 27/34.
+  - ``"llm-first"`` (the class default, kept for existing callers): the model
+    first, the grammar only when the model is unavailable or invalid.
+
+  Either way the model's output is checked before it can move the arm
+  (:meth:`LlmIntentParser._validated`): numbers are re-read from the
+  utterance, a place destination may not be a pronoun, and in hybrid mode a
+  target must be words the operator actually said.
 
 **Moving a named object** ("move the red block to the bowl", "put the can in
 the bowl", "move the red object to the left") is two actions: pick it, then
@@ -46,6 +64,7 @@ grammar's.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -59,6 +78,10 @@ __all__ = [
     "LlmIntentParser",
     "Intent",
     "UnparsedCommand",
+    "UnregisteredSkill",
+    "LLM_MODES",
+    "DEFAULT_LLM_MODE",
+    "REFUSAL_SKILL",
     "TransferSplit",
     "split_transfer",
     "PLACE_RELATIONS",
@@ -71,6 +94,54 @@ _log = get_logger("language.intent")
 
 class UnparsedCommand(MfwError):
     """The utterance did not match any known command."""
+
+
+class UnregisteredSkill(UnparsedCommand):
+    """The utterance was understood, but its skill is not on this robot.
+
+    "Rotate the wrist 90 degrees" on the hardware arm (no wrist roll joint) is
+    not a phrasing problem, so the hybrid parser does not ask the language
+    model to find some other skill for it: the refusal stands.
+    """
+
+
+class NegatedCommand(UnparsedCommand):
+    """The utterance negates its action ("don't drop it", "never release it").
+
+    The grammar matches verbs, not sentences: before this refusal "stop, don't
+    drop it" opened the jaw and "don't go home" went home (review finding 4).
+    A negated clause is refused, and the hybrid parser does not hand it to the
+    language model either -- there is no phrasing problem to solve, and the
+    measured model mis-maps exactly these ("drop it"/"let go"/"hold still").
+    The changed phrases are pinned in tests/test_hardware_language.py::HARDWARE_MAPPINGS.
+    """
+
+
+#: A negation anywhere in the clause refuses it (after "normalise", so
+#: "don't" is "don t"). "no"/"not" are included on purpose: "no, put it in the
+#: bowl" and "the marker, not the block" are corrections, and the safe reading
+#: of a correction is to do nothing and let the operator say it again.
+_NEGATION_RE = re.compile(
+    r"\b(?:don t|dont|do not|does not|doesn t|didn t|never|not|no|nope|cannot|can t|mustn t|shouldn t|won t)\b"
+)
+#: A stop word in a clause wins over every other matcher except the emergency
+#: stop: "stop, don't drop it" and "stop moving left" are stops.
+_STOP_WORD_RE = re.compile(r"\b(?:stop|halt|abort)\b")
+
+
+def is_negated(utterance: str) -> bool:
+    """True when the first clause of ``utterance`` carries a negation."""
+    text = RuleBasedIntentParser._first_clause(RuleBasedIntentParser._normalise(utterance or ""))
+    return _NEGATION_RE.search(text) is not None
+
+
+#: Parsing policies of :class:`LlmIntentParser`.
+LLM_MODES: tuple[str, ...] = ("hybrid", "llm-first")
+#: The policy used when an operator configures an LLM (``run_assistant --llm``).
+DEFAULT_LLM_MODE = "hybrid"
+#: The skill name a model uses to decline ("not a robot command", "no object
+#: named"). Never registered; it always means "refuse".
+REFUSAL_SKILL = "unknown"
 
 
 class Intent(dict):
@@ -320,6 +391,10 @@ def split_transfer(utterance: str) -> TransferSplit | None:
         if trailing.group("dir") == "back" and distance is None and verb in ("put", "place", "set"):
             return None
 
+    # "Set it down next to the mug": "down" belongs to the verb, not the object.
+    # It used to leave "it down" as the object -> pick "it" (the held object)
+    # before the place (tests/test_hardware_language.py::HARDWARE_MAPPINGS).
+    obj = re.sub(r"^(it|that|this|them)\s+down$", r"\1", obj)
     if not obj:
         return None
     pronoun = obj in _OBJECT_PRONOUNS
@@ -370,6 +445,20 @@ class RuleBasedIntentParser(IIntentParser):
         # than leaving it to matcher ordering -- which got this backwards, matching
         # the later "put" and silently turning a pick into a place.
         text = self._first_clause(text)
+
+        emergency = self._match_emergency(text)
+        if emergency is not None:
+            self._check_known(emergency)
+            return emergency
+        if _STOP_WORD_RE.search(text):
+            # Review finding 4: a stop word wins ("stop, don't drop it").
+            stop = Intent("stop", {}, 1.0)
+            self._check_known(stop)
+            return stop
+        if _NEGATION_RE.search(text):
+            raise NegatedCommand(
+                f"refusing {utterance!r}: it negates its action (say what to do, not what not to do)"
+            )
 
         for matcher in (
             self._match_emergency,
@@ -424,7 +513,7 @@ class RuleBasedIntentParser(IIntentParser):
 
     def _check_known(self, intent: Intent) -> None:
         if self.known_skills and intent.skill not in self.known_skills:
-            raise UnparsedCommand(
+            raise UnregisteredSkill(
                 f"parsed skill {intent.skill!r} is not registered; "
                 f"available: {sorted(self.known_skills)}"
             )
@@ -497,8 +586,25 @@ class RuleBasedIntentParser(IIntentParser):
             return Intent("close_gripper", {}, 1.0)
         return None
 
+    #: Returning to a named rest pose is going home (language stream, 2026-09-27,
+    #: fresh evaluation set). Pinned in
+    #: tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+    #:
+    #:   phrase                               was        now
+    #:   "return to your resting position"    place {}   go_home
+    #:   "go back to your starting position"  move_relative backward   go_home
+    #:
+    #: "position" is a place verb and "back" a direction word, so these carried
+    #: the held object back to its pick origin or moved the arm 10 cm towards its
+    #: base instead of going home. Only after a travel verb:
+    #: "put it in the starting position" stays a place.
+    _REST_POSE = re.compile(
+        r"\b(?:return|go|head|move|get)(?: back)? to (?:your |the |its |my )?"
+        r"(?:rest|resting|start|starting|initial|neutral|default|home|park|parking) (?:position|pose)\b"
+    )
+
     def _match_home(self, text: str) -> Intent | None:
-        if re.search(r"\b(go home|home position|return home|reset arm)\b", text):
+        if re.search(r"\b(go home|home position|return home|reset arm)\b", text) or self._REST_POSE.search(text):
             return Intent("go_home", {}, 1.0)
         return None
 
@@ -539,6 +645,14 @@ class RuleBasedIntentParser(IIntentParser):
         # "take a look" with no object is the same request; "take a look at X" is
         # left for the look_at matcher.
         r"\btake a look\b(?! at\b)",
+        # Language stream, 2026-09-27 (fresh evaluation set; the 3B model
+        # answered "unknown" to it after the prompt grew). Pinned in
+        # tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+        #
+        #   phrase                           was        now
+        #   "how many objects do you see"    UNPARSED   observe
+        #   "how many things are there"      UNPARSED   observe
+        r"\bhow many (?:objects?|things|items)\b",
     )
 
     def _match_observe(self, text: str) -> Intent | None:
@@ -574,7 +688,22 @@ class RuleBasedIntentParser(IIntentParser):
         #
         # "hold on" and "stay" already mapped to wait before phase 9.
         if re.search(r"\b(wait|hold (?:on|still|there|position)|stand ?by|pause|stay)\b", text):
-            seconds = self._find_number(text)
+            # Spoken number words count when a unit follows (language stream,
+            # 2026-09-26; ASR writes numbers as words about as often as digits).
+            # Same conversion in _match_rotate, _match_relative_move and
+            # _place_direction. Pinned in
+            # tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+            #
+            #   phrase                               was              now
+            #   "pause for five seconds"             wait 1 s         wait 5 s
+            #   "wait for two seconds"               wait 1 s         wait 2 s
+            #   "move left five centimetres"         no distance      0.05 m
+            #   "move up twenty mm"                  no distance      0.02 m
+            #   "rotate the wrist forty five degrees" 90 deg          45 deg
+            #
+            # "that one" / "the one on the left" have no unit after "one" and
+            # are untouched (see _digits_for_number_words).
+            seconds = self._find_number(_digits_for_number_words(text))
             return Intent("wait", {"duration": seconds if seconds is not None else 1.0}, 1.0)
         return None
 
@@ -584,7 +713,7 @@ class RuleBasedIntentParser(IIntentParser):
         if "wrist" not in text and "gripper" not in text and "hand" not in text:
             return None
 
-        degrees = self._find_number(text)
+        degrees = self._find_number(_digits_for_number_words(text))
         angle = (degrees or 90.0) * 3.141592653589793 / 180.0
         if re.search(r"\b(counter ?clockwise|left|anti ?clockwise)\b", text):
             angle = abs(angle)
@@ -608,7 +737,42 @@ class RuleBasedIntentParser(IIntentParser):
             return Intent("place", dict(split.place_params), 0.95)
         return Intent("pick", {"target": split.object_phrase}, 0.9)
 
+    #: "Raise/lift/lower the arm" moves the arm itself (language stream,
+    #: 2026-09-27). Pinned in tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+    #:
+    #:   phrase                        was                          now
+    #:   "lift the arm up by 5 cm"     pick "arm up by 5 cm"        move_relative up 0.05
+    #:   "raise the arm a bit"         UNPARSED                     move_relative up
+    #:   "lower the gripper 3 cm"      UNPARSED                     move_relative down 0.03
+    #:
+    #: Only when the object is the robot's own arm/hand/gripper: "lift the can"
+    #: is still a pick and "lower the can into the bowl" still a place.
+    _VERTICAL_SELF = re.compile(
+        r"^(?:(?:please|now|can you|could you|would you)\s+)*"
+        r"(?P<verb>raise|lift|lower|elevate)\s+(?:(?:the|your|my|robot)\s+)*"
+        r"(?:arm|hand|gripper|claw|wrist|tool|yourself)\b(?P<rest>.*)$"
+    )
+
+    def _match_vertical_self(self, text: str) -> Intent | None:
+        match = self._VERTICAL_SELF.match(text)
+        if match is None:
+            return None
+        rest = match.group("rest")
+        words = set(rest.split())
+        if any(w in words for w in ("left", "right", "forward", "forwards", "back", "backward", "backwards")):
+            return None  # a sideways move is not what these verbs say; let the model or a refusal decide
+        explicit = "up" if "up" in words else "down" if "down" in words else None
+        direction = explicit or ("down" if match.group("verb") == "lower" else "up")
+        params: dict[str, Any] = {"direction": direction}
+        distance = self._find_distance(_digits_for_number_words(rest))
+        if distance is not None:
+            params["distance"] = distance
+        return Intent("move_relative", params, 0.9)
+
     def _match_relative_move(self, text: str) -> Intent | None:
+        vertical = self._match_vertical_self(text)
+        if vertical is not None:
+            return vertical
         verb = re.search(r"\b(move|go|shift|nudge|step)\b", text)
         if not verb:
             return None
@@ -631,7 +795,7 @@ class RuleBasedIntentParser(IIntentParser):
         for word, direction in _DIRECTION_WORDS.items():
             if re.search(rf"\b{word}\b", text):
                 params: dict[str, Any] = {"direction": direction}
-                distance = self._find_distance(text)
+                distance = self._find_distance(_digits_for_number_words(text))
                 if distance is not None:
                     params["distance"] = distance
                 return Intent("move_relative", params, 0.95)
@@ -667,7 +831,7 @@ class RuleBasedIntentParser(IIntentParser):
         return Intent("place", {}, 0.95)
 
     def _place_direction(self, direction: str, text: str) -> Intent:
-        distance = self._find_distance(text)
+        distance = self._find_distance(_digits_for_number_words(text))
         return Intent(
             "place",
             {
@@ -704,10 +868,34 @@ class RuleBasedIntentParser(IIntentParser):
             return Intent("pick", {"target": "it"}, 0.8)
         return Intent("pick", {"target": self._clean_target(remainder)}, 0.95)
 
+    #: Approach phrasings (language stream, 2026-09-27). Pinned in
+    #: tests/test_hardware_language.py::HARDWARE_MAPPINGS:
+    #:
+    #:   phrase                        was        now
+    #:   "hover over the dice"         UNPARSED   move_to "dice"
+    #:   "go over to the mug"          UNPARSED   move_to "mug"
+    #:   "approach the sponge"         UNPARSED   move_to "sponge"
+    #:   "come closer to the sponge"   UNPARSED   move_to "sponge"
+    #:   "go to the bowl"              UNPARSED   move_to "bowl"
+    #:
+    #: This matcher runs last, so a direction ("go to the left") or home ("go
+    #: to the home position") has already been claimed; a target that is only
+    #: the robot itself or a deictic is left unparsed.
+    _MOVE_TO = re.compile(
+        r"\b(?:move (?:to|toward|towards|over)|hover (?:over|above)|go (?:over )?to|approach"
+        r"|come (?:closer )?to)\s+(.+)$"
+    )
+
     def _match_move_to(self, text: str) -> Intent | None:
-        match = re.search(r"\bmove (?:to|toward|towards|over)\s+(.+)$", text)
+        match = self._MOVE_TO.search(text)
         if match:
-            return Intent("move_to", {"target": self._clean_target(match.group(1))}, 0.9)
+            target = self._clean_target(match.group(1))
+            if not match.group(0).startswith("move ") and (
+                not _names_an_object(target) or target in _OBJECT_PRONOUNS
+                or not _names_a_destination(target)
+            ):
+                return None
+            return Intent("move_to", {"target": target}, 0.9)
         return None
 
     # ------------------------------------------------------------------
@@ -722,6 +910,19 @@ class RuleBasedIntentParser(IIntentParser):
         "it" rather than being stripped to nothing.
         """
         cleaned = phrase.strip()
+        # Benefactive "me"/"for me" names who the object is for, never the
+        # object (language stream, 2026-09-26; rows pinned in
+        # tests/test_hardware_language.py::HARDWARE_MAPPINGS):
+        #
+        #   phrase                               was                  now
+        #   "could you grab the banana for me"   "banana for me"      "banana"
+        #   "grab me that banana please"         "me that banana"     "banana"
+        #   "get me the marker"                  "me the marker"      "marker"
+        #
+        # Grounding cannot recover these: "me" and "for" are not modifiers it
+        # knows, so every one of them failed as "nothing in view is a me".
+        cleaned = re.sub(r"^(?:me|us)\s+(?=\S)", "", cleaned)
+        cleaned = re.sub(r"\s+for (?:me|us)(?=(?:\s+(?:please|now))?$)", "", cleaned)
         for article in _ARTICLES:
             if cleaned.startswith(article):
                 cleaned = cleaned[len(article) :]
@@ -755,88 +956,528 @@ class RuleBasedIntentParser(IIntentParser):
         return float(bare.group(1)) / 100.0 if bare else None
 
 
+#: Spoken number words -> digits, so "five centimetres" is re-read exactly like
+#: "5 centimetres" (the model's own number is never trusted, see ``_validated``).
+_UNITS_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19,
+}
+_TENS_WORDS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:(?P<tens>" + "|".join(_TENS_WORDS) + r")(?:[ -](?P<unit>"
+    + "|".join(w for w in _UNITS_WORDS if _UNITS_WORDS[w] < 10 and w != "zero")
+    + r"))?|(?P<single>" + "|".join(_UNITS_WORDS) + r"))\b"
+)
+#: A number word only counts as a quantity when a unit or quantity word follows;
+#: "that one" / "the one on the left" are referents, not numbers.
+_QUANTITY_AFTER = re.compile(
+    r"^\s*(?:mm|millimet(?:er|re)s?|cm|centimet(?:er|re)s?|m|met(?:er|re)s?|"
+    r"seconds?|secs?|s|degrees?|deg|radians?|rad)\b"
+)
+
+#: Words a raised/lowered arm is described with, when no direction word is said.
+_VERTICAL_VERBS = {"raise": "up", "lift": "up", "elevate": "up", "lower": "down", "drop": "down"}
+
+#: A place destination that is not a destination (it names the moved object).
+_NOT_A_DESTINATION = frozenset(_OBJECT_PRONOUNS | {"one", "object", "here", "there", "itself"})
+_TARGET_FILLER = frozenset({"the", "a", "an", "my", "your", "that", "this", "please", "now", "up"})
+
+
+def _digits_for_number_words(text: str) -> str:
+    """"move up five centimetres" -> "move up 5 centimetres" (quantities only)."""
+
+    def repl(match: re.Match[str]) -> str:
+        if not _QUANTITY_AFTER.match(text[match.end():]):
+            return match.group(0)
+        if match.group("single"):
+            return str(_UNITS_WORDS[match.group("single")])
+        return str(_TENS_WORDS[match.group("tens")] + _UNITS_WORDS.get(match.group("unit") or "", 0))
+
+    return _NUMBER_WORD_RE.sub(repl, text)
+
+
+def _evidence(*stems: str, exact: tuple[str, ...] = ()) -> re.Pattern[str]:
+    parts = [re.escape(stem).replace(r"\ ", " ") + r"\w*" for stem in stems]
+    parts += [re.escape(word).replace(r"\ ", " ") for word in exact]
+    return re.compile(r"\b(?:" + "|".join(parts) + r")\b")
+
+
+#: Hybrid mode (review finding 3): the model is asked only about what the
+#: grammar refused -- ASR noise, background talk -- and measured Qwen turns
+#: "hmm okay" into open_gripper and "thanks robot" into go_home. An LLM intent
+#: for a skill in this table is accepted only when the operator's first clause
+#: holds a word that asks for that skill (word stems; "pick" covers "picking").
+#: move_relative additionally needs a spoken direction (checked in
+#: ``_validated``). Skills that do not move the arm (observe, wait, stop,
+#: emergency_stop) need no evidence. The measured LLM successes all pass.
+_SKILL_EVIDENCE: dict[str, re.Pattern[str]] = {
+    "open_gripper": _evidence("open", "releas", "drop", "loos", "ungrip", "unclench",
+                              exact=("let go", "let it go", "let that go", "let them go")),
+    "close_gripper": _evidence("close", "closing", "shut", "grip", "grasp", "clamp", "squeez", "clench",
+                               "pinch", "tighten"),
+    "go_home": _evidence("home", "rest", "park", "start", "initial", "neutral", "default", "reset"),
+    "scan_scene": _evidence("scan", "survey", "search", "sweep", "explor", exact=("around", "room")),
+    "pick": _evidence("pick", "grab", "take", "took", "get", "lift", "fetch", "grasp", "collect", "hold",
+                      "bring", "snatch", "seiz", "carry", "hand", "nab", "retriev", "pluck", "scoop",
+                      "gather"),
+    "place": _evidence("put", "place", "drop", "set", "leave", "toss", "throw", "stick", "lay", "deposit",
+                       "releas", "bring", "carry", "pop", "stash", "move", "dump", "stack", "insert",
+                       "plop", "position", "return"),
+    "move_to": _evidence("move", "go", "reach", "hover", "approach", "point", "head", "come", "travel",
+                         exact=("over", "toward", "towards", "to", "near", "above")),
+    "look_at": _evidence("look", "point", "face", "aim", "turn", "watch", "focus", "see", "check"),
+    "rotate_wrist": _evidence("rotat", "turn", "twist", "spin", "roll", "clockwise", "wrist", "degree",
+                              "flip"),
+    "move_relative": _evidence("move", "go", "nudge", "shift", "slide", "scoot", "back", "raise", "lift",
+                               "lower", "bring", "push", "pull", "step", "inch", "jog",
+                               exact=("left", "right", "forward", "forwards", "ahead", "up", "down")),
+}
+#: Skills a negated utterance may still become (they stop or do nothing).
+_ALWAYS_SAFE_SKILLS = frozenset({"stop", "emergency_stop"})
+
+
+def _word_in(word: str, words: set[str]) -> bool:
+    """``word`` was said, allowing a plural/singular difference."""
+    return (
+        word in words
+        or f"{word}s" in words
+        or f"{word}es" in words
+        or (word.endswith("s") and word[:-1] in words)
+        or (word.endswith("es") and word[:-2] in words)
+    )
+
+
 class LlmIntentParser(IIntentParser):
     """Language-model parser constrained to a single atomic skill.
 
     ``complete`` is any callable taking a prompt and returning text, so this works
     with a local model, a hosted API, or a stub in tests without the framework
     depending on any particular SDK.
+
+    ``mode`` is one of :data:`LLM_MODES`. ``"hybrid"`` never lets the model
+    override a rule parse that succeeded; see the module docstring for the
+    measurement behind it. ``"llm-first"`` stays the class default only because
+    existing callers construct the parser directly and rely on it;
+    ``scripts/run_assistant.py`` selects :data:`DEFAULT_LLM_MODE`.
+
+    Which parser produced each intent is logged (``intent source=...``) and kept
+    on :attr:`last_source` and on the returned intent's ``source`` attribute
+    (an attribute, not a key: the intent dict itself is unchanged).
     """
 
     #: The instruction is explicit that exactly one skill may be emitted. A model
     #: asked to "pick up the can and put it in the box" will otherwise happily
     #: return a two-step plan, which is precisely the behaviour this framework
     #: forbids.
-    PROMPT_TEMPLATE = """You translate a robot operator's command into exactly ONE action.
+    #:
+    #: Everything that does not change per command comes first, so llama-server's
+    #: prompt cache reuses it; only the visible objects, the held object and the
+    #: command are evaluated per call (matters on the Jetson's prompt rate).
+    #: ``{formats}``, ``{rules}`` and ``{examples}`` list only the robot's own
+    #: skills: the hardware arm has no ``rotate_wrist``, so the model is never
+    #: told about it.
+    PROMPT_TEMPLATE = """You translate a robot operator's command into exactly ONE action for a small robot arm.
 
 Available actions: {skills}
 
-Required parameter format for each skill:
-- pick:         {{"skill": "pick",  "params": {{"target": "<object_name>"}}, "confidence": <0-1>}}
-- place:        {{"skill": "place", "params": {{"relation": "in|on|next_to|to|left_of|right_of|in_front_of|behind", "target": "<object_name>"}}, "confidence": <0-1>}}
-                or {{"skill": "place", "params": {{"relation": "direction", "direction": "left|right|forward|back", "distance": <metres>}}, "confidence": <0-1>}}
-                or {{"skill": "place", "params": {{}}, "confidence": <0-1>}} to put it back where it was picked
-- move_to:      {{"skill": "move_to", "params": {{"target": "<object_name>"}}, "confidence": <0-1>}}
-- look_at:      {{"skill": "look_at", "params": {{"target": "<object_name>"}}, "confidence": <0-1>}}
-- move_relative:{{"skill": "move_relative", "params": {{"direction": "left|right|forward|backward|up|down", "distance": <metres>}}, "confidence": <0-1>}}
-- rotate_wrist: {{"skill": "rotate_wrist", "params": {{"angle": <radians>}}, "confidence": <0-1>}}
-- wait:         {{"skill": "wait", "params": {{"duration": <seconds>}}, "confidence": <0-1>}}
-- Others (observe, scan_scene, open_gripper, close_gripper, go_home, stop, emergency_stop): no params needed.
+Parameter format for each action:
+{formats}
 
 Rules:
 - Emit exactly ONE action. Never a sequence, never two actions.
-- If the command implies several steps (e.g. "pick X and put it in Y"), emit only the FIRST action (pick).
-- "put", "place", "drop", "set" map to the "place" action; "pick", "grab", "take", "lift", "get", "fetch" map to "pick".
-- Always include the correct params as shown above — never leave params empty for pick.
-- Keep the whole object description in "target", qualifiers included (e.g. "small red block on the left").
-- Use "it"/"that" as the target when the operator used a pronoun; do not resolve it.
+- If the command implies several steps (e.g. "pick X and put it in Y"), emit only the FIRST action.
+{rules}
 - Reply with JSON only. No explanation, no extra text.
 
-Visible objects: {objects}
+Examples:
+{examples}
+
+Visible objects (for context only; never copy a name from this list into "target"): {objects}
 Currently held: {held}
 
 Command: {utterance}
 JSON:"""
+
+    #: One line per skill; only registered skills are shown.
+    _FORMATS: dict[str, str] = {
+        "pick": '- pick: {"skill": "pick", "params": {"target": "<the object, in the operator\'s own words>"}, "confidence": <0-1>}',
+        "place": (
+            '- place: {"skill": "place", "params": {"relation": "in|on|next_to|to|left_of|right_of|in_front_of|behind", '
+            '"target": "<the destination the operator named>"}, "confidence": <0-1>}\n'
+            '  or {"skill": "place", "params": {"relation": "direction", "direction": "left|right|forward|back", '
+            '"distance": <metres>}, "confidence": <0-1>}\n'
+            '  or {"skill": "place", "params": {}, "confidence": <0-1>} to put it back where it was picked'
+        ),
+        "move_to": '- move_to: {"skill": "move_to", "params": {"target": "<object_name>"}, "confidence": <0-1>}',
+        "look_at": '- look_at: {"skill": "look_at", "params": {"target": "<object_name>"}, "confidence": <0-1>}',
+        "move_relative": (
+            '- move_relative: {"skill": "move_relative", "params": {"direction": "left|right|forward|backward|up|down", '
+            '"distance": <metres, only if spoken>}, "confidence": <0-1>}'
+        ),
+        "rotate_wrist": '- rotate_wrist: {"skill": "rotate_wrist", "params": {"angle": <radians>}, "confidence": <0-1>}',
+        "wait": '- wait: {"skill": "wait", "params": {"duration": <seconds>}, "confidence": <0-1>}',
+    }
+
+    #: (skills the rule needs, rule text). A rule about a missing skill is left out.
+    _RULES: tuple[tuple[frozenset[str], str], ...] = (
+        (frozenset(),
+         '- "target" copies the operator\'s own words for the object, qualifiers included '
+         '(e.g. "small red block on the left"). Never add a colour, size or name the operator did not say.'),
+        (frozenset({"pick"}),
+         '- A pronoun ("it", "that", "this one") means the object being picked or already held: '
+         'use "it" as the target and do not resolve it.'),
+        (frozenset({"place"}),
+         '- When something is already held, "<any verb> it in/into/on/onto <a place>" (put, toss, throw, '
+         'stick, dump, drop...) is place, never pick: the held object cannot be picked again.'),
+        (frozenset({"pick", "place"}),
+         '- "put/move/bring <a named object> in/on/to <a place>" starts with picking that object: '
+         'the FIRST action is pick with the named object as target.'),
+        (frozenset({"place"}),
+         '- For place, "it"/"that" is the object being moved, NEVER the destination. '
+         'The place "target" is the named destination (bowl, box, bin, tray...). '
+         '"put it in the box" -> target "box".'),
+        (frozenset(),
+         f'- If the command names no object where one is needed, or is not a robot command, reply '
+         f'{{"skill": "{REFUSAL_SKILL}", "params": {{}}, "confidence": 0}}. Never guess an object.'),
+        (frozenset({"move_relative"}),
+         '- Distances are in metres: 20 mm = 0.02, 3 cm = 0.03, 0.3 m = 0.3. '
+         'Leave distance out when the operator gives none.'),
+        (frozenset({"rotate_wrist"}),
+         '- Angles are radians. Clockwise is NEGATIVE, counterclockwise/anticlockwise is POSITIVE.'),
+        (frozenset({"open_gripper"}),
+         '- "drop it", "let go", "release it", "open your hand" -> open_gripper. '
+         'Only "drop it in/on <a named place>" is a place.'),
+        (frozenset({"wait"}),
+         '- "hold still", "hold on", "pause", "stay", "stand by" -> wait (never stop).'),
+        (frozenset({"move_relative"}),
+         '- "raise"/"lower" move the whole arm: "raise the arm", "lift your hand", "lower the gripper", '
+         '"go up/down" -> move_relative up/down. They never open or close the gripper and never rotate '
+         'the wrist. Lifting a named object is a pick.'),
+        (frozenset({"move_to"}),
+         '- "go to", "go over to", "hover over", "approach", "come closer to" <an object> -> move_to that '
+         'object (the arm moves above it; nothing is picked).'),
+        (frozenset({"observe"}),
+         '- Questions about what is there ("what do you see", "what is in front of you", '
+         '"what objects are on the table", "take a picture") -> observe.'),
+    )
+
+    #: (skills the example needs, command, visible objects, reply). Written for
+    #: the error classes measured on 2026-09-26, with objects and wordings that
+    #: are NOT in the evaluation set, so they teach a rule rather than an answer.
+    _EXAMPLES: tuple[tuple[frozenset[str], str, str, str], ...] = (
+        (frozenset({"pick"}), "grab the cup", "blue cup, green tray",
+         '{"skill": "pick", "params": {"target": "cup"}, "confidence": 0.9}'),
+        (frozenset({"place"}), "now put it into the tray", "blue cup, green tray",
+         '{"skill": "place", "params": {"relation": "in", "target": "tray"}, "confidence": 0.9}'),
+        (frozenset({"place"}), "set that on the plate", "white plate",
+         '{"skill": "place", "params": {"relation": "on", "target": "plate"}, "confidence": 0.9}'),
+        (frozenset({"place"}), "chuck it onto the tray", "blue cup, green tray; held: blue cup",
+         '{"skill": "place", "params": {"relation": "on", "target": "tray"}, "confidence": 0.9}'),
+        (frozenset({"move_to"}), "hover above the cup", "blue cup, green tray",
+         '{"skill": "move_to", "params": {"target": "cup"}, "confidence": 0.9}'),
+        (frozenset({"open_gripper"}), "let it fall", "green tray",
+         '{"skill": "open_gripper", "params": {}, "confidence": 0.9}'),
+        (frozenset({"wait"}), "stay still for 2 seconds", "green tray",
+         '{"skill": "wait", "params": {"duration": 2}, "confidence": 0.9}'),
+        (frozenset({"move_relative"}), "move down 15 mm", "green tray",
+         '{"skill": "move_relative", "params": {"direction": "down", "distance": 0.015}, "confidence": 0.9}'),
+        (frozenset({"move_relative"}), "lift your hand up a little", "green tray",
+         '{"skill": "move_relative", "params": {"direction": "up"}, "confidence": 0.8}'),
+        (frozenset({"rotate_wrist"}), "twist the wrist 30 degrees clockwise", "green tray",
+         '{"skill": "rotate_wrist", "params": {"angle": -0.5236}, "confidence": 0.9}'),
+        (frozenset(), "sing me a song", "green tray",
+         f'{{"skill": "{REFUSAL_SKILL}", "params": {{}}, "confidence": 0}}'),
+    )
 
     def __init__(
         self,
         complete: Callable[[str], str],
         known_skills: tuple[str, ...],
         fallback: IIntentParser | None = None,
+        mode: str = "llm-first",
     ) -> None:
         self._complete = complete
         self.known_skills = tuple(known_skills)
         self._fallback = fallback or RuleBasedIntentParser(known_skills)
+        self.mode = mode
+        self.last_source: str | None = None
 
-    def parse(self, utterance: str, context: dict[str, Any] | None = None) -> Intent:
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        if value not in LLM_MODES:
+            raise ValueError(f"LLM parser mode must be one of {LLM_MODES}, got {value!r}")
+        self._mode = value
+
+    # ------------------------------------------------------------------
+    # prompt
+    # ------------------------------------------------------------------
+
+    def build_prompt(self, utterance: str, context: dict[str, Any] | None = None) -> str:
+        """The full prompt for one command (public so tests and harnesses can inspect it)."""
         context = context or {}
-        prompt = self.PROMPT_TEMPLATE.format(
-            skills=", ".join(self.known_skills),
+        known = set(self.known_skills)
+        formats = "\n".join(line for skill, line in self._FORMATS.items() if skill in known)
+        no_params = [s for s in self.known_skills if s not in self._FORMATS]
+        if no_params:
+            formats += f"\n- Others ({', '.join(no_params)}): no params needed."
+        rules = "\n".join(text for needs, text in self._RULES if needs <= known)
+        examples = "\n".join(
+            f"Command: {command}  (visible: {visible})\nJSON: {reply}"
+            for needs, command, visible, reply in self._EXAMPLES
+            if needs <= known
+        )
+        return self.PROMPT_TEMPLATE.format(
+            skills=", ".join((*self.known_skills, REFUSAL_SKILL)),
+            formats=formats,
+            rules=rules,
+            examples=examples,
             objects=", ".join(context.get("visible_objects", [])) or "none",
             held=context.get("held_object") or "nothing",
             utterance=utterance,
         )
 
+    # ------------------------------------------------------------------
+    # policies
+    # ------------------------------------------------------------------
+
+    def parse(self, utterance: str, context: dict[str, Any] | None = None) -> Intent:
+        context = context or {}
+        if self._mode == "hybrid":
+            return self._parse_hybrid(utterance, context)
+        return self._parse_llm_first(utterance, context)
+
+    def _parse_hybrid(self, utterance: str, context: dict[str, Any]) -> Intent:
+        """Grammar first; the model only for what the grammar refuses."""
         try:
-            raw = self._complete(prompt)
-            _log.info("LLM intent raw response: %s", raw.strip())
-            intent = self._parse_response(raw)
-            _log.info(
-                "LLM intent parsed: skill=%r params=%r confidence=%.2f",
-                intent.skill, intent.params, intent.confidence,
-            )
-        except Exception as exc:
+            intent = self._fallback.parse(utterance, context)
+        except (UnregisteredSkill, NegatedCommand):
+            # Understood, but this robot lacks the skill -- or the operator
+            # said what NOT to do: no phrasing problem for a model to solve,
+            # and any skill it found would be wrong.
+            self._record(None, "rule-refused")
+            raise
+        except UnparsedCommand as refusal:
+            if not utterance or not utterance.strip():
+                self._record(None, "rule-refused")
+                raise
+            try:
+                intent = self._ask_model(utterance, context, strict=True)
+            except Exception as exc:  # noqa: BLE001 - any model failure keeps the refusal
+                _log.info("LLM could not parse %r either (%s); keeping the rule parser's refusal",
+                          utterance, exc)
+                self._record(None, "rule-refused")
+                raise refusal from None
+            return self._record(intent, "llm")
+        return self._record(intent, "rule")
+
+    def _parse_llm_first(self, utterance: str, context: dict[str, Any]) -> Intent:
+        """Model first; the grammar when the model is unavailable or invalid."""
+        if is_negated(utterance):
+            # The grammar owns negation (a stop word wins, anything else is refused).
+            return self._record(self._fallback.parse(utterance, context), "rule-fallback")
+        try:
+            intent = self._ask_model(utterance, context, strict=False)
+        except _UnknownSkillFromModel as exc:
+            _log.warning("LLM proposed unknown skill %r; using the rule-based parser", exc.skill)
+        except Exception as exc:  # noqa: BLE001
             # Degrade to the grammar rather than refusing: a model outage should
             # not stop the robot understanding "stop".
             _log.warning("LLM intent parsing failed (%s); using the rule-based parser", exc)
-            return self._fallback.parse(utterance, context)
+        else:
+            return self._record(intent, "llm")
+        return self._record(self._fallback.parse(utterance, context), "rule-fallback")
 
-        if intent.skill not in self.known_skills:
-            _log.warning(
-                "LLM proposed unknown skill %r; using the rule-based parser", intent.skill
-            )
-            return self._fallback.parse(utterance, context)
+    def _record(self, intent: Intent | None, source: str) -> Intent:
+        self.last_source = source
+        if intent is None:
+            _log.info("intent source=%s (mode=%s): refused", source, self._mode)
+            return intent  # type: ignore[return-value]
+        try:
+            intent.source = source  # type: ignore[attr-defined]
+        except AttributeError:  # a fallback returning a plain dict
+            pass
+        _log.info("intent source=%s (mode=%s) skill=%r params=%r",
+                  source, self._mode, intent["skill"], intent["params"])
         return intent
+
+    # ------------------------------------------------------------------
+    # the model call and its checks
+    # ------------------------------------------------------------------
+
+    def _ask_model(self, utterance: str, context: dict[str, Any], strict: bool) -> Intent:
+        """One model call -> a validated intent, or an exception (never a guess)."""
+        raw = self._complete(self.build_prompt(utterance, context))
+        _log.info("LLM intent raw response: %s", raw.strip())
+        intent = self._parse_response(raw)
+        if intent.skill == REFUSAL_SKILL:
+            raise UnparsedCommand(f"the LLM declined {utterance!r}")
+        if intent.skill not in self.known_skills:
+            raise _UnknownSkillFromModel(intent.skill)
+        intent = self._validated(intent, utterance, strict, context.get("held_object"))
+        _log.info(
+            "LLM intent parsed: skill=%r params=%r confidence=%.2f",
+            intent.skill, intent.params, intent.confidence,
+        )
+        return intent
+
+    def _validated(
+        self, intent: Intent, utterance: str, strict: bool, held_object: Any = None
+    ) -> Intent:
+        """Check and normalise a model intent before it can move the arm.
+
+        * Numbers (distance, duration, angle) are re-read from the utterance
+          with the grammar's own unit-aware reader; the model only decides the
+          structure. Measured: "move up 20 mm" came back as distance 20, and a
+          bare "move backwards" as 0.5 m. No number spoken -> the skill default.
+        * The rotation sign comes from "clockwise"/"counterclockwise" in the
+          utterance (the model had it backwards).
+        * A move direction must agree with a direction word the operator said.
+        * A place destination may not be a pronoun (measured: "put it in the
+          box" -> target "it", i.e. place the object into itself).
+        * ``strict`` (hybrid): every target word must have been spoken; the
+          model may not invent "red block" from the visible-objects list when
+          the operator said "the block".
+        * A pick of a pronoun while something is held is refused: the pronoun
+          names the held object, which cannot be picked again (measured
+          2026-09-27: "toss it in the bin" while holding the eraser -> pick
+          "it").
+
+        Raises :class:`UnparsedCommand` when the intent cannot be trusted.
+        """
+        skill = intent.skill
+        params = dict(intent.params)
+        text = RuleBasedIntentParser._first_clause(RuleBasedIntentParser._normalise(utterance))
+        if _NEGATION_RE.search(text) and skill not in _ALWAYS_SAFE_SKILLS:
+            raise NegatedCommand(f"LLM {skill} for a negated command {utterance!r}")
+        if strict:
+            evidence = _SKILL_EVIDENCE.get(skill)
+            if evidence is not None and evidence.search(text) is None:
+                raise UnparsedCommand(
+                    f"LLM {skill} but {utterance!r} has no word asking for it; refusing rather than guessing"
+                )
+        numeric = _digits_for_number_words(text)
+        has_number = re.search(r"\d", numeric) is not None
+        out: dict[str, Any]
+
+        if skill in ("pick", "move_to", "look_at"):
+            out = {"target": self._clean_model_target(params.get("target"), skill, utterance, strict)}
+            if skill == "pick" and held_object and out["target"] in _OBJECT_PRONOUNS:
+                raise UnparsedCommand(
+                    f"LLM pick of {out['target']!r} while holding {held_object!r}: "
+                    "the pronoun names the held object"
+                )
+        elif skill == "place":
+            out = self._validated_place(params, numeric, has_number, utterance, strict)
+        elif skill == "move_relative":
+            direction = _DIRECTION_WORDS.get(str(params.get("direction", "")).strip().lower())
+            if direction is None:
+                raise UnparsedCommand(f"LLM move_relative without a valid direction: {params!r}")
+            spoken = {_DIRECTION_WORDS[w] for w in text.split() if w in _DIRECTION_WORDS}
+            spoken |= {_VERTICAL_VERBS[w] for w in text.split() if w in _VERTICAL_VERBS}
+            if strict and not spoken:
+                # Review finding 3: "nudge it a little bit" came back as a move
+                # left -- a direction the operator never said.
+                raise UnparsedCommand(f"LLM move_relative {direction!r} but no direction was spoken")
+            if spoken and direction not in spoken:
+                raise UnparsedCommand(
+                    f"LLM direction {direction!r} contradicts the spoken {sorted(spoken)}"
+                )
+            out = {"direction": direction}
+            if has_number:
+                out["distance"] = RuleBasedIntentParser._find_distance(numeric)
+        elif skill == "rotate_wrist":
+            degrees = RuleBasedIntentParser._find_number(numeric) if has_number else None
+            if degrees is not None and re.search(r"\brad(?:ian)?s?\b", numeric):
+                angle = degrees
+            else:
+                angle = math.radians(degrees if degrees is not None else 90.0)
+            # The grammar's sign convention (_match_rotate): counterclockwise or
+            # left is positive, clockwise or right negative.
+            if re.search(r"\b(?:counter ?clockwise|anti ?clockwise|left)\b", text):
+                angle = abs(angle)
+            elif re.search(r"\b(?:clockwise|right)\b", text):
+                angle = -abs(angle)
+            else:
+                try:
+                    model_angle = float(params.get("angle"))
+                except (TypeError, ValueError):
+                    model_angle = 1.0
+                angle = abs(angle) if model_angle >= 0 else -abs(angle)
+            out = {"angle": angle}
+        elif skill == "wait":
+            seconds = RuleBasedIntentParser._find_number(numeric) if has_number else None
+            out = {"duration": float(seconds) if seconds is not None else 1.0}
+        else:
+            # observe, scan_scene, gripper, go_home, stop, emergency_stop: no
+            # params (measured: "let go of it" -> stop {"target": "it"}).
+            out = {}
+
+        try:
+            confidence = min(1.0, max(0.0, float(intent.confidence)))
+        except (TypeError, ValueError):
+            confidence = 0.7
+        return Intent(skill, out, confidence)
+
+    def _validated_place(
+        self, params: dict[str, Any], numeric: str, has_number: bool, utterance: str, strict: bool
+    ) -> dict[str, Any]:
+        relation_raw = str(params.get("relation", "") or "").strip().lower().replace("_", " ")
+        target = params.get("target")
+        if not relation_raw and not target and "direction" not in params:
+            return {}  # back where it was picked
+        if relation_raw == "direction" or (not target and "direction" in params):
+            direction = _PLACE_DIRECTION_WORDS.get(str(params.get("direction", "")).strip().lower())
+            if direction is None:
+                raise UnparsedCommand(f"LLM directional place without a valid direction: {params!r}")
+            distance = RuleBasedIntentParser._find_distance(numeric) if has_number else None
+            return {
+                "relation": "direction",
+                "direction": direction,
+                "distance": distance if distance is not None else DEFAULT_PLACE_OFFSET_M,
+            }
+        relation: str | None
+        if not relation_raw:
+            relation = "to"  # a destination with no relation: Place decides
+        elif relation_raw.replace(" ", "_") in PLACE_RELATIONS:
+            relation = relation_raw.replace(" ", "_")
+        else:
+            relation = _PLACE_RELATION_WORDS.get(relation_raw)
+        if relation is None:
+            raise UnparsedCommand(f"LLM place with an unknown relation {relation_raw!r}")
+        cleaned = self._clean_model_target(target, "place", utterance, strict)
+        if cleaned in _NOT_A_DESTINATION:
+            raise UnparsedCommand(
+                f"LLM place destination {cleaned!r} is a pronoun: it names the held object, not a place"
+            )
+        return {"relation": relation, "target": cleaned}
+
+    @staticmethod
+    def _clean_model_target(target: Any, skill: str, utterance: str, strict: bool) -> str:
+        if not isinstance(target, str) or not target.strip():
+            raise UnparsedCommand(f"LLM {skill} without a target")
+        cleaned = RuleBasedIntentParser._clean_target(RuleBasedIntentParser._normalise(target))
+        if not strict:
+            return cleaned
+        said = set(RuleBasedIntentParser._normalise(utterance).split())
+        if cleaned in _OBJECT_PRONOUNS:
+            if not said & (_OBJECT_PRONOUNS | {"one"}):
+                raise UnparsedCommand(f"LLM target {cleaned!r} but the operator used no pronoun")
+            return cleaned
+        invented = [w for w in cleaned.split() if w not in _TARGET_FILLER and not _word_in(w, said)]
+        if invented:
+            raise UnparsedCommand(
+                f"LLM target {cleaned!r} has words the operator did not say: {invented}"
+            )
+        return cleaned
 
     def _parse_response(self, raw: str) -> Intent:
         """Extract the JSON object from a model response."""
@@ -851,9 +1492,19 @@ JSON:"""
         # Guard against a model returning a plan despite the instruction.
         if isinstance(data.get("params"), list) or isinstance(data["skill"], list):
             raise UnparsedCommand("model returned a sequence; only one action is permitted")
+        if data.get("params") is not None and not isinstance(data.get("params"), dict):
+            raise UnparsedCommand(f"model params are not an object: {data.get('params')!r}")
 
         return Intent(
             skill=str(data["skill"]),
             params=dict(data.get("params") or {}),
             confidence=float(data.get("confidence", 0.7)),
         )
+
+
+class _UnknownSkillFromModel(UnparsedCommand):
+    """The model named a skill that is not registered (llm-first falls back)."""
+
+    def __init__(self, skill: str) -> None:
+        super().__init__(f"LLM proposed unknown skill {skill!r}")
+        self.skill = skill

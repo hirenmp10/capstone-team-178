@@ -771,3 +771,368 @@ class TestServePortClaimedFirst:
         assert observed == {"second_bind": "refused", "probe": "refused"}
         # Released on the way out: the port can be bound again.
         worker.bind_server_socket("127.0.0.1", port).close()
+
+
+# ---------------------------------------------------------------------------
+# speech_worker.py: band-limited resampling (native-rate mics, --wav files)
+# ---------------------------------------------------------------------------
+
+
+def _dominant_hz(samples, rate: int) -> float:
+    import numpy as np
+
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
+    return float(np.fft.rfftfreq(len(samples), 1.0 / rate)[int(np.argmax(spectrum))])
+
+
+def _tone(hz: float, rate: int, seconds: float, amplitude: float = 0.5):
+    import numpy as np
+
+    t = np.arange(round(rate * seconds)) / rate
+    return (amplitude * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+
+
+class TestResampler:
+    @pytest.mark.parametrize("use_scipy", [False, True], ids=["numpy", "scipy"])
+    @pytest.mark.parametrize("rate", [48000, 44100, 22050, 32000])
+    def test_tone_frequency_and_length_are_kept(self, rate, use_scipy):
+        import numpy as np
+
+        if use_scipy:
+            pytest.importorskip("scipy.signal")
+        worker = _load_worker()
+        x = _tone(440.0, rate, 1.3)
+
+        y = worker.resample_audio(x, rate, 16000, use_scipy=use_scipy)
+
+        assert y.dtype == np.float32 and y.ndim == 1
+        # resample_poly's length contract: ceil(n * up / down).
+        assert len(y) == -(-len(x) * 16000 // rate)
+        assert _dominant_hz(y, 16000) == pytest.approx(440.0, abs=2.0)
+        # Amplitude survives in the steady-state middle (edges ramp by design).
+        middle = y[len(y) // 4 : 3 * len(y) // 4]
+        assert float(np.abs(middle).max()) == pytest.approx(0.5, abs=0.01)
+
+    def test_numpy_fallback_matches_scipy(self):
+        import numpy as np
+
+        pytest.importorskip("scipy.signal")
+        worker = _load_worker()
+        rng = np.random.default_rng(7)
+        x = rng.normal(0, 0.1, 44100).astype(np.float32)
+        a = worker.resample_audio(x, 44100, 16000, use_scipy=False)
+        b = worker.resample_audio(x, 44100, 16000, use_scipy=True)
+        assert a.shape == b.shape
+        assert float(np.abs(a - b).max()) < 1e-5
+
+    @pytest.mark.parametrize("use_scipy", [False, True], ids=["numpy", "scipy"])
+    def test_out_of_band_noise_is_filtered_not_folded_into_speech(self, use_scipy):
+        """A 12 kHz whine at 48 kHz must not come out as a 4 kHz tone.
+
+        That is exactly what decimation or linear interpolation does (12 kHz
+        aliases to 16 - 12 = 4 kHz, inside the speech band), and a speech-LLM
+        reads such tones as phonemes.
+        """
+        import numpy as np
+
+        if use_scipy:
+            pytest.importorskip("scipy.signal")
+        worker = _load_worker()
+        whine = _tone(12000.0, 48000, 1.0)
+
+        y = worker.resample_audio(whine, 48000, 16000, use_scipy=use_scipy)
+        naive = whine[::3]  # plain decimation, for contrast
+
+        middle = slice(len(y) // 4, 3 * len(y) // 4)
+        assert float(np.sqrt(np.mean(y[middle] ** 2))) < 0.01 * 0.354  # > 40 dB down
+        assert float(np.sqrt(np.mean(naive[middle] ** 2))) > 0.3  # the failure mode
+
+    def test_same_rate_and_empty_input_pass_through(self):
+        import numpy as np
+
+        worker = _load_worker()
+        x = _tone(300.0, 16000, 0.1)
+        assert np.array_equal(worker.resample_audio(x, 16000, 16000), x)
+        assert worker.resample_audio(np.zeros(0, np.float32), 48000, 16000).size == 0
+        with pytest.raises(ValueError):
+            worker.resample_audio(x, 0, 16000)
+
+    def test_load_wav_uses_the_band_limited_resampler(self, tmp_path):
+        """A 48 kHz WAV carrying an out-of-band whine loads as clean 16 kHz audio."""
+        import numpy as np
+
+        worker = _load_worker()
+        mix = _tone(300.0, 48000, 1.0, 0.3) + _tone(12000.0, 48000, 1.0, 0.3)
+        _write_wav(tmp_path / "w.wav", mix, 48000)
+        samples = worker.load_wav(tmp_path / "w.wav")
+        spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
+        freqs = np.fft.rfftfreq(len(samples), 1 / 16000)
+        at_300 = spectrum[np.argmin(np.abs(freqs - 300))]
+        at_4k = spectrum[np.argmin(np.abs(freqs - 4000))]  # where 12 kHz would alias
+        assert at_4k < 0.01 * at_300
+
+
+# ---------------------------------------------------------------------------
+# speech_worker.py: a microphone that refuses 16 kHz is captured natively
+# ---------------------------------------------------------------------------
+
+
+class _NativeRateMic:
+    """A stand-in ``sounddevice`` for a mic that only clocks its native rate.
+
+    Models what the hardware does, not what the worker hopes for:
+
+    * 16 kHz is refused both by ``check_input_settings`` and when a stream is
+      actually opened (PortAudio's "Invalid sample rate [PaErrorCode -9997]").
+    * The reported ``default_samplerate`` can be wrong (``reported_rate``).
+    * Each opened stream plays the next entry of ``sessions``: ``"speech"``
+      (room noise, a spoken burst -- a tone -- with one DROPPED block in the
+      middle flagged as an overflow, then silence), ``"unplugged"`` (the open
+      fails like a pulled USB cable) or ``"interrupt"`` (Ctrl+C).
+    * When a speech stream runs out, ``read`` raises like a dead device.
+    """
+
+    def __init__(self, native_rate=48000, accepted=None, reported_rate=None,
+                 tone_hz=300.0, sessions=("speech", "unplugged")):
+        import types
+
+        self.native_rate = native_rate
+        self.accepted = set(accepted) if accepted is not None else {native_rate}
+        self.reported_rate = reported_rate or native_rate
+        self.tone_hz = tone_hz
+        self.sessions = list(sessions)
+        self.opened_rates: list = []
+        self.rec_rates: list = []
+        self.default = types.SimpleNamespace(device=(None, None))
+
+    # -- sounddevice surface -------------------------------------------------
+    def check_input_settings(self, device=None, channels=1, samplerate=None, dtype=None):
+        if int(samplerate) not in self.accepted:
+            raise RuntimeError("Error opening InputStream: Invalid sample rate [PaErrorCode -9997]")
+
+    def query_devices(self, device=None, kind=None):
+        return {"name": "USB PnP Sound Device", "max_input_channels": 1,
+                "default_samplerate": float(self.reported_rate)}
+
+    def _noise(self, count, seed):
+        import numpy as np
+
+        return np.random.default_rng(seed).normal(0.0, 0.002, count).astype(np.float32)
+
+    def rec(self, frames, samplerate=None, channels=1, dtype="float32"):
+        self.check_input_settings(samplerate=samplerate)
+        self.rec_rates.append(samplerate)
+        return self._noise(int(frames), 1).reshape(-1, 1)
+
+    def wait(self):
+        return None
+
+    def InputStream(self, samplerate=None, channels=1, dtype="float32", blocksize=None,
+                    device=None):
+        self.check_input_settings(samplerate=samplerate)
+        kind = self.sessions.pop(0) if self.sessions else "unplugged"
+        if kind == "unplugged":
+            raise RuntimeError("Error opening InputStream: Device unavailable [PaErrorCode -9985]")
+        if kind == "interrupt":
+            raise KeyboardInterrupt
+        self.opened_rates.append(samplerate)
+        return _ScriptedStream(self._speech_signal(int(samplerate)), int(blocksize))
+
+    # -- the recording ----------------------------------------------------------
+    LEAD_S, SPEECH_S, TAIL_S = 0.6, 1.0, 1.0
+
+    def _speech_signal(self, rate):
+        import numpy as np
+
+        lead, speech, tail = (round(s * rate) for s in (self.LEAD_S, self.SPEECH_S, self.TAIL_S))
+        t = np.arange(speech) / rate
+        voiced = 0.3 * np.sin(2 * np.pi * self.tone_hz * t).astype(np.float32)
+        voiced += self._noise(speech, 3)
+        # One lost block mid-word: the driver overran and the samples are gone.
+        block = int(0.05 * rate)
+        drop = lead + speech // 2
+        signal = np.concatenate([self._noise(lead, 2), voiced, self._noise(tail, 4)])
+        signal[drop : drop + block] = 0.0
+        return signal, (drop, drop + block)
+
+
+class _ScriptedStream:
+    def __init__(self, scripted, blocksize):
+        (self.signal, self.dropped) = scripted
+        self.blocksize = blocksize
+        self.pos = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, frames):
+        if self.pos + frames > len(self.signal):
+            raise RuntimeError("Error reading stream: Unanticipated host error [PaErrorCode -9999]")
+        chunk = self.signal[self.pos : self.pos + frames]
+        overflowed = self.pos <= self.dropped[0] < self.pos + frames
+        self.pos += frames
+        return chunk.reshape(-1, 1).copy(), overflowed
+
+
+class _RecordingEngine:
+    def __init__(self):
+        self.seen: list = []
+
+    def transcribe(self, samples):
+        self.seen.append(samples)
+        return [("pick up the marker", 1.0)]
+
+
+def _protocol_lines(text: str) -> list:
+    import json
+
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+class TestNativeRateCapture:
+    def test_choose_rate_prefers_16k_when_accepted(self):
+        worker = _load_worker()
+        mic = _NativeRateMic(accepted={16000, 48000})
+        assert worker.choose_capture_rate(mic, 3) == 16000
+
+    def test_choose_rate_falls_back_to_the_native_rate(self):
+        worker = _load_worker()
+        assert worker.choose_capture_rate(_NativeRateMic(native_rate=44100), 3) == 44100
+
+    def test_a_misreported_default_rate_still_finds_one_that_opens(self):
+        worker = _load_worker()
+        mic = _NativeRateMic(native_rate=48000, accepted={48000}, reported_rate=44100)
+        assert worker.choose_capture_rate(mic, None) == 48000
+
+    def test_a_device_that_accepts_nothing_usable_is_reported(self):
+        worker = _load_worker()
+        mic = _NativeRateMic(accepted={8000})  # below 16 kHz: never used
+        with pytest.raises(worker.CaptureRateError, match="16000 Hz"):
+            worker.choose_capture_rate(mic, 3)
+
+    @pytest.mark.parametrize("native_rate", [48000, 44100])
+    def test_mic_mode_captures_natively_and_hands_the_model_16k(
+        self, native_rate, monkeypatch, capsys
+    ):
+        """End to end through main(): refusal -> native capture -> 16 kHz to the engine."""
+        import numpy as np
+
+        worker = _load_worker()
+        mic = _NativeRateMic(native_rate=native_rate)
+        engine = _RecordingEngine()
+        monkeypatch.setitem(sys.modules, "sounddevice", mic)
+        monkeypatch.setattr(worker, "build_engine", lambda *a, **k: engine)
+
+        assert worker.main(["--mic", "2", "--asr", "whisper"]) == 0
+
+        out = capsys.readouterr()
+        lines = _protocol_lines(out.out)
+        ready = [line for line in lines if line.get("event") == "ready"]
+        assert ready and ready[0]["capture_rate"] == native_rate
+        assert mic.opened_rates == [native_rate] and mic.rec_rates == [native_rate]
+        assert f"capturing at {native_rate} Hz" in out.err
+        assert {"text": "pick up the marker", "confidence": 1.0} in lines
+        # The unplug that followed is reported, not a crash.
+        assert any(line.get("event") == "error" for line in lines)
+
+        assert len(engine.seen) == 1
+        audio = engine.seen[0]
+        assert audio.dtype == np.float32 and audio.ndim == 1
+        # 0.5 s pre-roll + 1.0 s speech + 0.6 s hangover, now at 16 kHz.
+        assert len(audio) == pytest.approx(2.1 * 16000, abs=800)
+        assert _dominant_hz(audio, 16000) == pytest.approx(300.0, abs=3.0)
+
+    def test_mic_that_accepts_16k_is_not_resampled(self, monkeypatch, capsys):
+        import numpy as np
+
+        worker = _load_worker()
+        mic = _NativeRateMic(native_rate=16000)
+        engine = _RecordingEngine()
+        monkeypatch.setitem(sys.modules, "sounddevice", mic)
+        monkeypatch.setattr(worker, "build_engine", lambda *a, **k: engine)
+        calls: list = []
+        real = worker.resample_audio
+        monkeypatch.setattr(worker, "resample_audio", lambda *a, **k: calls.append(a) or real(*a, **k))
+
+        assert worker.main(["--mic", "0"]) == 0
+        capsys.readouterr()
+        assert mic.opened_rates == [16000] and calls == []
+        assert len(engine.seen) == 1 and engine.seen[0].dtype == np.float32
+
+    def test_a_mic_with_no_usable_rate_exits_2_before_the_model_loads(
+        self, monkeypatch, capsys
+    ):
+        worker = _load_worker()
+        loaded: list = []
+        monkeypatch.setitem(sys.modules, "sounddevice", _NativeRateMic(accepted={8000}))
+        monkeypatch.setattr(worker, "build_engine", lambda *a, **k: loaded.append(a))
+        assert worker.main(["--mic", "5"]) == 2
+        err = capsys.readouterr().err
+        assert "Input device 5" in err and "--list-mics" in err
+        assert loaded == []
+
+    def test_served_client_gets_resampled_transcripts_over_tcp(self, monkeypatch):
+        """--serve with a 48 kHz-only default mic: a client connects, receives
+        "ready" (capture_rate 48000) and the transcript, and the server survives
+        the disconnect (its model stays resident) until it is interrupted.
+
+        Also pins the TCP path itself: serve_forever sets TCP_NODELAY on the
+        accepted connection, which needs ``socket`` at module scope.
+        """
+        import json
+        import socket
+        import threading
+
+        worker = _load_worker()
+        mic = _NativeRateMic(native_rate=48000, sessions=("speech", "unplugged", "interrupt"))
+        engine = _RecordingEngine()
+        monkeypatch.setitem(sys.modules, "sounddevice", mic)
+        monkeypatch.setattr(worker, "build_engine", lambda *a, **k: engine)
+
+        server = worker.bind_server_socket("127.0.0.1", 0)
+        port = server.getsockname()[1]
+        result: dict = {}
+
+        def run():
+            try:
+                result["code"] = worker.serve_forever(
+                    "127.0.0.1", port, "canary-gguf", "base.en", "cpu", 4.0, 0.0,
+                    server_socket=server,
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below
+                result["error"] = repr(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def session() -> list:
+            for _ in range(100):
+                try:
+                    conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+                    break
+                except OSError:
+                    threading.Event().wait(0.05)  # not listening until the model is "loaded"
+            else:
+                raise AssertionError("server never started listening")
+            data = b""
+            with conn:
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            return [json.loads(line) for line in data.decode().splitlines() if line]
+
+        first = session()
+        ready = [line for line in first if line.get("event") == "ready"]
+        assert ready and ready[0]["capture_rate"] == 48000 and ready[0]["warm"] is True
+        assert {"text": "pick up the marker", "confidence": 1.0} in first
+        assert len(engine.seen) == 1 and len(engine.seen[0]) == pytest.approx(33600, abs=800)
+
+        session()  # second client: the operator hits Ctrl+C while it is attached
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert result == {"code": 0}

@@ -61,6 +61,11 @@ pytest>=7.0
 #    docstring for the torch/torchvision CUDA-line trap). Observed working:
 #    nemo_toolkit 3.1.0 in the venv, torch 2.12 cu130 + torchvision 0.27 in the base.
 # nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git
+#    --asr canary-gguf : the same model as GGUF Q4_K_M through transcribe.cpp
+#    (any 3.10-3.12 venv; set TRANSCRIBE_LIBRARY to a CUDA build of the native lib):
+# transcribe-cpp==0.2.4
+# numpy
+# sounddevice          # --mic / --serve capture (scipy optional: faster resampling)
 #    scripts/tts_to_wav.py needs nothing: Windows SAPI via PowerShell.
 
 # ---------------------------------------------------------------------------
@@ -74,9 +79,11 @@ pytest>=7.0
 # huggingface-hub      # repo-id -> snapshot resolution (already a GR00T dependency)
 
 # ---------------------------------------------------------------------------
-# G. Jetson Orin Nano (JetPack 6.2.2 system Python 3.10): jetson/robot_server.py,
-#    jetson/detector_service.py, speech_worker.py --asr parakeet.
-#    NanoOWL runs in its own container (jetson-containers), not via pip.
+# G. Jetson Orin Nano (JetPack 6.2.2, Python 3.10 venv), the MVP stack:
+#    jetson/robot_server.py (+ webcam), scripts/serve_detector.py --backend
+#    florence-onnx, scripts/speech_worker.py --asr canary-gguf,
+#    jetson/llm_worker_llamacpp.py (llama-server is a source build).
+#    Full install: jetson/README.md section 2.
 # ---------------------------------------------------------------------------
 # numpy
 # pyyaml
@@ -84,8 +91,12 @@ pytest>=7.0
 # msgpack
 # msgpack-numpy
 # opencv-python        # or JetPack's bundled OpenCV
-# pillow               # detector_service.py NanoOWL input
-# pyserial             # Arduino servo bridge driver
+# pyserial             # Arduino servo bridge driver (and jetson/serial_smoke.py)
 # smbus2               # PCA9685 servo driver
-# sherpa-onnx          # Parakeet-TDT ASR
-# sounddevice          # parakeet --mic capture
+# pillow               # detector input
+# tokenizers           # Florence-2 ONNX backend
+# onnx                 # Florence-2 fp16 decoder output-name fix at load
+# onnxruntime-gpu      # ONLY from --index-url https://pypi.jetson-ai-lab.io/jp6/cu126
+# transcribe-cpp==0.2.4  # + TRANSCRIBE_LIBRARY -> the sm_87 CUDA build of libtranscribe.so
+# sounddevice          # mic capture (apt: libportaudio2)
+# sherpa-onnx          # only for the Parakeet CPU fallback (--asr parakeet)
