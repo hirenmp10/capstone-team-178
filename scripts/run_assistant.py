@@ -504,6 +504,31 @@ def _robot_server_is_up(host: str, port: int, timeout: float = 1.0) -> bool:
         client.close()
 
 
+def _describe_robot_server(host: str, port: int, timeout: float = 1.0) -> dict | None:
+    """What is already listening on the robot port: ``None`` if nothing answers,
+    else ``{"fake": bool, "estopped": bool, "server": str}`` from ping + get_state."""
+    if not _robot_server_is_up(host, port, timeout=timeout):
+        return None
+    from mfw.hardware.zmq_rpc import RpcError, ZmqRpcClient
+
+    client = ZmqRpcClient(host, port, request_timeout_s=timeout)
+    try:
+        ping = client.call("ping", {})
+        try:
+            state = client.call("get_state", {})
+        except RpcError:
+            state = {}
+        return {
+            "fake": bool(ping.get("fake", False)),
+            "estopped": bool(state.get("estopped", False)),
+            "server": str(ping.get("server", "?")),
+        }
+    except RpcError:
+        return {"fake": False, "estopped": False, "server": "?"}
+    finally:
+        client.close()
+
+
 def _parse_host_port(spec: str, default_host: str, default_port: int) -> tuple[str, int]:
     host, _, port_text = str(spec).partition(":")
     return host or default_host, int(port_text or default_port)
@@ -732,19 +757,57 @@ class HardwareStopGuard:
 
 def _autostart_fake_hardware(
     robot_host: str, robot_port: int, detector_host: str, detector_port: int,
-    wait_seconds: float = 30.0,
+    wait_seconds: float = 30.0, reuse_existing: bool = False,
 ) -> list:
-    """Launch the two fake services this interpreter can run, if they are not up.
+    """Launch the two fake services this interpreter can run.
 
     Returns the Popen handles so the caller can stop what it started. Both
     run in this interpreter (``sys.executable``): they need only numpy, pyzmq
     and msgpack, all of which are already required to talk to them.
+
+    Something already listening on either port is NOT silently reused: a
+    leftover fake (an earlier run, a test) may be estopped or hold a different
+    scene, and made the demo fail intermittently; a robot server with a real
+    driver there would mean driving a real arm in fake mode. So a real driver
+    is always refused, and a fake is reused only with ``reuse_existing``
+    (``--reuse-fakes``) and only if it is not estopped.
     """
     import subprocess
 
+    existing = _describe_robot_server(robot_host, robot_port)
+    if existing is not None:
+        where = f"{robot_host}:{robot_port}"
+        if not existing["fake"]:
+            raise SystemExit(
+                f"--fake-hardware: a robot server with a REAL driver ({existing['server']}) is "
+                f"running on {where}. Fake mode never drives real hardware: stop that server, "
+                "or run with --hardware instead of --fake-hardware."
+            )
+        if not reuse_existing:
+            raise SystemExit(
+                f"--fake-hardware: a fake robot server is already running on {where} (left over "
+                "from an earlier run or a test?). Stop it so a fresh one can start, or pass "
+                "--reuse-fakes to use it as it is."
+            )
+        if existing["estopped"]:
+            raise SystemExit(
+                f"--reuse-fakes: the fake robot server on {where} is estopped. Send it "
+                "clear_estop, or stop it so a fresh one can start."
+            )
+        print(f"\n  Reusing the fake robot server already running on {where} (--reuse-fakes).")
+    if _server_is_up(detector_host, detector_port):
+        where = f"{detector_host}:{detector_port}"
+        if not reuse_existing:
+            raise SystemExit(
+                f"--fake-hardware: a detector is already running on {where} (left over from an "
+                "earlier run or a test?). Stop it so a fresh scripted one can start, or pass "
+                "--reuse-fakes to use it as it is."
+            )
+        print(f"  Reusing the detector already running on {where} (--reuse-fakes).")
+
     spawned = []
     jobs = []
-    if not _robot_server_is_up(robot_host, robot_port):
+    if existing is None:
         jobs.append((
             "robot server",
             # --fake-watchdog-ms: the fake detaches itself after 500 ms without a
@@ -876,7 +939,16 @@ def main() -> int:
         "--fake-hardware",
         action="store_true",
         help="hardware lane against loopback fakes (robot_server.py --driver fake, "
-        "detector_service.py --backend scripted), autostarted if not running",
+        "detector_service.py --backend scripted), started fresh for this run. Refuses if "
+        "something already listens on those ports (see --reuse-fakes); never drives a server "
+        "with a real driver",
+    )
+    parser.add_argument(
+        "--reuse-fakes",
+        action="store_true",
+        help="with --fake-hardware: use a fake robot server / detector that is already running "
+        "on the configured ports instead of refusing (still refused if that robot server is "
+        "estopped or has a real driver)",
     )
     parser.add_argument(
         "--jetson",
@@ -1124,7 +1196,8 @@ def main() -> int:
         hw = config.hardware
         if args.fake_hardware:
             spawned_fakes = _autostart_fake_hardware(
-                hw.jetson_host, hw.jetson_port, hw.detector_host, hw.detector_port
+                hw.jetson_host, hw.jetson_port, hw.detector_host, hw.detector_port,
+                reuse_existing=args.reuse_fakes,
             )
             if spawned_fakes:
                 import atexit

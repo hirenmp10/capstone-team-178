@@ -165,8 +165,8 @@ back home, and a report with directions, distances and what is out of reach (`ha
 The arm cannot scan with a fixed overhead camera, so the camera moves onto the arm.
 
 **Hardware:** a UVC USB camera on the forearm/wrist (eye-in-hand), cable tied along the arm. A Logitech C270
-with its stand removed (~75 g) is the affordable option; it adds load at the end of the arm, so the elbow
-also gets the 20 kg-cm DS3218. "Room" means **what the camera can see from the arm's base**; only objects
+with its stand removed (~75 g) is the affordable option; it adds load at the end of the arm, so this later
+stage needs a SECOND 20 kg-cm DS3218 for the elbow (the MVP uses one DS3218, on the shoulder, and a fixed overhead camera; see docs/MVP_RUNBOOK.md section 1). "Room" means **what the camera can see from the arm's base**; only objects
 within reach (~15–20 cm radius with the current placeholder geometry) can be picked.
 
 **Behaviour:**

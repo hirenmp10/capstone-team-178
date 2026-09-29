@@ -39,8 +39,8 @@ critical bridge finding):
   target for ``torque on`` is that same position (the server's ``bridge_q``;
   ``home``, slowly, when the bridge cannot tell), so an arm that was NOT
   moved while limp stays where it is -- but an arm that was moved by hand
-  JUMPS back to the last pulsed pose at full speed (three MG996R snap a
-  hand-posed linkage back in well under 200 ms). So it always prints that
+  JUMPS back to the last pulsed pose at full speed (the DS3218 and two
+  MG996R snap a hand-posed linkage back in well under 200 ms). So it always prints that
   warning and asks for ``yes`` first; ``--script`` runs must pass ``--yes``.
   Hand-posing is no use for ``zero``/``limit`` anyway: they read the
   *commanded* pulses.

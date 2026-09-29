@@ -22,14 +22,18 @@ smoke tests), `docs/JETSON_MODELS_PLAN.md` (models and memory),
 
 ## 1. Parts on the desk
 
+**This table is the single source of truth for the MVP parts** (servo per
+joint, servo supply, E-stop). `docs/HARDWARE_BRIEF.md` and `jetson/README.md`
+point here; where anything else disagrees, this table wins.
+
 | Part | Role | Note |
 |---|---|---|
 | DS3218 20 kg-cm | shoulder | **Buy the 180-degree version.** A 270-degree DS3218 maps 500..2500 us to 270 deg; the placeholder map assumes 600..2400 us = +-90 deg. Either works after calibration (section 6), but the placeholder band would move it further than expected. |
 | MG996R x2 | base, elbow | stall 1.4 A (genuine) to 2.5 A (clone) at 6 V |
 | MG90S x2 | wrist, gripper | never an SG90 on the gripper (strips) |
 | Arduino Uno R3, genuine (`lsusb` shows `2341:`) | servo bridge | a CH340 clone does not enumerate on JetPack 6 -> PCA9685 board (backup driver, no watchdog) |
-| Regulated 6 V DC, >= 5 A (8-10 A preferred) | servo supply | never the Jetson's or the Uno's 5 V |
-| Latching E-stop / SPST switch >= 10 A DC | the only mid-motion stop | in the +6 V lead only |
+| Regulated ~6 V DC, >= 5 A (8-10 A preferred) | servo supply | a 6 V supply, or a 5 V 10 A SMPS trimmed up to 5.8-6.0 V (the 0.3 V above 5.5 V is the sag budget: the bus must stay > 5.5 V during a full-speed home, S4 and section 11). Never the Jetson's or the Uno's 5 V |
+| Latching E-stop / SPST switch >= 10 A DC | the only mid-motion stop | in the servo supply's +V (+6 V) lead only, never the ground |
 | 1000 uF / 16 V electrolytic | across the servo bus | observe polarity |
 | Optional 7.5-10 A blade fuse | +6 V lead | after the switch |
 | 18 AWG wire, terminal block / bus bar | power bus | servo leads are 22-26 AWG: keep them short |
@@ -68,7 +72,7 @@ smoke tests), `docs/JETSON_MODELS_PLAN.md` (models and memory),
 Two people: one operates, one keeps a hand on the E-stop.
 
 1. E-stop within reach of the second person and **open** (off) before plugging anything in.
-2. Supply measured at 5.9-6.1 V with no load (S1). Polarity of the capacitor and of every servo plug checked.
+2. Supply measured with no load (S1), one pass condition per supply: 5.9-6.1 V from a 6 V supply; 5.8-6.0 V from a trimmed 5 V SMPS. Below 5.8 V there is no room for the load sag S4 allows (bus > 5.5 V). Polarity of the capacitor and of every servo plug checked.
 3. Exactly one ground wire servo bus (-) -> Uno GND; no arm wire on any Jetson pin.
 4. Workspace clear of hands, cables and anything that must not be knocked over; foam or a towel under the reach circle.
 5. The arm **hand-posed at home** (upper arm vertical, forearm folded ~35 deg back, jaws up; `robot.home_joint_positions`) **right before the first `home`**: after every robot_server start the bridge knows no position, and the first `home` request attaches all servos AT home at full speed. That request is `calibrate_servos.py` -> `home`, or `run_assistant.py --hardware` connecting (HardwareRuntime homes on startup), which can be minutes after `jetson_mode.sh conversation` while an unpowered arm sags. **run_assistant does not send it silently:** against a real driver with no known position it prints the hand-pose checklist (arm at home, E-stop in reach, hands clear), discards anything typed during bring-up, and waits for you to type **`home`** (a bare Enter is asked again); Ctrl-C or end of input aborts before anything moves (Ctrl-C also sends an estop: clear it with `calibrate_servos.py` -> `clear` before the next run, or the next run refuses and says so). Pose the arm at that prompt, not earlier. **A second run on the same robot_server prompts too**: 5 s after the previous run's last request the server's host timeout detaches the servos and the arm goes limp, and the next `home` re-attaches every servo AT ITS LAST POSE at full speed before moving slowly home -- a sagged arm snaps back there. The checklist then says "DETACHED (limp)" and prints that last pose: hand-pose the arm at that pose (not at home). A run with no terminal (piped input, a scheduled task, a service unit) refuses and exits 1 unless `--home-confirmed` is given -- pass it only when a person has just hand-posed the arm and is at the E-stop. Only the fake lane, and a real arm whose servos are still attached at a known position (a run started within the host timeout), never prompt.
@@ -300,6 +304,11 @@ robot_server always stays on the Jetson (it owns the USB serial and the webcam).
 
 ## 13. Things that will surprise a first demo attempt
 
+- `--fake-hardware` starts fresh fakes and refuses if something already listens on
+  5560/5558 (a leftover fake from an earlier run or a test made the demo fail
+  intermittently when it was reused silently). Stop the leftover, or pass
+  `--reuse-fakes` to use it on purpose; an estopped fake or a server with a real
+  driver is always refused.
 - With `--allow-placeholder-calibration` picks stop with "Jetson clamped a
   target" (the laptop's limits are wider than the 1000..2000 us band; measured
   on the fake lane). Calibrate first (section 6).

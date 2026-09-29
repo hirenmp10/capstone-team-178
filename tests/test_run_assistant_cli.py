@@ -660,3 +660,127 @@ class TestFirstHomeFlag:
             cli.main()
         text = " ".join(capsys.readouterr().out.split())
         assert "--home-confirmed" in text and "not a terminal" in text
+
+
+# ----------------------------------------------------------------------
+# --fake-hardware never silently reuses what already listens on its ports
+# ----------------------------------------------------------------------
+
+
+class TestFakeHardwareDoesNotReuseSilently:
+    """A leftover fake (an earlier run, a test) on 5560 made the demo fail
+    intermittently: it was reused as is, and it was estopped or held another
+    scene. A server with a REAL driver there would mean driving a real arm in
+    fake mode. Nothing here opens a socket: the probes and Popen are fakes."""
+
+    class _Popen:
+        def __init__(self, command, **_kw):
+            self.command = command
+            self.pid = 4242
+            TestFakeHardwareDoesNotReuseSilently.launched.append(command)
+
+    launched: list = []
+
+    def _setup(self, cli, monkeypatch, robot: dict | None, detector_up: bool):
+        import subprocess
+
+        TestFakeHardwareDoesNotReuseSilently.launched = []
+        started = {"robot": False, "detector": False}
+
+        def _describe(*_a, **_k):
+            return robot
+
+        def _robot_up(*_a, **_k):  # the post-spawn readiness probe
+            return started["robot"] or robot is not None
+
+        def _server_up(*_a, **_k):
+            return detector_up or started["detector"]
+
+        def _popen(command, **kw):
+            proc = self._Popen(command, **kw)
+            started["robot" if "robot_server.py" in " ".join(command) else "detector"] = True
+            return proc
+
+        monkeypatch.setattr(cli, "_describe_robot_server", _describe)
+        monkeypatch.setattr(cli, "_robot_server_is_up", _robot_up)
+        monkeypatch.setattr(cli, "_server_is_up", _server_up)
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+
+    def _launched_names(self):
+        return ["robot_server" if "robot_server.py" in " ".join(c) else "detector"
+                for c in TestFakeHardwareDoesNotReuseSilently.launched]
+
+    def test_nothing_running_starts_both_fakes(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot=None, detector_up=False)
+        spawned = cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558, wait_seconds=1)
+        assert len(spawned) == 2
+        assert self._launched_names() == ["robot_server", "detector"]
+        assert "--driver" in TestFakeHardwareDoesNotReuseSilently.launched[0]
+        assert "fake" in TestFakeHardwareDoesNotReuseSilently.launched[0]
+
+    def test_a_real_driver_on_the_port_is_always_refused(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot={"fake": False, "estopped": False, "server": "mfw-robot"},
+                    detector_up=False)
+        for reuse in (False, True):
+            with pytest.raises(SystemExit, match="REAL driver"):
+                cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558,
+                                             wait_seconds=1, reuse_existing=reuse)
+        assert self._launched_names() == []
+
+    def test_a_leftover_fake_is_refused_without_the_flag(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot={"fake": True, "estopped": False, "server": "mfw-robot"},
+                    detector_up=True)
+        with pytest.raises(SystemExit, match="already running .*--reuse-fakes"):
+            cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558, wait_seconds=1)
+        assert self._launched_names() == []
+
+    def test_an_estopped_fake_is_refused_even_with_the_flag(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot={"fake": True, "estopped": True, "server": "mfw-robot"},
+                    detector_up=True)
+        with pytest.raises(SystemExit, match="estopped"):
+            cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558,
+                                         wait_seconds=1, reuse_existing=True)
+        assert self._launched_names() == []
+
+    def test_reuse_with_the_flag_starts_nothing_and_says_so(self, cli, monkeypatch, capsys):
+        self._setup(cli, monkeypatch, robot={"fake": True, "estopped": False, "server": "mfw-robot"},
+                    detector_up=True)
+        spawned = cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558,
+                                               wait_seconds=1, reuse_existing=True)
+        assert spawned == [] and self._launched_names() == []
+        out = capsys.readouterr().out
+        assert "Reusing the fake robot server" in out and "Reusing the detector" in out
+
+    def test_a_leftover_detector_is_refused_without_the_flag(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot=None, detector_up=True)
+        with pytest.raises(SystemExit, match="detector is already running"):
+            cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558, wait_seconds=1)
+        assert self._launched_names() == []
+
+    def test_describe_reports_fake_and_estopped_from_the_server(self, cli, monkeypatch):
+        import mfw.hardware.zmq_rpc as rpc
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def call(self, endpoint, data):
+                return {"ping": {"ok": True, "fake": True, "server": "mfw-robot"},
+                        "get_state": {"estopped": True}}[endpoint]
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(cli, "_robot_server_is_up", lambda *a, **k: True)
+        monkeypatch.setattr(rpc, "ZmqRpcClient", _Client)
+        assert cli._describe_robot_server("127.0.0.1", 5560) == {
+            "fake": True, "estopped": True, "server": "mfw-robot"}
+        monkeypatch.setattr(cli, "_robot_server_is_up", lambda *a, **k: False)
+        assert cli._describe_robot_server("127.0.0.1", 5560) is None
+
+    def test_help_documents_the_flag(self, cli, monkeypatch, restore_sigint, capsys):
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", "--help"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        text = " ".join(capsys.readouterr().out.split())
+        assert "--reuse-fakes" in text and "never drives a server with a real driver" in text

@@ -1186,3 +1186,67 @@ class TestScanIndependence:
         text = " ".join((REPO_ROOT / "docs" / "MVP_RUNBOOK.md").read_text(encoding="utf-8").split())
         assert "--history-max-age 0" in text and "frame_gap_s" in text
         assert "not independent" in text
+
+
+class TestServoPartsAreOneList:
+    """``docs/MVP_RUNBOOK.md`` section 1 is the single source of truth for the
+    servo on each joint, the servo supply and the E-stop. The brief listed
+    3 x MG996R (and its order list omitted the shoulder servo), the Jetson
+    README said nothing about servos, and the S1 no-load range excluded the
+    trimmed 5 V SMPS the MVP accepts."""
+
+    OTHERS = ("docs/HARDWARE_BRIEF.md", "jetson/README.md")
+
+    @staticmethod
+    def _flat(rel: str) -> str:
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8").replace("\u2013", "-")
+        return " ".join(text.split())
+
+    @staticmethod
+    def _parts_rows() -> dict[str, str]:
+        text = (REPO_ROOT / "docs" / "MVP_RUNBOOK.md").read_text(encoding="utf-8")
+        section = text.split("## 1. Parts on the desk", 1)[1].split("\n## ", 1)[0]
+        assert "single source of truth" in section
+        return {line.split("|")[1].strip(): line for line in section.splitlines() if line.startswith("| ")}
+
+    def test_the_runbook_parts_table_is_the_mvp_decision(self):
+        rows = self._parts_rows()
+        assert "| shoulder |" in rows["DS3218 20 kg-cm"] and "180-degree version" in rows["DS3218 20 kg-cm"]
+        assert "| base, elbow |" in rows["MG996R x2"]
+        assert "| wrist, gripper |" in rows["MG90S x2"] and "never an SG90 on the gripper" in rows["MG90S x2"]
+        supply = rows["Regulated ~6 V DC, >= 5 A (8-10 A preferred)"]
+        assert "5 V 10 A SMPS trimmed up to 5.8-6.0 V" in supply
+        estop = next(row for key, row in rows.items() if key.startswith("Latching E-stop"))
+        assert "+V" in estop and "never the ground" in estop
+        assert not any("SG90" in key or "MG996R x3" in key for key in rows)
+
+    def test_the_brief_and_the_jetson_readme_point_to_it_and_agree(self):
+        for rel in self.OTHERS:
+            text = self._flat(rel)
+            assert "`docs/MVP_RUNBOOK.md` section 1" in text, rel
+            assert "DS3218 20 kg-cm" in text and "180-degree version" in text, rel
+            assert "base + elbow" in text or "(base, elbow)" in text, rel
+            assert "never an SG90 on the gripper" in text, rel
+            assert "5 V 10 A SMPS trimmed to 5.8-6.0 V" in text, rel
+            for stale in ("3 × MG996R", "3 x MG996R", "three MG996R", "5.9-6.1 V;", "S1 supply 5.9-6.1 V",
+                          "5.5-6.0 V", "5.5-6.1 V"):
+                assert stale not in text, (rel, stale)
+
+    def test_the_s1_no_load_range_is_the_same_everywhere(self):
+        """S1 is one pass condition per supply, and each floor leaves room for
+        the load sag S4 allows (bus > 5.5 V). The old headline 5.5-6.1 V let
+        an SMPS pass S1 at 5.5 V -- certain to fail S4 -- and a 6 V supply
+        pass at 5.6 V against its own 5.9 V floor."""
+        s1 = {
+            "docs/MVP_RUNBOOK.md": ("5.9-6.1 V from a 6 V supply", "5.8-6.0 V from a trimmed 5 V SMPS"),
+            "jetson/README.md": ("5.9-6.1 V from a 6 V supply", "5.8-6.0 V from a trimmed 5 V SMPS"),
+            "docs/HARDWARE_BRIEF.md": ("5.9-6.1 V (6 V supply)", "5.8-6.0 V (trimmed 5 V SMPS)"),
+        }
+        for rel, conditions in s1.items():
+            text = self._flat(rel)
+            for condition in conditions:
+                assert condition in text, (rel, condition)
+            assert "5.5-6.1 V" not in text and "5.5-6.0 V" not in text, rel
+            assert "> 5.5 V" in text, rel  # the S4 / section 11 load floor the S1 floors leave room for
+        assert "the 0.3 V above 5.5 V is the sag budget" in self._flat("docs/MVP_RUNBOOK.md")
+        assert "three MG996R" not in (REPO_ROOT / "scripts" / "calibrate_servos.py").read_text(encoding="utf-8")

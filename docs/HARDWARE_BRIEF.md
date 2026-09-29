@@ -46,7 +46,7 @@ claims in this project were wrong until someone checked.
 | Item | Fact |
 |---|---|
 | Arm | Techno-Tirupati 5-DOF PLA kit. 4 arm DOF: base yaw + shoulder/elbow/wrist pitch (coplanar) + gripper. Reach ~20–30 cm. Payload ~100–200 g. |
-| Servos | 3 × MG996R (stall 1.4 A genuine / 2.5 A clone @ 6 V), 2 × MG90S (~0.7 A). PWM, **no feedback**. Owned: 1 MG996R, 1 SG90 (SG90 → spare; gripper gets MG90S). |
+| Servos | As `docs/MVP_RUNBOOK.md` section 1 (the single source of truth for parts): shoulder **DS3218 20 kg-cm, 180-degree version**; base + elbow **MG996R** (stall 1.4 A genuine / 2.5 A clone @ 6 V); wrist + gripper **MG90S** (~0.7 A), never an SG90 on the gripper. PWM, **no feedback**. Owned: 1 MG996R, 1 SG90 (SG90 → spare). |
 | Jetson | Orin Nano 8 GB dev kit. Linux sees **7 620 MB**. Swap/zram cannot back GPU allocs. Header: 3.3 V logic, 3 PWM pins, 5 V pins 0.5 A total. **No mic jack** → USB mic. |
 | Laptop | Windows 11, RTX 5090 Laptop 24 GB (95 W). `py -3.12` has torch/transformers/pyzmq + (now) msgpack, msgpack-numpy, opencv. |
 | Camera | one USB webcam, overhead, fixed. No depth, no wrist cam. |
@@ -65,7 +65,7 @@ jetson/robot_server.py (ZMQ/msgpack) :5560           ◄──ZMQ──    Joint
   │    servo_bridge.ino: Servo lib, 20 ms interp, watchdog       RuleBasedIntentParser (default, 0 GB)
   └─ camera: get_frame (calibration + Florence fallback)         optional: --llm-server <jetson>:5557
 [optional] llama-server Qwen2.5-1.5B Q4_K_M + jetson/llm_worker_llamacpp.py :5557
-Servos: separate 6 V ≥5 A supply ── E-stop switch in +6 V ── ONE common ground to the Uno
+Servos: separate regulated ~6 V ≥5 A supply ── E-stop switch in +V ── ONE common ground to the Uno
 ```
 
 Perception without depth: overhead camera → pixel → table XY by homography
@@ -143,12 +143,17 @@ record `tegrastats` idle. **Do not upgrade JetPack mid-project.**
 
 ## 8. Parts (order day 1)
 
-2 × MG996R · 2 × MG90S · genuine Arduino Uno R3/R4 (CH340 clones do not
-enumerate on JetPack 6; if clone → PCA9685) · regulated 6 V DC ≥ 5 A (8–10 A
-preferred) · 1000 µF/16 V cap · inline SPST ≥ 10 A DC switch (E-stop) · 1080p
-USB webcam · close-talk USB microphone · NVMe SSD if not present · clamp,
-jumpers, bus bar · foam cube, toy banana, small light box, bowl, bin · printed
-A4 checkerboard. ≈ ₹9.6k (≈ ₹5.9k if Uno + NVMe already owned).
+The parts list is `docs/MVP_RUNBOOK.md` section 1; it wins where this
+summary differs. 1 × DS3218 20 kg-cm, 180-degree version (shoulder) ·
+2 × MG996R (base, elbow) · 2 × MG90S (wrist, gripper; never an SG90 on the
+gripper) · genuine Arduino Uno R3/R4 (CH340 clones do not enumerate on
+JetPack 6; if clone → PCA9685) · regulated ~6 V DC ≥ 5 A (8–10 A preferred; a
+5 V 10 A SMPS trimmed to 5.8–6.0 V is acceptable) · 1000 µF/16 V cap · inline
+SPST ≥ 10 A DC switch (E-stop) in the +V lead · 1080p USB webcam · close-talk
+USB microphone · NVMe SSD if not present · clamp, jumpers, bus bar · foam
+cube, toy banana, small light box, bowl, bin · printed A4 checkerboard.
+≈ ₹9.6k (≈ ₹5.9k if Uno + NVMe already owned) -- an estimate from before the
+DS3218 shoulder was chosen, not re-priced.
 
 ## 9. Wiring (Option B) and smoke test
 
@@ -182,9 +187,9 @@ nearer objects are refused as unreachable instead of being executed 5-9 cm off
 by a silently clamped servo. `HardwareRuntime` refuses to build when the laptop
 limits are wider than the Jetson's pulse map; fix it with `calibrate_servos.py`.
 
-Smoke, linkages off horns: S1 supply 5.9–6.1 V · S2 `/dev/ttyACM0` present ·
+Smoke, linkages off horns: S1 no-load supply 5.9–6.1 V (6 V supply) or 5.8–6.0 V (trimmed 5 V SMPS) (runbook section 3 item 2) · S2 `/dev/ttyACM0` present ·
 S3 `P1500,…` → `OK` · S4 one MG90S 1200→1800→1500, bus > 5.5 V · S5 add servos
-one at a time, record end-stop µs (check no MG996R is continuous-rotation) ·
+one at a time, record end-stop µs (check no servo is continuous-rotation) ·
 S6 5-joint slow sweep 2 min watching `dmesg -w` — a Jetson reboot here is
 power/ground, not code.
 
@@ -331,7 +336,7 @@ Daily 15-min sync; run the fake e2e test before every push.
 ## 13. Rules
 
 1. **Read the code before asserting behaviour.** Cite `file:line`.
-2. Never power servos from the Jetson 5 V rail or the Uno 5 V pin. One common ground. E-stop in the +6 V lead only.
+2. Never power servos from the Jetson 5 V rail or the Uno 5 V pin. One common ground. E-stop in the servo +V lead only.
 3. Load GPU models **once at boot, largest first**; never lazily per utterance (NvMap error 12).
 4. Do not upgrade JetPack mid-project; 6.2.2 locks the toolchain.
 5. `gr00t.use_mock_server` stays `false` over LAN — the mock transport is pickle (remote code execution). Never expose the mock server beyond loopback.

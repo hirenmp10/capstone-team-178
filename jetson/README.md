@@ -151,8 +151,13 @@ gripper**. 115200 baud. Servos stay detached until the first `P`/`T` frame;
 `SKETCH_ARM_PULSE_US` / `SKETCH_GRIPPER_PULSE_US` in `robot_server.py`
 (`tests/test_hardware_bridge.py` pins the two together).
 
-Power: a separate regulated **6 V >= 5 A** supply -> **E-stop switch** in the
-+6 V lead -> 1000 uF across the servo bus; **one** ground wire from the servo
+Servos (the parts list is `docs/MVP_RUNBOOK.md` section 1): shoulder DS3218
+20 kg-cm (180-degree version), base + elbow MG996R, wrist + gripper MG90S
+(never an SG90 on the gripper).
+
+Power: a separate regulated **~6 V >= 5 A** supply (8-10 A preferred; a 5 V
+10 A SMPS trimmed to 5.8-6.0 V is acceptable) -> **E-stop switch** in the
++V lead -> 1000 uF across the servo bus; **one** ground wire from the servo
 bus (-) to an Uno GND; nothing from the arm on the Jetson's 5 V pins. Full
 wiring and the pre-power-on checklist: `docs/MVP_RUNBOOK.md` sections 2 and 3.
 
@@ -230,6 +235,8 @@ python3 jetson/robot_server.py --config jetson/robot_config.yaml --driver uno --
 - **A failed estop still relaxes the arm**: `D` is retried 3 times; if it is
   never confirmed the keepalive has already stopped and the Uno's watchdog
   drops the arm within 500 ms. The +6 V switch is the mid-motion stop.
+  The estop reply never asks the Uno `?` after its `D` attempts, so it
+  carries `bridge_probed: false` and `bridge_q: null`; `get_state` asks.
 - **Serial resync**: after any failed exchange the host sends `S<nonce>` and
   reads until the echo *before* it sends the next frame; after 3 failures in
   a row it declares the servos detached. A line of 64 bytes or more is
@@ -308,7 +315,7 @@ while a model runs (a zero means a silent CPU fallback).
 
 | # | Check | Pass |
 |---|---|---|
-| S1 | Servo supply under no load, at the bus, E-stop closed | 5.9-6.1 V; E-stop open -> 0 V |
+| S1 | Servo supply under no load, at the bus, E-stop closed | 5.9-6.1 V from a 6 V supply, or 5.8-6.0 V from a trimmed 5 V SMPS (room for the S4 sag to > 5.5 V); E-stop open -> 0 V |
 | S2 | `ls /dev/ttyACM0`; `lsusb` shows `2341:` (PCA9685: `i2cdetect -y -r 7` shows `40`) | present |
 | S3 | robot_server stopped; `python3 jetson/serial_smoke.py --serial /dev/ttyACM0` | `S3 PASS` (5 exchanges: `?` fresh, `P` attach, `?` echo `,1,1`, `D`, `?` `,0,1`) |
 | S4 | robot_server with `--allow-placeholder-calibration`; laptop `calibrate_servos.py`: `pulse wrist_pitch 1200`, `1800`, `1500` | bus stays > 5.5 V |

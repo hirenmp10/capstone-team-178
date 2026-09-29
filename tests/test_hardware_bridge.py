@@ -1893,6 +1893,108 @@ class TestDetachRobustness:
         finally:
             driver.close()
 
+    @staticmethod
+    def _estop_timed(server: RobotServer, driver: UnoSerialDriver) -> tuple[dict[str, Any], float, float]:
+        """``(reply, s from the end of the D attempts to the reply, s of the D attempts)``."""
+        marks: dict[str, float] = {}
+        original_detach = driver.detach
+
+        def detach(reason: str = "detach") -> None:
+            marks["start"] = time.monotonic()
+            try:
+                original_detach(reason)
+            finally:
+                marks["done"] = time.monotonic()
+
+        driver.detach = detach  # type: ignore[method-assign]
+        state = server._handle("estop", {})
+        replied = time.monotonic()
+        return state, replied - marks["done"], marks["done"] - marks["start"]
+
+    def test_a_dead_uno_does_not_delay_the_estop_reply(self, stub_serial):
+        """The estop reply used to come from ``state()``, which asks the Uno
+        ``?`` after the D retries: with a dead Uno that is one more reply
+        timeout and a failed sync, on the wall clock of a real port. The
+        reply is now built from cached/commanded state, with no '?' at all."""
+        driver = _uno()
+        ser = stub_serial.instances[-1]
+        server = RobotServer("127.0.0.1", 0, driver, camera=None, calibration=driver.calibration,
+                             follower_sleep=lambda _s: None)
+        try:
+            server._handle("home", {})
+            assert driver.attached
+            # The Uno dies: nothing ever answers, and each read costs its real timeout.
+            ser.reply_override = b""
+            stub_readline = ser.readline
+
+            def readline() -> bytes:
+                line = stub_readline()
+                if not line:
+                    time.sleep(ser.timeout)
+                return line
+
+            ser.readline = readline  # type: ignore[method-assign]
+            n = len(ser.frames)
+            state, after_d, d_attempts = self._estop_timed(server, driver)
+            sent = [f[:1] for f in ser.frames[n:]]
+            assert sent[0] == b"D", sent  # D still goes out first
+            assert sent.count(b"D") == DETACH_ATTEMPTS
+            assert b"?" not in sent, f"probed the Uno after the D attempts: {sent}"
+            assert d_attempts >= ser.timeout  # the stub really waited on the dead port
+            assert after_d < 0.05, f"estop reply took {after_d * 1000:.0f} ms after the D attempts"
+            assert state["estopped"] is True and state["attached"] is False
+            assert "did not confirm the detach" in state["detach_error"]
+            assert state["last_detach_reason"] == "estop"
+        finally:
+            driver.close()
+
+    def test_a_live_uno_estop_sends_no_probe_but_get_state_still_does(self, stub_serial):
+        driver = _uno()
+        ser = stub_serial.instances[-1]
+        server = RobotServer("127.0.0.1", 0, driver, camera=None, calibration=driver.calibration,
+                             follower_sleep=lambda _s: None)
+        try:
+            server._handle("home", {})
+            n = len(ser.frames)
+            state, after_d, _ = self._estop_timed(server, driver)
+            assert [f[:1] for f in ser.frames[n:]] == [b"D"]
+            assert after_d < 0.05
+            assert state["estopped"] is True and state["attached"] is False and state["detach_error"] is None
+            assert ser.attached is False  # the Uno executed the D
+            n = len(ser.frames)
+            later = server._handle("get_state", {})
+            assert [f[:1] for f in ser.frames[n:]] == [b"?"], "get_state must still ask the bridge"
+            assert later["estopped"] is True and later["attached"] is False
+        finally:
+            driver.close()
+
+    def test_the_estop_reply_never_reports_a_stale_bridge_pose(self):
+        """Review medium: with no ``?`` the estop reply read ``bridge_q`` from
+        the last probe on record, which nothing refreshes after a trajectory,
+        so a healthy bridge was reported at its PRE-motion pose. The reply
+        now says it cannot tell; the next ``get_state`` asks the bridge."""
+        cal = _fast_calibration()
+        driver = FakeDriver(cal)
+        server = RobotServer("127.0.0.1", 0, driver, camera=None, calibration=cal,
+                             follower_sleep=lambda _s: None)
+        home = np.asarray(server._handle("home", {})["q"])
+        assert server.state()["bridge_probed"] is True
+        pre_motion = np.asarray(server.state()["bridge_q"])
+        np.testing.assert_allclose(pre_motion, home, atol=2e-3)
+        reply = server._handle("follow_trajectory", {"waypoints": np.stack([home, GOAL_Q]), "dt": 0.1})
+        assert "error" not in reply, reply
+        state = server._handle("estop", {})
+        assert state["estopped"] is True and state["detach_error"] is None
+        assert state["bridge_probed"] is False
+        assert state["bridge_q"] is None and state["bridge_gripper_width"] is None, (
+            f"estop reply carried a bridge pose it did not ask for: {state['bridge_q']}"
+        )
+        np.testing.assert_allclose(state["q"], GOAL_Q, atol=1e-6)  # commanded state is current
+        later = server._handle("get_state", {})
+        assert later["bridge_probed"] is True
+        np.testing.assert_allclose(later["bridge_q"], GOAL_Q, atol=2e-3)
+        assert not np.allclose(later["bridge_q"], pre_motion, atol=2e-3)
+
 
 # ----------------------------------------------------------------------
 # one lost reply must not trip the watchdog (re-review medium)

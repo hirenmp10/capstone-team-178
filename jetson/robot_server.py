@@ -2663,7 +2663,7 @@ class RobotServer:
 
     # -- endpoints ----------------------------------------------------------
 
-    def state(self) -> dict[str, Any]:
+    def state(self, probe: bool = True) -> dict[str, Any]:
         """The ``get_state`` reply: commanded values, never measured ones.
 
         ``attached`` is whether the servos are being pulsed. Drivers that can
@@ -2681,15 +2681,25 @@ class RobotServer:
         every bridge reset until the first attach; ``detach_count`` /
         ``last_detach_reason`` count every detach so a client can notice one
         it did not ask for.
+
+        ``probe=False`` skips the bridge query and answers from the server's
+        own belief only. The estop reply uses it: a dead or out-of-step Uno
+        costs a reply timeout (plus a failed sync) per ``?``, and the estop
+        reply must not wait on the wire once its ``D`` attempts are over.
+        ``bridge_q`` / ``bridge_gripper_width`` are then ``None`` ("cannot
+        tell"), never the last probe on record: nothing refreshes that probe
+        after a motion, so it can be a whole trajectory old. ``bridge_probed``
+        says which kind of reply this is.
         """
-        self._reconcile_attach_state()
+        if probe:
+            self._reconcile_attach_state()
         q, width = self.driver.read_commanded()
         bridge_q: list[float] | None = None
         bridge_width: float | None = None
         known = self.driver.position_known
-        probe = self._last_probe
-        if probe is not None and known:
-            pulses, _attached = probe
+        last_probe = self._last_probe if probe else None
+        if last_probe is not None and known:
+            pulses, _attached = last_probe
             bridge_q = [float(v) for v in self.calibration.pulses_to_q(pulses[:_N_ARM])]
             bridge_width = float(self.calibration.us_to_width(pulses[_N_ARM]))
         return {
@@ -2701,6 +2711,7 @@ class RobotServer:
             "bridge_q": bridge_q,
             "bridge_gripper_width": bridge_width,
             "bridge_position_known": bool(known),
+            "bridge_probed": bool(probe),
             "detach_count": int(self.driver.detach_count),
             "last_detach_reason": self.driver.last_detach_reason,
             "host_timeout_s": float(self.host_timeout_s),
@@ -2905,7 +2916,10 @@ class RobotServer:
             _log.warning("ESTOP: servos detached; motion refused until clear_estop")
         else:
             _log.error("ESTOP: %s", detach_error)
-        state = self.state()
+        # Cached/commanded state only: no ``?`` after the D attempts, so a dead
+        # or out-of-step Uno cannot delay the reply by further timeouts.
+        # ``attached`` is already False (detach() lowers it before the wire).
+        state = self.state(probe=False)
         state["detach_error"] = detach_error
         return state
 

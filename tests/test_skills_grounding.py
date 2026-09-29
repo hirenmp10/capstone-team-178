@@ -16,6 +16,7 @@ height (re-review, gv/probe2.py).
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from typing import Any
@@ -278,12 +279,31 @@ class TestALookAgainBeforeRefusing:
 # ----------------------------------------------------------------------
 
 
+#: Every hardware-lane module ``failing_lane`` imports; each is skipped on when absent.
+HARDWARE_LANE_MODULES = (
+    "jetson.robot_server",
+    "jetson.detector_service",
+    "mfw.hardware.kinematics",
+    "tests.test_hardware_e2e",
+)
+
+
 @pytest.fixture
 def failing_lane(tmp_path):
     """The e2e fake lane whose detector raises once, on the first observe after the lift."""
-    # The simulation-only checkout omits the hardware lane; skip rather than error.
-    pytest.importorskip("jetson.robot_server", reason="hardware lane (jetson/) is not in this checkout")
-    pytest.importorskip("mfw.hardware.kinematics", reason="hardware lane (mfw/hardware) is not in this checkout")
+    # The simulation-only checkout omits the hardware lane, and a partial one
+    # (a teammate branch with only some hardware modules) may lack any of the
+    # four modules imported below; skip rather than error, as
+    # HARDWARE_LANE_PRESENT does in tests/test_place_logic.py.
+    for module in HARDWARE_LANE_MODULES:
+        try:
+            importlib.import_module(module)
+        except ModuleNotFoundError as exc:
+            # Name the module that is actually missing: a present module
+            # whose own dependency is absent must not be reported as absent.
+            missing = exc.name or module
+            needed_by = "" if missing == module else f" (needed by {module})"
+            pytest.skip(f"hardware lane module {missing} is not in this checkout{needed_by}")
     from jetson.detector_service import DetectorServer, ScriptedDetector, SyntheticPinhole
     from jetson.robot_server import FakeDriver, RobotServer, ServoCalibration
     from mfw.config.schema import load_config
@@ -353,3 +373,91 @@ class TestUnverifiedPickGuard:
         assert held is None  # unverified: memory does not claim a hold
         assert [e for e in events if e.get("event") == "pick.verification_error"]
         assert released.ok and world.attached is None
+
+
+class TestFailingLaneOnAPartialCheckout:
+    """A teammate branch with only some hardware modules must skip the F3
+    guard, not error. The fixture guarded two of its four imports, and
+    ``tests/test_place_logic.py`` (imported at the top of this file) imported
+    the e2e lane whenever the ``jetson`` and ``mfw.hardware`` packages
+    existed, so this whole file failed collection."""
+
+    @pytest.mark.parametrize(
+        ("missing", "reason"),
+        [
+            ("jetson.detector_service", "hardware lane module jetson.detector_service is not in this checkout"),
+            ("tests.test_hardware_e2e", "hardware lane module tests.test_hardware_e2e is not in this checkout"),
+            # test_hardware_e2e IS present; only its dependency is missing, and
+            # the reason must say so rather than blame the e2e file.
+            ("mfw.hardware.remote_arm",
+             "hardware lane module mfw.hardware.remote_arm is not in this checkout "
+             "(needed by tests.test_hardware_e2e)"),
+        ],
+    )
+    def test_a_missing_hardware_module_skips_the_guard(self, missing, reason):
+        import subprocess
+        import sys
+
+        repo = Path(__file__).resolve().parents[1]
+        node = "tests/test_skills_grounding.py::TestUnverifiedPickGuard"
+        # ``None`` in sys.modules makes ``import missing`` raise
+        # ModuleNotFoundError, as when the file is absent from the checkout.
+        code = (
+            "import sys\n"
+            f"sys.modules[{missing!r}] = None\n"
+            "import pytest\n"
+            f"sys.exit(pytest.main([{node!r}, '-q', '-rs', '-p', 'no:cacheprovider']))\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], cwd=repo, capture_output=True,
+                                text=True, timeout=180)
+        out = result.stdout + result.stderr
+        assert result.returncode == 0, out
+        assert "1 skipped" in out and "passed" not in out and "error" not in out.lower(), out
+        assert reason in " ".join(out.split()), out
+
+    def test_the_place_logic_simulation_tests_still_run_without_the_e2e_lane(self):
+        import subprocess
+        import sys
+
+        repo = Path(__file__).resolve().parents[1]
+        code = (
+            "import sys\n"
+            "sys.modules['jetson.detector_service'] = None\n"
+            "import pytest\n"
+            "sys.exit(pytest.main(['tests/test_place_logic.py', '-q', '-rs', '-p', 'no:cacheprovider',\n"
+            "                      '-k', 'TestHardwareFakeLane or test_in_the_bowl_succeeds_inside_the_footprint']))\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], cwd=repo, capture_output=True,
+                                text=True, timeout=180)
+        out = result.stdout + result.stderr
+        assert result.returncode == 0, out
+        assert "1 passed" in out and "skipped" in out and "error" not in out.lower(), out
+        assert "hardware lane is incomplete in this checkout" in out, out
+
+    def test_a_broken_but_present_e2e_lane_still_fails_collection(self):
+        """Only a MISSING module skips. A plain ImportError -- the module is
+        there but broken, or lacks a symbol -- must fail collection of
+        tests/test_place_logic.py instead of quietly skipping its hardware
+        lane, the same way it fails the fixture guard above."""
+        import subprocess
+        import sys
+
+        repo = Path(__file__).resolve().parents[1]
+        code = (
+            "import sys\n"
+            "class Broken:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'tests.test_hardware_e2e':\n"
+            "            raise ImportError(\"cannot import name 'lane_factory' (probe)\")\n"
+            "        return None\n"
+            # --assert=plain: pytest's rewrite hook would otherwise sit
+            # ahead of this finder and load test modules itself.
+            "sys.meta_path.insert(0, Broken())\n"
+            "import pytest\n"
+            "sys.exit(pytest.main(['tests/test_place_logic.py', '-q', '--collect-only', '--assert=plain', '-p', 'no:cacheprovider']))\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], cwd=repo, capture_output=True,
+                                text=True, timeout=180)
+        out = result.stdout + result.stderr
+        assert result.returncode != 0, out
+        assert "cannot import name 'lane_factory' (probe)" in out, out
