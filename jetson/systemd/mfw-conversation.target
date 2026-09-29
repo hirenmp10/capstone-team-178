@@ -1,0 +1,31 @@
+# Conversation mode (docs/JETSON_MODELS_PLAN.md, Mode C): the robot server +
+# Qwen2.5-3B (llama-server + shim) + Canary speech + Florence detector, all
+# resident. Models load one at a time in the order llama-server -> speech ->
+# detector (each unit's After= plus an ExecStartPost readiness wait), each
+# after a page-cache drop and memory compaction.
+#
+#   sudo scripts/jetson_mode.sh install        # once: units -> /etc/systemd/system
+#   sudo scripts/jetson_mode.sh conversation   # start this mode
+#   sudo scripts/jetson_mode.sh build          # stop everything (nothing resident)
+#   scripts/jetson_mode.sh status
+#
+# Never load/unload models per command: switch modes, or reboot after any
+# NvMap error 12 / cudaMalloc out-of-memory.
+
+#
+# Deliberately NOT started at boot (no [Install] section): the first `home`
+# after robot_server starts (sent by run_assistant --hardware when it connects,
+# after its FIRST HOME prompt, or pre-confirmed with --home-confirmed) attaches
+# every servo AT home at full speed, so a person hand-poses the arm at home and
+# stands at the E-stop for it.
+
+[Unit]
+Description=mfw conversation mode (robot + Qwen + Canary + Florence)
+Wants=mfw-robot.service mfw-llama.service mfw-llm-shim.service mfw-speech.service mfw-detector.service
+# After= the services too, so `systemctl start mfw-conversation.target`
+# returns only once every one of them is up (each ExecStartPost waited
+# for its model). Wants= means a failed service does not fail the target:
+# jetson_mode.sh checks each unit itself.
+After=network-online.target mfw-robot.service mfw-llama.service mfw-llm-shim.service mfw-speech.service mfw-detector.service
+Conflicts=mfw-build.target
+AllowIsolate=no

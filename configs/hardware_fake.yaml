@@ -1,0 +1,45 @@
+# Hardware lane against in-process fakes: loopback robot_server --driver fake,
+# detector_service --backend scripted, and a virtual clock. This is the config
+# the day-0 end-to-end test and `run_assistant.py --fake-hardware` load, and
+# the one to run before every push.
+#
+# Everything not restated comes from hardware.yaml, so the fake lane exercises
+# the same geometry, limits and thresholds the real arm will.
+#
+extends: hardware.yaml
+
+hardware:
+  jetson_host: 127.0.0.1
+  detector_host: 127.0.0.1
+  # WallClock advances virtually: a 2 s trajectory takes no wall time.
+  fake_clock: true
+  arm_bridge: fake
+  # The scripted detector invents no phantoms, so the fake lane may ask for
+  # every object it can script (its out-of-reach cube included). The real
+  # camera's list in hardware.yaml is the demo table only.
+  labels: [marker, cube, ball, banana, block, bowl, bin, box]
+
+exterior_camera:
+  # The scripted detector's SyntheticPinhole (jetson/detector_service.py):
+  # 1920x1080, f = 1400 px, an oblique overhead view from behind the base.
+  # Pose and intrinsics are informational (the homography does the work) but
+  # `position` feeds the bottom-centre anchor correction, so it must match.
+  resolution: [1920, 1080]
+  fx: 1400.0
+  fy: 1400.0
+  cx: 960.0
+  cy: 540.0
+  position: [-0.10, 0.0, 0.60]
+  look_at: [0.18, 0.0, 0.0]
+  up: [0.0, 0.0, 1.0]
+  # The synthetic camera's pose and intrinsics ARE exact (they generated the
+  # scripted pixels), so the pinhole anchor refinement and the lift-prediction
+  # grasp evidence may run. hardware.yaml keeps this false until measured.
+  pose_measured: true
+  # Exact pixel -> table map of that camera, row-major 3x3, as printed by
+  #   py -3.12 jetson/detector_service.py --backend scripted --print-homography
+  # Regenerate if SyntheticPinhole's defaults change; a stale matrix here puts
+  # every scripted object at a plausible wrong place.
+  homography: [-0.0, -0.0005632984901277583, 0.5236933797909408,
+               -0.0005767576779528519, 3.201648268462986e-20, 0.553687370834738,
+               0.0, 0.0004065040650406504, 1.0]

@@ -1,0 +1,285 @@
+# Hardware lane: the Techno-Tirupati 4-DOF hobby arm driven through a Jetson
+# Orin Nano, with an overhead USB webcam and no depth.
+#
+# Inherits configs/default.yaml and restates only what differs, so physics,
+# logging, memory and the language stack stay in exactly one place. Keys the
+# sim lane needs (usd_subpath, prim paths, PhysX) are inherited and ignored --
+# nothing here boots Isaac.
+#
+# Every value tagged MEASURE is a placeholder that must be replaced on the
+# assembled arm before a real pick is attempted. The placeholders are
+# self-consistent (the fake lane runs on them) but they are not the arm.
+#
+# Run with:
+#   py -3.12 scripts/run_assistant.py --config configs/hardware.yaml --hardware
+#
+extends: default.yaml
+
+backend: hardware
+
+robot:
+  name: planar_arm
+  # Closed-form planar model in mfw/hardware/kinematics.py; Lula is not
+  # available (no URDF, no Isaac) and would not fit a 4-DOF arm anyway.
+  kinematics: planar_4dof
+  # Joint order is load-bearing: it is the order of the Uno's P/T frames and
+  # of hardware.arm.joint_lower/upper. Do not reorder.
+  arm_joint_names: [base_yaw, shoulder_pitch, elbow_pitch, wrist_pitch]
+  finger_joint_names: [gripper]
+  # MEASURE (Gowtham): a tucked, servo-friendly rest posture, radians, once the
+  # kinematics sign convention is frozen. Must lie inside hardware.arm limits
+  # and equal home_q in jetson/robot_config.yaml. Placeholder: upper arm
+  # vertical, forearm folded 35 deg back, jaws up-and-back (TCP ~10 cm behind
+  # the base, out of the overhead camera's workspace) = 1500/1500/1150/1600 us,
+  # well inside the pulse map (the old elbow -90 deg sat at the 600 us
+  # extreme). S5 end-stop measurements replace it.
+  home_joint_positions: [0.0, 0.0, -0.6109, 0.1745]
+  tcp_parent_prim: wrist_pitch
+  # Wrist axis to jaw midpoint. Must equal hardware.arm.tool. MEASURE.
+  tcp_offset_from_hand: [0.0, 0.0, 0.09]
+  # MEASURE: jaw span fully open, metres. 45 mm is the kit's nominal.
+  gripper_open_width: 0.045
+  gripper_closed_width: 0.0
+  # PWM servos have no position readback, so a closed command is not evidence
+  # of a grasp. Skills switch to perception-based verification.
+  gripper_feedback: false
+
+# One camera, overhead, fixed. No wrist camera exists on this arm.
+wrist_camera:
+  enabled: false
+
+exterior_camera:
+  name: exterior_camera
+  enabled: true
+  # Device on the host that owns the USB port (the Jetson); informational here.
+  source: /dev/video0
+  resolution: [640, 480]
+  # MEASURE (scripts/calibrate_camera.py intrinsics: >= 15 still checkerboard
+  # views, cv2.calibrateCamera, refused above 1.0 px RMS): pixel intrinsics of
+  # the real webcam at THIS resolution. Placeholders are a typical C270-class
+  # lens at 640x480. Leaving fx at 0 would derive intrinsics from Isaac's mm
+  # apertures, which mean nothing for a webcam.
+  fx: 600.0
+  fy: 600.0
+  cx: 320.0
+  cy: 240.0
+  # MEASURE (same step): OpenCV (k1, k2, p1, p2[, k3]); [] = ideal pinhole.
+  distortion: []
+  # Written by that step: its RMS reprojection error, px. 0 = not measured,
+  # and `calibrate_camera.py pose` then refuses to set pose_measured.
+  intrinsics_rms_px: 0.0
+  # MEASURE (scripts/calibrate_camera.py pose, or scripts/calibrate_table.py
+  # --touch): row-major 3x3 raw-pixel -> table (x, y) map. Empty is valid for
+  # loading but HardwareRuntime refuses to build with it -- an uncalibrated
+  # homography puts every object at a plausible wrong place, which is worse
+  # than a refusal.
+  homography: []
+  # MEASURE: where the camera sits and what it looks at, robot base frame. The
+  # homography does the positioning, but this orientation is NOT decorative:
+  # look_at/up always set which way "up the image" points on the table, i.e.
+  # the direction of the first-order near-face step (a wrong `up` moves every
+  # tall object by half its depth). With pose_measured: true, position/look_at
+  # and fx/fy/cx/cy also drive the pinhole anchor refinement and the
+  # lift prediction that confirms a carry (review GEO-2).
+  # `up` is +X (not +Z) because a nadir view makes +Z parallel to the view ray.
+  position: [0.18, 0.0, 0.60]
+  look_at: [0.18, 0.0, 0.0]
+  up: [1.0, 0.0, 0.0]
+  # MEASURE: set true only once fx/fy/cx/cy come from a checkerboard and
+  # position/look_at/up from a tape measure or a PnP fit -- i.e. run
+  # `scripts/calibrate_camera.py intrinsics` then `pose --touch` (or --origin/
+  # --yaw), which write all of it and set this; verify with its `check`.
+  # False disables the pinhole anchor refinement and the lift-prediction grasp evidence: against
+  # an exact homography a placeholder pose 10 cm off made every estimate
+  # ~100 mm wrong, worse than not refining at all.
+  # CONSEQUENCE while false: the feedback-less grasp verdict is never
+  # "carried" (mfw/physics/contact.py) -- bbox growth alone is what a spun
+  # marker, detector jitter or a box that takes in the fingers also produce
+  # (re-review). Every pick then ends "cannot confirm the grasp" with the jaw
+  # left closed for a person to check. Measure the pose to get "carried".
+  pose_measured: false
+  enable_depth: false
+  enable_segmentation: false
+
+perception:
+  # No renderer to warm up.
+  render_frames_before_capture: 0
+  # Steps here are wall-clock ticks at physics_dt (120 Hz): 7200 = one minute.
+  # A track must outlive a full pick, or the target vanishes mid-motion.
+  track_max_age_steps: 7200
+  ground_plane_z: 0.0
+
+grasp:
+  # The standoff view is the same overhead view that produced the estimate;
+  # re-observing from it buys nothing and costs a round trip.
+  recentre_from_standoff: false
+  # Short reach means short approaches.
+  approach_offset: 0.05
+  lift_height: 0.06
+  # Jaw is 45 mm open; leave finger_width_margin (10 mm) of clearance. The
+  # inherited 78 mm ceiling would accept objects the jaws cannot span.
+  max_grasp_width: 0.035
+  # Metres a NON-rising object must slide on the table to be labelled
+  # 'knocked' rather than 'resting'. It is not evidence of a carry: a lifted
+  # object shifts only 7-29 mm by parallax (review F1), so a carry is judged
+  # from pixel growth and the lift prediction (mfw/physics/contact.py).
+  # MEASURE against your camera's XY noise.
+  verify_min_displacement: 0.03
+
+motion:
+  # Straight-line joint interpolation via a transit height; there is no
+  # collision world on the hardware lane.
+  planner: joint_space
+  # Conservative for PLA links. MEASURE: raise once the arm does not ring.
+  max_joint_velocity: 1.0
+
+scene:
+  add_table: false
+  add_ground_plane: false
+  # Nothing is spawned: on hardware the objects are whatever perception sees.
+  objects: []
+  # Reachable box in the robot base frame, metres. MEASURE with the arm: the
+  # -5 mm z floor lets the TCP touch the table for the --touch calibration.
+  workspace_min: [0.06, -0.24, -0.005]
+  workspace_max: [0.30, 0.24, 0.20]
+  # MEASURE: upper_arm + forearm + tool minus a few cm of orientation slack.
+  robot_reach_m: 0.28
+  # MEASURE: closest the jaws can reach without the elbow fouling the base.
+  # With the +-90 deg placeholder elbow a top-down grasp needs r >= ~0.145 m
+  # (see hardware.arm below); workspace_min stays at 0.06 so perception still
+  # reports nearer objects -- the planner then refuses them by name.
+  robot_min_reach_m: 0.14
+  robot_base: [0.0, 0.0, 0.0]
+
+hardware:
+  # Jetson static IP (set in the day-1 checklist). Both services live there
+  # once Stages 1-2 pass; point detector_host at the laptop to fall back to
+  # Florence-2 without touching code.
+  jetson_host: 192.168.1.50
+  jetson_port: 5560
+  detector_host: 192.168.1.50
+  detector_port: 5558
+  # uno_serial (genuine Uno R3/R4 over USB-CDC) | pca9685 (I2C, for a CH340
+  # clone JetPack 6 cannot enumerate) | fake (tests).
+  arm_bridge: uno_serial
+  request_timeout_s: 5.0
+  trajectory_timeout_margin_s: 5.0
+  trajectory_chunk_s: 1.0
+  # 24 ticks at 120 Hz = 200 ms for the PLA links to stop ringing before a
+  # frame is trusted. MEASURE: shorten if frames are already sharp.
+  settle_steps_after_motion: 24
+  fake_clock: false
+
+  arm:
+    # MEASURE (Gowtham, calipers on the assembled arm), metres. Placeholders
+    # match HardwareArmConfig defaults and sum to ~29.5 cm of reach.
+    base_height: 0.07        # table plane -> shoulder axis
+    shoulder_offset: 0.0     # shoulder axis horizontal offset from yaw axis
+    upper_arm: 0.105         # shoulder axis -> elbow axis
+    forearm: 0.10            # elbow axis -> wrist axis
+    tool: 0.09               # wrist axis -> jaw midpoint (== robot.tcp_offset_from_hand z)
+    # MEASURE (scripts/calibrate_servos.py): kinematic limits in radians, joint
+    # order (base_yaw, shoulder, elbow, wrist). Servo pulse end-stops are a
+    # separate table on the Jetson (jetson/robot_config.yaml).
+    #
+    # ELBOW RANGE DECISION (review GEO-1 / HS-2): the elbow is +-1.5708
+    # (+-90 deg) because that is ALL the placeholder pulse map (600..2400 us
+    # over -90..+90 deg) can command. It used to say +-120 deg; a 180-degree
+    # servo cannot span 240 degrees whatever its zero offset, the Jetson
+    # clamped the pulse silently, and a top-down grasp at r = 0.10 m closed
+    # the jaw 88 mm from the object. Sign convention (mfw/hardware/kinematics.py):
+    # positive elbow folds the forearm forward/down (elbow-up grasps), negative
+    # folds it back over the shoulder (the placeholder home uses -35 deg).
+    # Consequence on the placeholder arm: top-down grasps reach only about
+    # 0.145-0.20 m out at table level, 75-degree ones 0.17-0.225 m, 60-degree
+    # ones 0.19-0.245 m; nearer objects are REFUSED ("unreachable"), never
+    # executed wrong. A real hobby elbow folds far one way and barely
+    # hyperextends: once S5 measures it, place its 180-degree window with
+    # calibrate_servos.py (zero_offset / angle_at_min/max, e.g. -30..+150 deg),
+    # then copy the SAME limits here, into jetson/robot_config.yaml, and move
+    # robot.home_joint_positions / home_q inside them. HardwareRuntime refuses
+    # to build when these limits are wider than the Jetson's pulse map.
+    joint_lower: [-1.5708, -0.5236, -1.5708, -1.5708]
+    joint_upper: [1.5708, 1.5708, 1.5708, 1.5708]
+    elbow_up: true
+    # tangential | radial -- which way the fixed jaws close relative to the
+    # base->object ray. Set by how the gripper is bolted on. MEASURE (look).
+    jaw_axis: tangential
+    # Floor of the per-plan transit height, metres (review GEO-4). The planner
+    # raises it per plan to the tallest perceived obstacle + 2 cm inflation
+    # + the held object's half-height + 16 mm tilted-finger dip; 0.15 clears
+    # the 0.10 m bin below with a small held object. Reach at 0.15 m on the
+    # placeholder arm: 0.10-0.20 m out with the tool tilted 45 deg, so a
+    # transit starting or ending outside that band is refused, not crossed low.
+    transit_height: 0.15
+
+  # Per-label (x, y, z) extents, metres, standing in for depth. z sets the
+  # grasp height, the jaw-axis extent sets the grasp width. MEASURE each real
+  # demo object with a ruler and write its numbers here.
+  #
+  # MVP demo objects (existing hobby arm): everything picked is <= 35 mm
+  # across the jaw (grasp.max_grasp_width) and <= 50 g (MG90S gripper,
+  # MG996R elbow on PLA links). Long things (marker, banana, block) are
+  # picked across their narrow side, so lay them pointing at the base or
+  # across it -- a diagonal one is refused ("which way ... lying"). The
+  # destinations (bowl, bin, box) are placed INTO/ONTO, never picked. Place
+  # everything 14-20 cm from the base: that is where top-down grasps reach on
+  # the placeholder geometry (see hardware.arm above). Avoid naming anything
+  # "can": the speech model hears "kin".
+  object_sizes:
+    marker: [0.140, 0.019, 0.019]   # whiteboard marker, lying down
+    # The 50 mm foam cube on the shopping list: too wide for the 45 mm jaw,
+    # so a pick is REFUSED by name. Kept at 50 mm because the scripted
+    # detector's DEFAULT_FOOTPRINTS (jetson/detector_service.py) mirrors this
+    # table; change both together (to 0.030 for a 30 mm cube) or use the ball.
+    cube:   [0.050, 0.050, 0.050]
+    ball:   [0.030, 0.030, 0.030]   # 30 mm foam ball (a 40 mm ping-pong ball is too wide)
+    banana: [0.120, 0.030, 0.030]   # toy banana, <= 30 mm thick (a real one is too wide)
+    block:  [0.060, 0.025, 0.025]   # 60 x 25 x 25 mm wooden block
+    bowl:   [0.150, 0.150, 0.060]   # destination
+    bin:    [0.180, 0.120, 0.100]   # destination
+    box:    [0.100, 0.070, 0.050]   # destination (placed on)
+  default_object_size: [0.04, 0.04, 0.04]
+  # Detector vocabulary sent on every observe. Synonyms are the detector
+  # service's business; these are the canonical names skills resolve to.
+  # REAL CAMERA: list ONLY the objects actually on the table. Florence-2 draws
+  # a box for every label it is asked for, present or not (sim renders, voted
+  # service: the old 8-label list [marker, cube, ball, banana, block, bowl,
+  # bin, box] found 17/60 objects with 4 phantoms; only the objects on the
+  # table found 36/42 with 2. In raw single-frame output "ball" alone made
+  # 8-12 phantoms per 6 images; the frame vote removed those). Shipped: the
+  # demo table (marker + block to pick, bowl + box as destinations). Add a
+  # label only when that object is on the table. The fake lane keeps the
+  # 8-label list in hardware_fake.yaml (its scripted out-of-reach cube).
+  # Colour prompts per label go in the detector's --label-config.
+  labels: [marker, block, bowl, box]
+
+  # "Scan the room" (mfw.skills.primitives.FixedCameraScan): the fixed
+  # overhead camera already sees the table, so the scan looks `frames` times
+  # (an object counts when seen in >= min_frames of them), then turns the
+  # base slowly toward what it found and back home, and reports it with
+  # directions. MEASURE: lower sweep_speed_rad_s if the MG996R base jerks.
+  scan:
+    frames: 3
+    min_frames: 2
+    frame_gap_s: 0.15
+    sweep_speed_rad_s: 0.35
+    max_sweep_rad: 1.0
+    min_sweep_rad: 0.35
+    dwell_s: 0.6
+    max_stops: 4
+  # What `run_assistant.py --hardware --demo` says, in order. Empty = the
+  # script's built-in HARDWARE_DEMO_SCRIPT (the same five commands).
+  demo_script:
+    - scan the room
+    - what do you see
+    - pick up the marker
+    - put it in the bowl
+    - go home
+  detection_min_score: 0.1
+  # bottom_center: where the object meets the table (camera not perfectly
+  # overhead). center: for a truly nadir view.
+  pixel_anchor: bottom_center
+  workspace_margin_xy: 0.03
+  # Approach pitches, degrees from horizontal, most vertical first.
+  grasp_pitch_angles_deg: [90, 75, 60]

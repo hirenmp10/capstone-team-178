@@ -1,0 +1,171 @@
+# Servo calibration for jetson/robot_server.py (ServoCalibration.from_dict).
+#
+# This file lives ON THE JETSON, next to the arm, and is edited by
+# scripts/calibrate_servos.py over the ZMQ `set_calibration` endpoint (the
+# server rewrites it atomically). Hand edits are fine too. The pulse maps,
+# zero offsets and gripper points live only here (the laptop speaks radians
+# and metres), BUT limit_lower/upper_rad and home_q are mirrored in the
+# laptop's configs/hardware.yaml (hardware.arm.joint_lower/upper,
+# robot.home_joint_positions) and MUST stay equal: change both files
+# together. The laptop refuses to build when its limits are wider than this
+# map can reach, and warns when they are narrower.
+#
+# Every value below is a PLACEHOLDER sized to the kit. Replace it during smoke
+# test S5 / calibration: record each joint's mechanical end-stop pulse, then
+# tighten pulse_min_us/pulse_max_us in BOTH this file and MIN_US/MAX_US in
+# jetson/arduino/servo_bridge/servo_bridge.ino (the sketch clamps too).
+#
+# `measured` says whether that has happened. With measured: false a REAL
+# driver (--driver uno / pca9685) refuses to start. For the FIRST bench
+# bring-up only, --allow-placeholder-calibration starts anyway and keeps every
+# pulse inside 1000..2000 us (--placeholder-band-us), caps the joint speed at
+# 0.35 rad/s and slows re-attach/home. After S5 + calibrate_servos.py, the
+# REPL's `measured yes` then `save` writes measured: true here.
+
+# PLACEHOLDER until smoke test S5 + calibrate_servos.py; see above.
+measured: false
+#
+# Conventions
+#   * Joint order on the wire is fixed: base_yaw, shoulder_pitch, elbow_pitch,
+#     wrist_pitch, gripper -> Uno D3, D5, D6, D9, D10 (or PCA9685 ch 0-4).
+#   * A servo's own angle is linear in pulse width between
+#     (pulse_min_us, angle_at_min_deg) and (pulse_max_us, angle_at_max_deg).
+#   * The JOINT angle the planner uses is
+#         q = direction * (servo_rad - zero_offset_rad)
+#     zero_offset_rad = servo angle at which the joint reads 0 (calibrate_servos
+#     `zero <joint>`), direction = -1 for a mirror-mounted servo.
+#   * limit_lower_rad / limit_upper_rad are joint-space limits enforced on every
+#     command. Keep them equal to hardware.arm.joint_lower/joint_upper in
+#     configs/hardware.yaml or the laptop will plan poses the Jetson clamps.
+#   * PULSE-MAP RULE: both limits must map INSIDE pulse_min_us..pulse_max_us
+#     after direction/zero_offset, and that range must sit inside the sketch's
+#     MIN_US/MAX_US (600..2400 arm, 900..2100 gripper). A 180-degree servo
+#     cannot span a wider kinematic range whatever the offset; the Uno would
+#     clamp the pulse silently and answer OK (the elbow used to say +-120 deg
+#     here and a top-down grasp at 10 cm closed the jaw 88 mm from the
+#     object). The server refuses to load a file that breaks this rule.
+
+joints:
+  base_yaw:
+    pulse_min_us: 600
+    pulse_max_us: 2400
+    angle_at_min_deg: -90.0
+    angle_at_max_deg: 90.0
+    zero_offset_rad: 0.0
+    direction: 1
+    limit_lower_rad: -1.5708
+    limit_upper_rad: 1.5708
+  shoulder_pitch:
+    pulse_min_us: 600
+    pulse_max_us: 2400
+    angle_at_min_deg: -90.0
+    angle_at_max_deg: 90.0
+    zero_offset_rad: 0.0
+    direction: 1
+    limit_lower_rad: -0.5236
+    limit_upper_rad: 1.5708
+  elbow_pitch:
+    pulse_min_us: 600
+    pulse_max_us: 2400
+    angle_at_min_deg: -90.0
+    angle_at_max_deg: 90.0
+    zero_offset_rad: 0.0
+    direction: 1
+    # +-90 deg: all a 600..2400 us map reaches (see the pulse-map rule above).
+    # Top-down grasps closer than ~14.5 cm (table level) need more elbow than
+    # this and are now refused by the planner instead of executed wrong. Must
+    # equal hardware.arm.joint_lower/upper[2] in configs/hardware.yaml (the
+    # laptop refuses to build when its limits are wider than this map). After
+    # S5, place the servo's 180-degree window where the elbow really moves
+    # (it folds far one way, barely hyperextends: e.g. angle_at_min_deg -30,
+    # angle_at_max_deg 150) and move both limit pairs and home_q with it.
+    limit_lower_rad: -1.5708
+    limit_upper_rad: 1.5708
+  wrist_pitch:
+    pulse_min_us: 600
+    pulse_max_us: 2400
+    angle_at_min_deg: -90.0
+    angle_at_max_deg: 90.0
+    zero_offset_rad: 0.0
+    direction: 1
+    limit_lower_rad: -1.5708
+    limit_upper_rad: 1.5708
+
+# Two measured points: the pulse at which the jaws are fully open / closed and
+# the jaw opening (metres) at each. width_open_m == robot.gripper_open_width.
+gripper:
+  pulse_open_us: 1000
+  pulse_closed_us: 1900
+  width_open_m: 0.045
+  width_closed_m: 0.0
+
+# Servo channel per name. Uno: index into the P frame (fixed by the pin table,
+# leave as is). PCA9685: the board channel the servo is plugged into.
+channels:
+  base_yaw: 0
+  shoulder_pitch: 1
+  elbow_pitch: 2
+  wrist_pitch: 3
+  gripper: 4
+
+# Rest pose reached by `home`, radians, joint order as above. Must equal
+# robot.home_joint_positions in configs/hardware.yaml. PLACEHOLDER: upper arm
+# vertical, forearm folded 35 deg back, jaws up-and-back (TCP ~10 cm behind
+# the base, ~34 cm high, out of the camera's workspace) = 1500/1500/1150/1600
+# us on the placeholder map -- well inside every pulse extreme and inside the
+# 1000..2000 us placeholder band. It used to put the
+# elbow at -90 deg = 600 us, exactly the pulse extreme, which on a real
+# MG996R may sit at or past the end-stop and stall at every boot. Smoke test
+# S5 end-stop measurements replace it (calibrate_servos.py `home set`).
+# The server refuses a home with any link below the table (planar FK with
+# --arm-geometry): home is driven to at every boot with no planner in the loop.
+home_q: [0.0, 0.0, -0.6109, 0.1745]
+
+# Ticks per second at which follow_trajectory streams P frames to the Uno
+# (its servo frame is 20 ms, so 50 is the ceiling that changes anything).
+control_rate_hz: 50.0
+# rad/s. A trajectory that would exceed this on any joint is stretched in
+# time, never truncated. Conservative for PLA linkages; raise after the
+# 2-minute sweep (smoke S6) runs clean.
+max_joint_velocity: 1.2
+
+# Slow re-attach. After any detach (estop, torque off, the Uno's watchdog,
+# serial loss, host timeout) the first motion command re-energises the servos
+# with ONE T frame from the Uno's last pulsed position to the command's target
+# over reattach_s seconds (stretched further if max_joint_velocity demands
+# it), instead of re-attaching at the old pose and streaming a trajectory at
+# once. `home` from the detached state takes home_move_s.
+#
+# NOT AT BOOT. Opening the serial port resets the Uno (DTR), so after every
+# robot_server start -- and any USB reset or brownout -- the bridge knows NO
+# position: its first frame attaches every servo AT that frame's target,
+# instantly, whatever the duration says. The server therefore refuses every
+# motion except `home` until that first attach (get_state reports
+# bridge_position_known: false), and boot home is a jump to home_q at full
+# speed. Hand-pose the arm at home_q before every server start.
+reattach_s: 1.0
+home_move_s: 2.5
+
+# Host-liveness bound. With no request from any client for this many seconds
+# (laptop crash, Wi-Fi loss, a frozen laptop) and no motion running, the
+# server detaches the servos: the arm goes limp and drops what it holds,
+# rather than squeezing the gripper and pushing whatever it touches for as
+# long as the Jetson runs (the keepalive would otherwise feed the Uno's
+# watchdog forever). The laptop's RemoteArm, calibrate_servos.py and
+# calibrate_table.py --touch send a get_state heartbeat every second while
+# alive, so a person thinking at a prompt is not a dead laptop. 0 disables it
+# -- never do that with the arm powered, and never with the PCA9685 (it has
+# no watchdog of its own; the server refuses that combination).
+# `--host-timeout-s` overrides it.
+host_timeout_s: 5.0
+
+# Overhead webcam served by get_frame. robot_server.py is the ONLY process that
+# opens it (camera on by default; --require-camera makes a failed open fatal);
+# the detector, calibrate_table.py and the laptop take frames via get_frame,
+# which carries t_capture / age_s / seq and refuses frames older than 1 s.
+camera:
+  device: /dev/video0
+  width: 640
+  height: 480
+  fps: 30
+  jpeg_quality: 85

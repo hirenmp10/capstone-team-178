@@ -344,3 +344,443 @@ def test_help_runs_without_isaac(cli, capsys):
         sys.argv = argv
     assert exc.value.code == 0
     assert "--fake-hardware" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# MVP: hardware demo, "look around" routing, exit status on failure
+# ----------------------------------------------------------------------
+
+
+class TestHardwarePhraseRouting:
+    @pytest.mark.parametrize(
+        "utterance",
+        ["look around", "Look around!", "scan the table", "scan the room", "please look around the room",
+         "can you look around", "have a look around", "scan the table please", "look at the table"],
+    )
+    def test_scan_phrases_route_to_scan_the_room(self, cli, utterance):
+        assert cli.route_hardware_phrase(utterance) == "scan the room"
+
+    @pytest.mark.parametrize(
+        "utterance",
+        ["pick up the marker", "look at the marker", "what do you see", "look around and pick up the marker",
+         "scan the marker", "go home", ""],
+    )
+    def test_everything_else_is_untouched(self, cli, utterance):
+        assert cli.route_hardware_phrase(utterance) == utterance
+
+    def test_the_rule_parser_now_reaches_scan_scene(self, cli):
+        from mfw.language.intent_parser import RuleBasedIntentParser
+
+        parser = RuleBasedIntentParser()
+        for phrase in ("look around", "scan the table", "scan the room"):
+            assert parser.parse(cli.route_hardware_phrase(phrase))["skill"] == "scan_scene", phrase
+
+    def test_routed_applies_per_clause(self, cli):
+        ran: list[str] = []
+        clauses_of, run_clause = cli.route_clauses(expand_clauses, lambda c: (ran.append(c), _outcome(c, "x", True, "ok"))[1])
+        report = cli.run_command("look around and then pick up the marker", clauses_of, run_clause)
+        assert ran == ["scan the room", "pick up the marker"]
+        assert report.ok
+
+
+def _report(cli, utterance: str, ok: bool, message: str = ""):
+    return cli.CommandReport(utterance, [(utterance, _outcome(utterance, "x", ok, message or utterance))])
+
+
+class TestScriptedRunExitStatus:
+    def test_stops_at_the_first_failure_by_default(self, cli):
+        results = {"a": True, "b": False, "c": True}
+        ran: list[str] = []
+
+        def run_one(u):
+            ran.append(u)
+            return _report(cli, u, results[u], "ObjectNotFound: no marker" if not results[u] else "")
+
+        reports, not_run = cli.run_script(["a", "b", "c"], run_one, emit=lambda r: None)
+        assert ran == ["a", "b"] and not_run == ("c",)
+        assert cli.script_exit_code(reports, not_run) == 1
+        text = cli.script_summary(reports, not_run)
+        assert "3 -> 1 ok, 1 failed, 1 not run" in text
+        assert 'first failure: "b" -> ObjectNotFound: no marker' in text
+        assert "--keep-going" in text
+
+    def test_keep_going_runs_everything_and_still_fails(self, cli):
+        ran: list[str] = []
+
+        def run_one(u):
+            ran.append(u)
+            return _report(cli, u, u != "b")
+
+        reports, not_run = cli.run_script(["a", "b", "c"], run_one, keep_going=True, emit=lambda r: None)
+        assert ran == ["a", "b", "c"] and not_run == ()
+        assert cli.script_exit_code(reports, not_run) == 1
+
+    def test_all_ok_is_zero(self, cli):
+        reports, not_run = cli.run_script(["a", "b"], lambda u: _report(cli, u, True), emit=lambda r: None)
+        assert cli.script_exit_code(reports, not_run) == 0
+        assert "2 -> 2 ok, 0 failed, 0 not run" in cli.script_summary(reports, not_run)
+
+    def test_only_the_hardware_lanes_exit_non_zero(self, cli):
+        """Review: the sim lane exited 0 at HEAD whatever its commands did; keep it."""
+        reports, not_run = cli.run_script(["a", "b"], lambda u: _report(cli, u, u != "b"),
+                                          keep_going=True, emit=lambda r: None)
+        assert cli.lane_exit_code(True, reports, not_run) == 1
+        assert cli.lane_exit_code(False, reports, not_run) == 0
+        source = (Path(cli.__file__)).read_text(encoding="utf-8")
+        assert "exit_code = lane_exit_code(hardware_mode, reports, not_run)" in source
+
+
+class _FakeSkills:
+    names = ("go_home", "observe", "pick", "place", "scan_scene")
+
+    def has(self, name: str) -> bool:
+        return name in self.names
+
+
+class _FakeAssistant:
+    """Stands in for mfw.assistant.Assistant in main(): no runtime, no sockets."""
+
+    fail: set[str] = set()
+    ran: list[str] = []
+
+    def __init__(self, config=None, llm_complete=None) -> None:
+        self.runtime = SimpleNamespace(skills=_FakeSkills(), events=SimpleNamespace(path="events.jsonl"))
+        self.closed = False
+
+    def describe(self) -> dict:
+        return {"skills": list(_FakeSkills.names), "backends": ["classical"], "objects": []}
+
+    def clauses(self, utterance: str) -> list:
+        return expand_clauses(utterance)
+
+    def command(self, utterance: str) -> CommandOutcome:
+        _FakeAssistant.ran.append(utterance)
+        return _outcome(utterance, "x", utterance not in _FakeAssistant.fail, "done")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _main(cli, monkeypatch, argv: list[str], fail: set[str] = frozenset()) -> tuple[int, list[str]]:
+    import mfw.assistant
+
+    _FakeAssistant.fail = set(fail)
+    _FakeAssistant.ran = []
+    monkeypatch.setattr(mfw.assistant, "Assistant", _FakeAssistant)
+    monkeypatch.setattr(sys, "argv", ["run_assistant.py", *argv])
+    code = cli.main()
+    return code, list(_FakeAssistant.ran)
+
+
+class TestMainExitStatus:
+    def test_a_failed_command_exits_1_and_stops(self, cli, monkeypatch, restore_sigint, capsys):
+        code, ran = _main(cli, monkeypatch,
+                          ["--hardware", "-c", "pick up the marker", "-c", "put it in the bowl"],
+                          fail={"pick up the marker"})
+        assert code == 1
+        assert ran == ["pick up the marker"]
+        assert "not run  : put it in the bowl" in capsys.readouterr().out
+
+    def test_sim_lane_still_runs_every_command_and_exits_0_as_at_head(self, cli, monkeypatch, restore_sigint,
+                                                                      capsys):
+        # The sim demo always ran all of its commands and exited 0; only the
+        # hardware lane stops at the first failure (a real arm should not keep
+        # moving) and exits 1 (review: the sim lane's behaviour is unchanged).
+        code, ran = _main(cli, monkeypatch, ["-c", "pick up the marker", "-c", "go home"],
+                          fail={"pick up the marker"})
+        assert code == 0
+        assert ran == ["pick up the marker", "go home"]
+        assert "2 -> 1 ok, 1 failed, 0 not run" in capsys.readouterr().out
+
+    def test_keep_going_runs_the_rest_and_still_exits_1(self, cli, monkeypatch, restore_sigint):
+        code, ran = _main(cli, monkeypatch, ["--hardware", "--keep-going", "-c", "pick up the marker", "-c", "go home"],
+                          fail={"pick up the marker"})
+        assert code == 1 and ran == ["pick up the marker", "go home"]
+
+    def test_all_ok_exits_0(self, cli, monkeypatch, restore_sigint):
+        code, ran = _main(cli, monkeypatch, ["-c", "go home"])
+        assert code == 0 and ran == ["go home"]
+
+    def test_hardware_demo_is_the_mvp_script_with_routing(self, cli, monkeypatch, restore_sigint, capsys):
+        code, ran = _main(cli, monkeypatch, ["--hardware", "--demo"])
+        assert code == 0
+        assert ran == ["scan the room", "what do you see", "pick up the marker", "put it in the bowl", "go home"]
+        out = capsys.readouterr().out
+        assert "demo     : scan the room -> what do you see" in out
+        assert "5 -> 5 ok, 0 failed, 0 not run" in out
+
+    def test_look_around_reaches_scan_on_the_hardware_lane(self, cli, monkeypatch, restore_sigint):
+        code, ran = _main(cli, monkeypatch, ["--hardware", "-c", "look around"])
+        assert code == 0 and ran == ["scan the room"]
+
+    def test_sim_lane_is_not_routed(self, cli, monkeypatch, restore_sigint):
+        _code, ran = _main(cli, monkeypatch, ["-c", "scan the table"])
+        assert ran == ["scan the table"]
+
+    def test_builtin_hardware_demo_matches_the_yaml(self, cli):
+        from mfw.config.schema import load_config
+
+        hw = load_config(REPO_ROOT / "configs" / "hardware.yaml").hardware
+        assert tuple(cli.HARDWARE_DEMO_SCRIPT) == hw.demo_script
+        assert "can" not in " ".join(cli.HARDWARE_DEMO_SCRIPT).split()
+
+    def test_fake_scene_has_an_out_of_reach_object(self, cli):
+        from jetson.detector_service import parse_scene
+
+        scene = parse_scene(cli.FAKE_SCENE)
+        assert {"marker", "bowl", "cube"} <= set(scene)
+        x, y = scene["cube"][:2]
+        assert y > 0.24 + 0.03, "beyond workspace_max y + margin: seen but out of reach"
+
+
+class TestRemoteSpeechServerIsNeverAutostarted:
+    """``--voice --voice-server <jetson>:5556`` with the Jetson's speech service
+    still loading (Canary's warm-up takes a while on a cold board): the laptop
+    must wait for it, not probe for a local NeMo install and not launch a local
+    worker bound to the Jetson's address (which can only fail)."""
+
+    class _Stop(Exception):
+        pass
+
+    def _run(self, cli, monkeypatch, server: str) -> list[str]:
+        import mfw.assistant
+
+        calls: list[str] = []
+
+        def _probe(*_a, **_k):
+            calls.append("find_voice_python")
+            return "python"
+
+        def _autostart(*_a, **_k):
+            calls.append("autostart")
+            return False
+
+        stop = self._Stop
+
+        class _Boom:
+            def __init__(self, *a, **k):
+                raise stop()
+
+        monkeypatch.setattr(cli, "_server_is_up", lambda *a, **k: False)
+        monkeypatch.setattr(cli, "_find_voice_python", _probe)
+        monkeypatch.setattr(cli, "_autostart_speech_server", _autostart)
+        monkeypatch.setattr(mfw.assistant, "Assistant", _Boom)
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", "--hardware", "--voice",
+                                          "--voice-server", server, "-c", "go home"])
+        with pytest.raises(self._Stop):
+            cli.main()
+        return calls
+
+    def test_remote_server_is_waited_for_not_started(self, cli, monkeypatch, restore_sigint, capsys):
+        assert self._run(cli, monkeypatch, "10.9.8.7:5556") == []
+        assert "remote: not autostarted" in capsys.readouterr().out
+
+    def test_loopback_server_is_still_autostarted(self, cli, monkeypatch, restore_sigint):
+        assert self._run(cli, monkeypatch, "127.0.0.1:5556") == ["find_voice_python", "autostart"]
+
+
+# ----------------------------------------------------------------------
+# first home: --home-confirmed and the no-terminal refusal
+# ----------------------------------------------------------------------
+
+
+class _RealArmAssistant(_FakeAssistant):
+    """Builds like ``Assistant`` against a real driver whose bridge knows no
+    position: ``HardwareRuntime.build`` calls the installed module gate before
+    the home. ``homes`` counts the homes that would have been sent."""
+
+    homes = 0
+    contexts: list = []
+
+    def __init__(self, config=None, llm_complete=None) -> None:
+        from mfw.hardware import runtime as runtime_mod
+
+        context = {"endpoint": "tcp://10.0.0.5:5560", "driver": "uno",
+                   "home_q": [0.0, 0.0, -0.6109, 0.1745], "state": {"bridge_position_known": False}}
+        _RealArmAssistant.contexts.append(context)
+        runtime_mod._default_first_home_gate(context)  # raises FirstHomeRefused to refuse
+        _RealArmAssistant.homes += 1
+        super().__init__(config, llm_complete)
+
+
+class TestFirstHomeFlag:
+    def _run(self, cli, monkeypatch, argv: list[str]) -> int:
+        import io
+
+        import mfw.assistant
+
+        _RealArmAssistant.homes = 0
+        _RealArmAssistant.contexts = []
+        _FakeAssistant.ran = []
+        _FakeAssistant.fail = set()
+        monkeypatch.setattr(mfw.assistant, "Assistant", _RealArmAssistant)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # a scripted run: no terminal
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", *argv])
+        return cli.main()
+
+    def test_no_terminal_without_the_flag_refuses_before_moving(self, cli, monkeypatch, restore_sigint, capsys):
+        from mfw.hardware import runtime as runtime_mod
+
+        before = runtime_mod._default_first_home_gate
+        code = self._run(cli, monkeypatch, ["--hardware", "-c", "go home"])
+        out = capsys.readouterr().out
+        assert code == 1
+        assert _RealArmAssistant.homes == 0 and _FakeAssistant.ran == []
+        assert "FIRST HOME NOT SENT" in out and "--home-confirmed" in out and "Nothing was sent" in out
+        assert "Traceback" not in out
+        assert runtime_mod._default_first_home_gate is before, "main() must restore the module gate"
+
+    def test_home_confirmed_proceeds_and_runs_the_commands(self, cli, monkeypatch, restore_sigint, capsys):
+        from mfw.hardware import runtime as runtime_mod
+
+        before = runtime_mod._default_first_home_gate
+        code = self._run(cli, monkeypatch, ["--hardware", "--home-confirmed", "-c", "go home"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert _RealArmAssistant.homes == 1 and _FakeAssistant.ran == ["go home"]
+        assert "--home-confirmed given" in out and "Hand-pose the arm at home" in out
+        assert "1st home : pre-confirmed (--home-confirmed)" in out
+        assert runtime_mod._default_first_home_gate is before
+
+    def test_the_banner_says_the_first_home_will_be_confirmed(self, cli, monkeypatch, restore_sigint, capsys):
+        self._run(cli, monkeypatch, ["--hardware", "-c", "go home"])
+        assert "1st home : a real arm with no known position or limp servos asks you to type 'home'" in capsys.readouterr().out
+
+    def test_sim_lane_never_installs_a_home_gate(self, cli, monkeypatch, restore_sigint):
+        from mfw.hardware import runtime as runtime_mod
+
+        installed: list = []
+        monkeypatch.setattr(runtime_mod, "set_first_home_gate", lambda gate: installed.append(gate))
+        code, ran = _main(cli, monkeypatch, ["-c", "go home"])
+        assert code == 0 and ran == ["go home"] and installed == []
+
+    def test_help_documents_the_flag(self, cli, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", "--help"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        text = " ".join(capsys.readouterr().out.split())
+        assert "--home-confirmed" in text and "not a terminal" in text
+
+
+# ----------------------------------------------------------------------
+# --fake-hardware never silently reuses what already listens on its ports
+# ----------------------------------------------------------------------
+
+
+class TestFakeHardwareDoesNotReuseSilently:
+    """A leftover fake (an earlier run, a test) on 5560 made the demo fail
+    intermittently: it was reused as is, and it was estopped or held another
+    scene. A server with a REAL driver there would mean driving a real arm in
+    fake mode. Nothing here opens a socket: the probes and Popen are fakes."""
+
+    class _Popen:
+        def __init__(self, command, **_kw):
+            self.command = command
+            self.pid = 4242
+            TestFakeHardwareDoesNotReuseSilently.launched.append(command)
+
+    launched: list = []
+
+    def _setup(self, cli, monkeypatch, robot: dict | None, detector_up: bool):
+        import subprocess
+
+        TestFakeHardwareDoesNotReuseSilently.launched = []
+        started = {"robot": False, "detector": False}
+
+        def _describe(*_a, **_k):
+            return robot
+
+        def _robot_up(*_a, **_k):  # the post-spawn readiness probe
+            return started["robot"] or robot is not None
+
+        def _server_up(*_a, **_k):
+            return detector_up or started["detector"]
+
+        def _popen(command, **kw):
+            proc = self._Popen(command, **kw)
+            started["robot" if "robot_server.py" in " ".join(command) else "detector"] = True
+            return proc
+
+        monkeypatch.setattr(cli, "_describe_robot_server", _describe)
+        monkeypatch.setattr(cli, "_robot_server_is_up", _robot_up)
+        monkeypatch.setattr(cli, "_server_is_up", _server_up)
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+
+    def _launched_names(self):
+        return ["robot_server" if "robot_server.py" in " ".join(c) else "detector"
+                for c in TestFakeHardwareDoesNotReuseSilently.launched]
+
+    def test_nothing_running_starts_both_fakes(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot=None, detector_up=False)
+        spawned = cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558, wait_seconds=1)
+        assert len(spawned) == 2
+        assert self._launched_names() == ["robot_server", "detector"]
+        assert "--driver" in TestFakeHardwareDoesNotReuseSilently.launched[0]
+        assert "fake" in TestFakeHardwareDoesNotReuseSilently.launched[0]
+
+    def test_a_real_driver_on_the_port_is_always_refused(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot={"fake": False, "estopped": False, "server": "mfw-robot"},
+                    detector_up=False)
+        for reuse in (False, True):
+            with pytest.raises(SystemExit, match="REAL driver"):
+                cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558,
+                                             wait_seconds=1, reuse_existing=reuse)
+        assert self._launched_names() == []
+
+    def test_a_leftover_fake_is_refused_without_the_flag(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot={"fake": True, "estopped": False, "server": "mfw-robot"},
+                    detector_up=True)
+        with pytest.raises(SystemExit, match="already running .*--reuse-fakes"):
+            cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558, wait_seconds=1)
+        assert self._launched_names() == []
+
+    def test_an_estopped_fake_is_refused_even_with_the_flag(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot={"fake": True, "estopped": True, "server": "mfw-robot"},
+                    detector_up=True)
+        with pytest.raises(SystemExit, match="estopped"):
+            cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558,
+                                         wait_seconds=1, reuse_existing=True)
+        assert self._launched_names() == []
+
+    def test_reuse_with_the_flag_starts_nothing_and_says_so(self, cli, monkeypatch, capsys):
+        self._setup(cli, monkeypatch, robot={"fake": True, "estopped": False, "server": "mfw-robot"},
+                    detector_up=True)
+        spawned = cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558,
+                                               wait_seconds=1, reuse_existing=True)
+        assert spawned == [] and self._launched_names() == []
+        out = capsys.readouterr().out
+        assert "Reusing the fake robot server" in out and "Reusing the detector" in out
+
+    def test_a_leftover_detector_is_refused_without_the_flag(self, cli, monkeypatch):
+        self._setup(cli, monkeypatch, robot=None, detector_up=True)
+        with pytest.raises(SystemExit, match="detector is already running"):
+            cli._autostart_fake_hardware("127.0.0.1", 5560, "127.0.0.1", 5558, wait_seconds=1)
+        assert self._launched_names() == []
+
+    def test_describe_reports_fake_and_estopped_from_the_server(self, cli, monkeypatch):
+        import mfw.hardware.zmq_rpc as rpc
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def call(self, endpoint, data):
+                return {"ping": {"ok": True, "fake": True, "server": "mfw-robot"},
+                        "get_state": {"estopped": True}}[endpoint]
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(cli, "_robot_server_is_up", lambda *a, **k: True)
+        monkeypatch.setattr(rpc, "ZmqRpcClient", _Client)
+        assert cli._describe_robot_server("127.0.0.1", 5560) == {
+            "fake": True, "estopped": True, "server": "mfw-robot"}
+        monkeypatch.setattr(cli, "_robot_server_is_up", lambda *a, **k: False)
+        assert cli._describe_robot_server("127.0.0.1", 5560) is None
+
+    def test_help_documents_the_flag(self, cli, monkeypatch, restore_sigint, capsys):
+        monkeypatch.setattr(sys, "argv", ["run_assistant.py", "--help"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        text = " ".join(capsys.readouterr().out.split())
+        assert "--reuse-fakes" in text and "never drives a server with a real driver" in text

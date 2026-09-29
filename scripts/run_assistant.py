@@ -16,7 +16,9 @@ Modes:
 Hardware lane (no Isaac Sim; run with a plain ``py -3.12``):
 
     py -3.12 scripts/run_assistant.py --fake-hardware -c "pick up the marker"
+    py -3.12 scripts/run_assistant.py --fake-hardware --demo
     py -3.12 scripts/run_assistant.py --hardware --jetson 192.168.1.50 --interactive
+    py -3.12 scripts/run_assistant.py --hardware --jetson 192.168.1.50 --demo
 
   --hardware        drive the real arm through the Jetson robot server
                     (configs/hardware.yaml unless --config is given)
@@ -25,6 +27,29 @@ Hardware lane (no Isaac Sim; run with a plain ``py -3.12``):
                     jetson/detector_service.py --backend scripted
   --jetson HOST[:PORT], --detector-server HOST:PORT, --llm-server HOST:PORT
                     point the three services at another machine
+  --demo            on the hardware lane: scan the room -> what do you see ->
+                    pick up the marker -> put it in the bowl -> go home
+                    (hardware.demo_script in the YAML overrides it)
+  --home-confirmed  pre-confirm the first home for a run with no terminal
+                    (see below)
+
+First home (real arm only). After every robot_server start the servo bridge
+knows no position, and the bring-up `home` attaches every servo AT home at
+full speed. Against a real driver in that state, --hardware prints the
+hand-pose instructions (arm at home, E-stop in reach, hands clear), discards
+anything typed during bring-up and waits for the word `home`; Ctrl-C or end
+of input aborts before anything moves. It asks the same way on a second run
+against the same robot_server when the servos are detached (the server's
+5 s host timeout after the previous session, a cleared estop): that home
+re-attaches AT the last pulsed pose at full speed first, so the arm is posed
+there, not at home. With no terminal (stdin not a TTY: piped, scheduled, a
+service unit) it refuses and exits 1 unless --home-confirmed says a person
+already hand-posed the arm. Only the fake lane, and a real arm whose servos
+are still attached at a known position, never prompt.
+
+Exit status: 0 when every -c/--demo command succeeded, 1 when any failed (or
+the first home was refused), 130 on Ctrl-C. On the hardware lane the run stops at the first failure unless
+--keep-going; the sim lane runs every command, as it always has.
 
 ``sys.argv`` is cleared before the simulator starts: ``SimulationApp`` parses argv
 itself and exits on flags it does not recognise, so our own options must not still
@@ -36,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -61,6 +87,49 @@ DEMO_SCRIPT = [
     "place it",
     "go home",
 ]
+
+#: The hardware MVP demo (``--demo`` with ``--hardware``/``--fake-hardware``),
+#: in the words of configs/hardware.yaml's labels: marker (19 mm across the
+#: jaw) into the bowl. "can" is avoided on purpose -- Canary hears "kin".
+#: ``hardware.demo_script`` in the YAML replaces it without a code change.
+HARDWARE_DEMO_SCRIPT = [
+    "scan the room",
+    "what do you see",
+    "pick up the marker",
+    "put it in the bowl",
+    "go home",
+]
+
+#: Whole-clause phrases that mean "scan the room" on the hardware lane but
+#: that the rule parser maps elsewhere ("scan the table" -> observe) or not at
+#: all ("look around"). Rewritten before parsing, only when scan_scene is
+#: registered, so the sim lane's parse of the same words is untouched.
+_SCAN_PHRASE = re.compile(
+    r"(?:please )?(?:(?:can|could|will) you )?"
+    r"(?:(?:have a |take a )?look around(?: the (?:room|table|scene))?"
+    r"|scan (?:the )?(?:room|table|scene|area|workspace)"
+    r"|look at the table)"
+    r"(?: for me)?(?: please)?"
+)
+
+
+def route_hardware_phrase(utterance: str) -> str:
+    """``"look around"`` / ``"scan the table"`` -> ``"scan the room"``; else unchanged."""
+    text = re.sub(r"[^a-z0-9\s]", " ", str(utterance).lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    return "scan the room" if _SCAN_PHRASE.fullmatch(text) else utterance
+
+
+def route_clauses(
+    clauses_of: Callable[[str], list],
+    run_clause: Callable[[str], Any],
+    route: Callable[[str], str] = route_hardware_phrase,
+) -> tuple[Callable[[str], list], Callable[[str], Any]]:
+    """``(clauses_of, run_clause)`` that apply ``route`` to every clause first."""
+    return (
+        lambda utterance: [route(c) for c in clauses_of(utterance)],
+        lambda clause: run_clause(route(clause)),
+    )
 
 
 def format_outcome(utterance: str, outcome, show_remaining: bool = True) -> list[str]:
@@ -198,6 +267,59 @@ def format_report(report: CommandReport) -> str:
 
 def _print_report(report: CommandReport) -> None:
     print("\n" + format_report(report))
+
+
+def run_script(
+    commands: list[str],
+    run_one: Callable[[str], CommandReport],
+    keep_going: bool = False,
+    emit: Callable[[CommandReport], None] = _print_report,
+) -> tuple[list[CommandReport], tuple[str, ...]]:
+    """Run scripted (-c / --demo) commands in order; ``(reports, not_run)``.
+
+    Stops at the first command that is not ok unless ``keep_going``: "put it
+    in the bowl" after a failed pick has nothing to put, and on the real arm
+    every further motion is one more thing to go wrong unobserved.
+    """
+    reports: list[CommandReport] = []
+    for index, utterance in enumerate(commands):
+        report = run_one(utterance)
+        emit(report)
+        reports.append(report)
+        if not report.ok and not keep_going:
+            return reports, tuple(commands[index + 1:])
+    return reports, ()
+
+
+def script_summary(reports: list[CommandReport], not_run: tuple[str, ...]) -> str:
+    """One line for the end of a scripted run; names the first failure."""
+    failed = [r for r in reports if not r.ok]
+    line = (
+        f"commands : {len(reports) + len(not_run)} -> {len(reports) - len(failed)} ok, "
+        f"{len(failed)} failed, {len(not_run)} not run"
+    )
+    if failed:
+        first = failed[0]
+        line += f'\n  first failure: "{first.utterance}" -> {first.final.message or "(no message)"}'
+    if not_run:
+        line += f"\n  not run  : {' / '.join(not_run)}  (pass --keep-going to run them anyway)"
+    return line
+
+
+def script_exit_code(reports: list[CommandReport], not_run: tuple[str, ...]) -> int:
+    """0 only when every scripted command ran and succeeded."""
+    return 0 if not not_run and all(r.ok for r in reports) else 1
+
+
+def lane_exit_code(hardware_mode: bool, reports: list[CommandReport], not_run: tuple[str, ...]) -> int:
+    """The process exit status after a scripted run.
+
+    Hardware lanes (``--hardware``/``--fake-hardware``): :func:`script_exit_code`,
+    so a failed demo step is a non-zero exit. The sim lane keeps HEAD's
+    behaviour -- a scripted run exits 0 whatever its commands did (review:
+    the simulation's behaviour must not change); read its summary instead.
+    """
+    return script_exit_code(reports, not_run) if hardware_mode else 0
 
 
 def _listen_for_reply(recognizer: Any, attempts: int = 3) -> str | None:
@@ -382,6 +504,31 @@ def _robot_server_is_up(host: str, port: int, timeout: float = 1.0) -> bool:
         client.close()
 
 
+def _describe_robot_server(host: str, port: int, timeout: float = 1.0) -> dict | None:
+    """What is already listening on the robot port: ``None`` if nothing answers,
+    else ``{"fake": bool, "estopped": bool, "server": str}`` from ping + get_state."""
+    if not _robot_server_is_up(host, port, timeout=timeout):
+        return None
+    from mfw.hardware.zmq_rpc import RpcError, ZmqRpcClient
+
+    client = ZmqRpcClient(host, port, request_timeout_s=timeout)
+    try:
+        ping = client.call("ping", {})
+        try:
+            state = client.call("get_state", {})
+        except RpcError:
+            state = {}
+        return {
+            "fake": bool(ping.get("fake", False)),
+            "estopped": bool(state.get("estopped", False)),
+            "server": str(ping.get("server", "?")),
+        }
+    except RpcError:
+        return {"fake": False, "estopped": False, "server": "?"}
+    finally:
+        client.close()
+
+
 def _parse_host_port(spec: str, default_host: str, default_port: int) -> tuple[str, int]:
     host, _, port_text = str(spec).partition(":")
     return host or default_host, int(port_text or default_port)
@@ -393,7 +540,9 @@ def _is_loopback(host: str) -> bool:
 
 #: The scripted scene both fake services agree on: the robot server owns it
 #: (objects move when the fake jaw closes on them) and the detector reads it.
-FAKE_SCENE = "marker:0.18,0.05 bowl:0.15,-0.12"
+#: The cube sits 37 cm out, beyond the workspace, so the demo also shows the
+#: "out of reach" report (it is never picked or planned around).
+FAKE_SCENE = "marker:0.18,0.05 bowl:0.15,-0.12 cube:0.20,0.31"
 #: The Uno sketch's watchdog (servo_bridge.ino), mirrored by the spawned fake.
 FAKE_WATCHDOG_MS = 500
 
@@ -608,19 +757,57 @@ class HardwareStopGuard:
 
 def _autostart_fake_hardware(
     robot_host: str, robot_port: int, detector_host: str, detector_port: int,
-    wait_seconds: float = 30.0,
+    wait_seconds: float = 30.0, reuse_existing: bool = False,
 ) -> list:
-    """Launch the two fake services this interpreter can run, if they are not up.
+    """Launch the two fake services this interpreter can run.
 
     Returns the Popen handles so the caller can stop what it started. Both
     run in this interpreter (``sys.executable``): they need only numpy, pyzmq
     and msgpack, all of which are already required to talk to them.
+
+    Something already listening on either port is NOT silently reused: a
+    leftover fake (an earlier run, a test) may be estopped or hold a different
+    scene, and made the demo fail intermittently; a robot server with a real
+    driver there would mean driving a real arm in fake mode. So a real driver
+    is always refused, and a fake is reused only with ``reuse_existing``
+    (``--reuse-fakes``) and only if it is not estopped.
     """
     import subprocess
 
+    existing = _describe_robot_server(robot_host, robot_port)
+    if existing is not None:
+        where = f"{robot_host}:{robot_port}"
+        if not existing["fake"]:
+            raise SystemExit(
+                f"--fake-hardware: a robot server with a REAL driver ({existing['server']}) is "
+                f"running on {where}. Fake mode never drives real hardware: stop that server, "
+                "or run with --hardware instead of --fake-hardware."
+            )
+        if not reuse_existing:
+            raise SystemExit(
+                f"--fake-hardware: a fake robot server is already running on {where} (left over "
+                "from an earlier run or a test?). Stop it so a fresh one can start, or pass "
+                "--reuse-fakes to use it as it is."
+            )
+        if existing["estopped"]:
+            raise SystemExit(
+                f"--reuse-fakes: the fake robot server on {where} is estopped. Send it "
+                "clear_estop, or stop it so a fresh one can start."
+            )
+        print(f"\n  Reusing the fake robot server already running on {where} (--reuse-fakes).")
+    if _server_is_up(detector_host, detector_port):
+        where = f"{detector_host}:{detector_port}"
+        if not reuse_existing:
+            raise SystemExit(
+                f"--fake-hardware: a detector is already running on {where} (left over from an "
+                "earlier run or a test?). Stop it so a fresh scripted one can start, or pass "
+                "--reuse-fakes to use it as it is."
+            )
+        print(f"  Reusing the detector already running on {where} (--reuse-fakes).")
+
     spawned = []
     jobs = []
-    if not _robot_server_is_up(robot_host, robot_port):
+    if existing is None:
         jobs.append((
             "robot server",
             # --fake-watchdog-ms: the fake detaches itself after 500 ms without a
@@ -671,6 +858,22 @@ def _find_llm_python(user_override: str | None = None) -> str:
             return str(c)
     return sys.executable
 
+
+
+def _apply_llm_mode(assistant: Any, mode: str) -> None:
+    """Set the LLM parser's policy (``--llm-mode``) on a built Assistant.
+
+    ``Assistant`` constructs ``LlmIntentParser`` itself; the planner holds the
+    same parser object, so setting ``mode`` here changes what every command
+    uses. Parsing has not started yet (construction only runs ``observe``).
+    """
+    from mfw.language.intent_parser import LlmIntentParser
+
+    parser = getattr(assistant, "parser", None)
+    if isinstance(parser, LlmIntentParser):
+        parser.mode = mode
+        print(f"  LLM parser mode   : {mode}"
+              + (" (rules first; LLM only when the rules refuse)" if mode == "hybrid" else ""))
 
 
 def _autostart_llm_server(
@@ -736,7 +939,16 @@ def main() -> int:
         "--fake-hardware",
         action="store_true",
         help="hardware lane against loopback fakes (robot_server.py --driver fake, "
-        "detector_service.py --backend scripted), autostarted if not running",
+        "detector_service.py --backend scripted), started fresh for this run. Refuses if "
+        "something already listens on those ports (see --reuse-fakes); never drives a server "
+        "with a real driver",
+    )
+    parser.add_argument(
+        "--reuse-fakes",
+        action="store_true",
+        help="with --fake-hardware: use a fake robot server / detector that is already running "
+        "on the configured ports instead of refusing (still refused if that robot server is "
+        "estopped or has a real driver)",
     )
     parser.add_argument(
         "--jetson",
@@ -775,7 +987,28 @@ def main() -> int:
         "always GPU. Worth it for scenes with hundreds of bodies; for a handful, "
         "kernel-launch and sync overhead usually makes it SLOWER than CPU.",
     )
-    parser.add_argument("--demo", action="store_true", help="run the scripted demo")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="run the scripted demo (hardware lane: scan the room, what do you see, pick up "
+        "the marker, put it in the bowl, go home)",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="with -c/--demo on the hardware lane: run every command even after one fails "
+        "(the exit status is still 1). Default there: stop at the first failure. The sim "
+        "lane always runs every command",
+    )
+    parser.add_argument(
+        "--home-confirmed",
+        action="store_true",
+        help="hardware lane: a person has hand-posed the arm (at home after a robot_server "
+        "start; at its last pose when the servos are limp), E-stop in reach, hands clear, so the "
+        "first home -- a full-speed attach -- may be sent without the typed 'home' prompt. "
+        "Required when stdin is not a terminal (scripted or service runs); without it such a run "
+        "refuses before moving anything",
+    )
     parser.add_argument("--interactive", action="store_true", help="prompt for commands")
     parser.add_argument(
         "-c", "--command", action="append", default=[], help="run a command (repeatable)"
@@ -850,6 +1083,14 @@ def main() -> int:
         choices=["cuda", "cpu"],
         help="device for the LLM intent model (default: cuda)",
     )
+    parser.add_argument(
+        "--llm-mode",
+        default="hybrid",
+        choices=["hybrid", "llm-first"],
+        help="with --llm: 'hybrid' (default) runs the rule parser first and asks the LLM "
+        "only when the rule parser refuses; the LLM never overrides a rule parse. "
+        "'llm-first' asks the LLM first and falls back to the rules.",
+    )
     args = parser.parse_args()
 
     hardware_mode = bool(args.hardware or args.fake_hardware)
@@ -885,13 +1126,22 @@ def main() -> int:
     # It also fails for a confusing reason: --asr selects which dependency set is
     # probed, so connecting to a running Canary server without repeating
     # `--asr canary` reports missing *whisper* packages.
+    # A speech server on another machine (the Jetson, :5556) is never started
+    # from here -- launching a local worker bound to the Jetson's address can
+    # only fail, and probing for a local ASR install would demand NeMo on a
+    # laptop that needs none. The voice block below waits for it instead.
+    remote_voice_server = bool(args.voice and args.voice_server and not _is_loopback(_host))
+    if remote_voice_server and not server_already_up:
+        print(f"\n  Speech server {_host}:{_port} is not answering yet (remote: not autostarted;"
+              " start it there, e.g. jetson_mode.sh conversation).")
+
     voice_python = None
-    if args.voice and not server_already_up:
+    if args.voice and not server_already_up and not remote_voice_server:
         # Needed either to spawn a one-shot worker, or to auto-start the resident
         # server when it is not already up.
         voice_python = _find_voice_python(args.voice_python, args.asr)
 
-    if args.voice and args.voice_server and not args.no_autostart:
+    if args.voice and args.voice_server and not args.no_autostart and not remote_voice_server:
         if not server_already_up:
             # Started before Isaac Sim so the ~39 s model load overlaps Isaac's
             # own ~60 s startup instead of running after it.
@@ -946,7 +1196,8 @@ def main() -> int:
         hw = config.hardware
         if args.fake_hardware:
             spawned_fakes = _autostart_fake_hardware(
-                hw.jetson_host, hw.jetson_port, hw.detector_host, hw.detector_port
+                hw.jetson_host, hw.jetson_port, hw.detector_host, hw.detector_port,
+                reuse_existing=args.reuse_fakes,
             )
             if spawned_fakes:
                 import atexit
@@ -963,6 +1214,11 @@ def main() -> int:
         print(f"  backend  : {config.default_executor}")
         print(f"  labels   : {', '.join(hw.labels)}")
         print(f"  STOP     : {STOP_NOTICE.format(chunk=hw.trajectory_chunk_s)}")
+        print("  1st home : " + (
+            "pre-confirmed (--home-confirmed): the arm must already be hand-posed at home"
+            if args.home_confirmed else
+            "a real arm with no known position or limp servos asks you to type 'home' first"
+        ))
         print("=" * 72)
     else:
         print("=" * 72)
@@ -1029,8 +1285,27 @@ def main() -> int:
             llm_complete = None
 
     assistant = None
+    exit_code = 0
     stop_guard: HardwareStopGuard | None = None
+
+    def _route_if_hardware(clauses_of: Callable[[str], list], run_clause: Callable[[str], Any]):
+        """The hardware lane's "look around" -> "scan the room" rewrite (see :func:`route_clauses`)."""
+        if hardware_mode and assistant.runtime.skills.has("scan_scene"):
+            return route_clauses(clauses_of, run_clause)
+        return clauses_of, run_clause
+    #: Caught below only on the hardware lane (an empty tuple catches nothing),
+    #: so the sim lane never imports the hardware runtime.
+    home_refused: tuple = ()
+    previous_home_gate: Any = None
     if hardware_mode:
+        # The first home after a robot_server start jumps a real arm to home at
+        # full speed; the runtime asks the operator (TTY) or needs
+        # --home-confirmed. Assistant builds the runtime itself, so the gate is
+        # installed as the module default and restored in the finally below.
+        from mfw.hardware.runtime import FirstHomeGate, FirstHomeRefused, set_first_home_gate
+
+        home_refused = (FirstHomeRefused,)
+        previous_home_gate = set_first_home_gate(FirstHomeGate(confirmed=args.home_confirmed))
         # Ctrl-C estops first -- during bring-up too (HS-4) -- then exits through
         # the finally below.
         stop_guard = HardwareStopGuard(config.hardware.jetson_host, config.hardware.jetson_port)
@@ -1043,6 +1318,8 @@ def main() -> int:
             assistant = stop_guard.construct(Assistant, config=config, llm_complete=llm_complete)
         else:
             assistant = Assistant(config=config, llm_complete=llm_complete)
+        if llm_complete is not None:
+            _apply_llm_mode(assistant, args.llm_mode)
         state = assistant.describe()
         print("\n" + "-" * 72)
         print("  Robot ready")
@@ -1055,10 +1332,25 @@ def main() -> int:
 
         commands = list(args.command)
         if args.demo or (not commands and not args.interactive and not args.voice):
-            commands = DEMO_SCRIPT
+            if hardware_mode:
+                commands = list(config.hardware.demo_script) or list(HARDWARE_DEMO_SCRIPT)
+                print(f"\n  demo     : {' -> '.join(commands)}")
+            else:
+                commands = DEMO_SCRIPT
 
-        for utterance in commands:
-            _print_report(run_command(utterance, assistant.clauses, assistant.command))
+        if commands:
+            reports, not_run = run_script(
+                commands,
+                lambda utterance: run_command(
+                    utterance, *_route_if_hardware(assistant.clauses, assistant.command)
+                ),
+                # Stop-at-first-failure is a hardware-lane safety rule (every
+                # further motion of a real arm is one more unobserved risk).
+                # The sim lane keeps running every command, as it always did.
+                keep_going=args.keep_going or not hardware_mode,
+            )
+            print("\n" + script_summary(reports, not_run))
+            exit_code = lane_exit_code(hardware_mode, reports, not_run)
 
         if args.voice:
             from mfw.language.speech import (
@@ -1128,7 +1420,9 @@ def main() -> int:
                     print("\n" + "*" * 72)
                     print("  MICROPHONE IS LIVE - SPEAK NOW")
                     print(f"  You have {seconds:.0f} seconds per command. Speak clearly.")
-                    print('  Try: "what do you see"  /  "pick up the can"  /  "place it"')
+                    print('  Try: "scan the room"  /  "pick up the marker"  /  "put it in the bowl"'
+                          if hardware_mode else
+                          '  Try: "what do you see"  /  "pick up the can"  /  "place it"')
                     print("  Say 'quit' to stop.")
                     print("*" * 72, flush=True)
                     speak("Robot ready. Give me your command.", talk)
@@ -1185,9 +1479,11 @@ def main() -> int:
                 print(f'\n  [heard] "{text}"')
                 report = run_command(
                     text,
-                    assistant.clauses,
-                    lambda clause: assistant.command_with_clarification(
-                        clause, ask_by_voice, notify=tell
+                    *_route_if_hardware(
+                        assistant.clauses,
+                        lambda clause: assistant.command_with_clarification(
+                            clause, ask_by_voice, notify=tell
+                        ),
                     ),
                 )
                 _print_report(report)
@@ -1211,6 +1507,9 @@ def main() -> int:
                 "shift/nudge", "turn", "survey", "look at", "return home",
                 "squeeze" and "let go" through unconfirmed.
                 """
+                if hardware_mode:
+                    # "look around" moves the base once routed to scan_scene.
+                    text = route_hardware_phrase(text)
                 if args.no_confirm or not assistant.needs_confirmation(text):
                     return True
 
@@ -1294,8 +1593,12 @@ def main() -> int:
         if args.interactive:
             print("\n" + "=" * 72)
             print("  Interactive mode. Try:")
-            print('    "what do you see"      "pick up the can"     "place it"')
-            print('    "move left 5 cm"       "open the gripper"    "go home"')
+            if hardware_mode:
+                print('    "scan the room"        "what do you see"     "pick up the marker"')
+                print('    "put it in the bowl"   "open the gripper"    "go home"')
+            else:
+                print('    "what do you see"      "pick up the can"     "place it"')
+                print('    "move left 5 cm"       "open the gripper"    "go home"')
             print("  Type 'quit' to exit.")
             print("=" * 72)
             while True:
@@ -1314,9 +1617,11 @@ def main() -> int:
                 _print_report(
                     run_command(
                         utterance,
-                        assistant.clauses,
-                        lambda clause: assistant.command_with_clarification(
-                            clause, _typed_ask, notify=lambda text: print(f"  {text}")
+                        *_route_if_hardware(
+                            assistant.clauses,
+                            lambda clause: assistant.command_with_clarification(
+                                clause, _typed_ask, notify=lambda text: print(f"  {text}")
+                            ),
                         ),
                     )
                 )
@@ -1329,10 +1634,24 @@ def main() -> int:
             print("\nInterrupted during bring-up (connecting / boot homing). An estop was "
                   "sent to the robot server -- the line above says whether it was "
                   "acknowledged; if it was not, cut the +6 V servo supply. An "
-                  "acknowledged estop keeps the servos detached until clear_estop.")
+                  "acknowledged estop keeps the servos detached until clear_estop "
+                  "(`scripts/calibrate_servos.py --jetson <ip>:5560` -> `clear`).")
         else:
             print("\nInterrupted.")
+        exit_code = 130
+    except home_refused as exc:
+        # Nothing was sent to the arm: say why and how to proceed, no traceback.
+        print("\n" + "!" * 72)
+        print("  FIRST HOME NOT SENT")
+        print("!" * 72)
+        print(f"  {exc}")
+        print("!" * 72)
+        exit_code = 1
     finally:
+        if previous_home_gate is not None:
+            from mfw.hardware.runtime import set_first_home_gate
+
+            set_first_home_gate(previous_home_gate)
         if assistant is not None:
             assistant.close()
         elif stop_guard is not None:
@@ -1344,7 +1663,7 @@ def main() -> int:
         if stop_guard is not None:
             stop_guard.restore()
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

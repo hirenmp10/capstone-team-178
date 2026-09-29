@@ -788,7 +788,20 @@ class TestHonestyThroughPlace:
 # ----------------------------------------------------------------------
 
 if HARDWARE_LANE_PRESENT:
-    from tests.test_hardware_e2e import lane_factory  # noqa: E402,F401  (pytest fixture)
+    try:
+        from tests.test_hardware_e2e import lane_factory  # noqa: E402,F401  (pytest fixture)
+    except ModuleNotFoundError as _lane_exc:
+        # A partial checkout (a teammate branch with only some hardware
+        # modules): the packages exist but the e2e lane cannot import. Skip
+        # the lane instead of failing collection of this whole file -- and
+        # of tests/test_skills_grounding.py, which imports it. Only a MISSING
+        # module skips: a plain ImportError (a module present but broken, or
+        # lacking a symbol) still fails collection, as it fails the fixture
+        # guard in tests/test_skills_grounding.py.
+        HARDWARE_LANE_PRESENT = False
+        needs_hardware_lane = pytest.mark.skipif(
+            True, reason=f"hardware lane is incomplete in this checkout ({_lane_exc})"
+        )
 
 
 @needs_hardware_lane

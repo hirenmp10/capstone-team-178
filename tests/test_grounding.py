@@ -555,8 +555,11 @@ class TestMoveObjectToDestination:
          ("put the can there", ("place", {})),
          ("put it in the box", ("place", {"relation": "in", "target": "box"})),
          ("move it to the bowl", ("place", {"relation": "to", "target": "bowl"})),
-         ("bring it next to the can", ("place", {"relation": "next_to", "target": "can"})),
-         ("drop the can next to the bowl", ("place", {"relation": "next_to", "target": "bowl"}))],
+         ("bring it next to the can", ("place", {"relation": "next_to", "target": "can"}))],
+        # was here until 2026-09-28: ("drop the can next to the bowl", place next_to bowl).
+        # A named object after "drop" is now a transfer (pick it first); when it
+        # is the object already held the Assistant runs only the place --
+        # TestDropAndPutANamedObject below, tests/test_hardware_language.py.
     )
     def test_not_a_transfer(self, parser, utterance, expected):
         """The robot itself, a pronoun, or no destination: not expanded."""
@@ -882,6 +885,123 @@ OPTIONS = ("green box", "blue can", "red block")
 IDS = ("obj_003", "obj_002", "obj_001")
 
 
+class HoldAwareExecutor(FakeExecutor):
+    """FakeExecutor with the two facts the transfer decision rests on.
+
+    Like mfw/skills/primitives.py Pick.validate, a pick while something is held
+    refuses ("already holding something; place or release it first") without
+    moving; a successful pick holds the object and a place releases it. A fake
+    that let every pick succeed could not show that a different held object is
+    never placed.
+    """
+
+    def __init__(self, memory, scene):
+        super().__init__()
+        self.memory, self.scene = memory, scene
+
+    def execute(self, skill_name, params):
+        self.calls.append((skill_name, dict(params)))
+        if skill_name == "pick":
+            if self.memory.get_held_object() is not None:
+                return SkillResult(skill_name=skill_name, status=SkillStatus.INFEASIBLE,
+                                   message="already holding something; place or release it first")
+            chosen = resolve_reference(params["target"], self.scene, memory=self.memory)
+            self.memory.set_held_object(chosen.track_id)
+            return SkillResult(skill_name=skill_name, status=SkillStatus.SUCCESS, message="picked",
+                               data={"track_id": chosen.track_id})
+        if skill_name == "place":
+            if self.memory.get_held_object() is None:
+                return SkillResult(skill_name=skill_name, status=SkillStatus.FAILED, message="not holding anything")
+            self.memory.set_held_object(None)
+        return SkillResult(skill_name=skill_name, status=SkillStatus.SUCCESS, message="scripted")
+
+
+def _holding(track_id, scene=None):
+    """Memory that has seen ``scene`` (default_scene) and holds ``track_id``."""
+    memory = WorkingMemory(MemoryConfig())
+    scene = scene or default_scene()
+    memory.update_scene(scene)
+    if track_id is not None:
+        memory.set_held_object(track_id)
+    return memory, scene
+
+
+class TestDropAndPutANamedObject:
+    """Language decisions stream, 2026-09-28.
+
+    "drop/put <named object> <relation> <place>": a transfer (pick, then place)
+    unless the named object IS the held one, then a plain place. A different
+    held object is never placed: the pick refuses first.
+
+    was: "drop the can next to the box" -> place (whatever was held went next
+    to the box, even with the red block in the gripper); "put the can in the
+    box" while holding the can -> pick refused ("already holding"), nothing placed.
+    """
+
+    @pytest.mark.parametrize("utterance,place", [
+        ("drop the can next to the box", {"relation": "next_to", "target": "box"}),
+        ("drop the blue can in the box", {"relation": "in", "target": "box"}),
+        ("put the can in the box", {"relation": "in", "target": "box"}),
+        ("no, put the can in the box", {"relation": "in", "target": "box"}),
+        ("drop it in the box", {"relation": "in", "target": "box"}),
+    ])
+    def test_the_held_object_named_is_a_plain_place(self, utterance, place):
+        memory, scene = _holding("obj_002")  # the blue can
+        executor = HoldAwareExecutor(memory, scene)
+        assistant = _assistant(executor, memory=memory)
+        assert len(assistant.clauses(utterance)) == 1
+        outcome = assistant.command(utterance)
+        assert outcome.ok, outcome.message
+        assert executor.calls == [("place", place)]
+
+    @pytest.mark.parametrize("utterance", ["drop the red block next to the box", "put the block in the box",
+                                           "drop the green box on the block"])
+    def test_a_different_held_object_is_never_placed(self, utterance):
+        memory, scene = _holding("obj_002")  # holding the can; the block/box is named
+        executor = HoldAwareExecutor(memory, scene)
+        outcome = _assistant(executor, memory=memory).command(utterance)
+        assert not outcome.ok and "already holding" in outcome.message
+        assert [c[0] for c in executor.calls] == ["pick"]
+        assert memory.get_held_object() == "obj_002"
+        assert outcome.remaining_clauses and outcome.remaining_clauses[0].startswith("place it")
+
+    def test_nothing_held_is_pick_then_place(self):
+        memory, scene = _holding(None)
+        executor = HoldAwareExecutor(memory, scene)
+        outcome = _assistant(executor, memory=memory).command("drop the can next to the box")
+        assert outcome.ok
+        assert executor.calls == [("pick", {"target": "can"}),
+                                  ("place", {"relation": "next_to", "target": "box"})]
+
+    def test_the_held_object_out_of_view_is_found_in_the_scene_at_pick(self):
+        memory, scene = _holding("obj_002")
+        without_can = _scene(scene.objects["obj_001"], scene.objects["obj_003"])
+        memory.update_scene(without_can)  # the gripper hides it from the camera
+        assert memory.get_held_object() == "obj_002"
+        executor = HoldAwareExecutor(memory, without_can)
+        outcome = _assistant(executor, memory=memory).command("drop the can in the box")
+        assert outcome.ok and executor.calls == [("place", {"relation": "in", "target": "box"})]
+
+    def test_an_ambiguous_name_is_not_assumed_to_be_the_held_one(self):
+        """Two cans, one held: "the can" might be either; pick first, which refuses."""
+        scene = _scene(_obj("obj_1", "can", "blue", (0.5, 0.2, 0.45)),
+                       _obj("obj_2", "can", "red", (0.5, -0.2, 0.45)),
+                       _obj("obj_3", "box", "green", (0.6, 0.0, 0.44)))
+        memory, _ = _holding("obj_1", scene)
+        executor = HoldAwareExecutor(memory, scene)
+        outcome = _assistant(executor, memory=memory).command("drop the can in the box")
+        assert not outcome.ok and [c[0] for c in executor.calls] == ["pick"]
+        # ...while the unambiguous description is the place:
+        executor = HoldAwareExecutor(memory, scene)
+        assert _assistant(executor, memory=memory).command("drop the blue can in the box").ok
+        assert executor.calls == [("place", {"relation": "in", "target": "box"})]
+
+    def test_expand_clauses_without_a_predicate_is_unchanged(self):
+        assert expand_clauses("drop the can in the box") == ["pick the can", "place it in the box"]
+        assert expand_clauses("drop the can in the box", names_held=lambda phrase: phrase == "can") == [
+            "place it in the box"]
+
+
 class TestInterpretClarification:
     @pytest.mark.parametrize(
         "answer,index",
@@ -895,6 +1015,27 @@ class TestInterpretClarification:
     @pytest.mark.parametrize("answer", ["cancel", "never mind", "Never mind.", "forget it", "none of them", "no"])
     def test_cancel(self, answer):
         assert interpret_clarification(answer, OPTIONS).kind == "cancel"
+
+    @pytest.mark.parametrize("answer,index", [("nope, the red one", 2), ("no, the second one", 1),
+                                              ("no the can", 1), ("actually, the green box", 0)])
+    def test_a_correction_marker_before_an_answer_is_ignored(self, answer, index):
+        """2026-09-28. was: "nope, the red one" -> unknown (asked again): "nope" was read as a word."""
+        assert (interpret_clarification(answer, OPTIONS).kind, interpret_clarification(answer, OPTIONS).index) == (
+            "choice", index)
+
+    @pytest.mark.parametrize("answer", ["nope", "no no", "no, none of them", "nope, never mind"])
+    def test_a_bare_or_cancelling_correction_still_cancels(self, answer):
+        assert interpret_clarification(answer, OPTIONS).kind == "cancel"
+
+    @pytest.mark.parametrize("answer", ["no not the can", "no, not that one, the can", "not the red one",
+                                        "nope not the red one", "the red one not the can",
+                                        "don't take the can", "no, the other one, not the box"])
+    @pytest.mark.parametrize("with_scene", [False, True])
+    def test_an_answer_that_excludes_an_option_is_asked_again(self, answer, with_scene):
+        """Fixer, 2026-09-28. was: "no not the can" -> the can (with the scene
+        and without): every matcher read "can". now: unknown, asked again."""
+        kw = {"track_ids": IDS, "scene": default_scene()} if with_scene else {}
+        assert interpret_clarification(answer, OPTIONS, **kw).kind == "unknown"
 
     @pytest.mark.parametrize("answer", ["banana", "the fifth one", "one", "", "hmm"])
     def test_unknown(self, answer):
@@ -1054,7 +1195,11 @@ class TestConfirmationGate:
          ("stop", False), ("never mind", False),
          # substring traps of the old matcher
          ("I know", None), ("nothing", None), ("yesterday", None), ("notice", None), ("snowy", None),
-         ("yes no", None), ("", None), ("hmm", None)],
+         ("yes no", None), ("", None), ("hmm", None),
+         # fixer, 2026-09-28: a hesitation blocks a yes (was True: "okay wait"
+         # confirmed a release); a no stays a no
+         ("okay wait", None), ("yes, hold on", None), ("ok hang on", None), ("wait", None),
+         ("sure, one sec", None), ("no wait", False), ("go ahead", True)],
     )
     def test_reply_matching_is_word_based(self, reply, verdict):
         assert classify_confirmation(reply) is verdict
@@ -1156,3 +1301,64 @@ class TestNotFoundExplainsTheMismatch:
         message, exc = _not_found("the blue one", default_scene(), allowed_ids=("obj_001", "obj_003"))
         assert message.endswith(self.ALL)
         assert exc.visible == ("red block", "blue can", "green box")
+
+
+# ----------------------------------------------------------------------
+# ASR alias: Canary hears "can" as "kin" (language stream, 2026-09-26)
+# ----------------------------------------------------------------------
+
+
+class TestAsrKinAlias:
+    """Canary-Qwen-2.5B (bf16 and Q4_K_M) transcribed "can" as "kin" on the
+    30-command set; "pick up the kin" must ground exactly as "pick up the can"
+    would, and never where a real "kin" label or a lookalike word exists."""
+
+    def test_kin_grounds_to_the_can(self):
+        assert _ground("kin", default_scene()) == "obj_002"
+        assert _ground("the blue kin", default_scene()) == "obj_002"
+
+    def test_plural_kins(self):
+        assert _ground("kins", default_scene()) == "obj_002"
+
+    def test_kin_prefers_the_exact_can_over_a_tin_like_can_does(self):
+        """A synonym-group alias would make this a question (can AND tin); the
+        rewrite behaves exactly like the word "can"."""
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", "tin", "red", (0.5, -0.2, 0.45)))
+        assert _ground("can", scene) == "obj_001"
+        assert _ground("kin", scene) == "obj_001"
+
+    def test_multi_word_label(self):
+        assert _ground("soup kin", benchmark_scene()) == "obj_001"
+
+    def test_a_real_kin_label_is_never_rewritten(self):
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", "kin", "red", (0.5, -0.2, 0.45)))
+        assert _ground("kin", scene) == "obj_002"
+        assert _ground("can", scene) == "obj_001"
+
+    def test_a_label_containing_kin_as_a_word_is_never_rewritten(self):
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", "kin doll", "red", (0.5, -0.2, 0.45)))
+        assert _ground("kin", scene) == "obj_002"
+
+    @pytest.mark.parametrize("label", ["napkin", "pumpkin", "skin cream"])
+    def test_lookalike_words_do_not_collide(self, label):
+        """Word-level only: "napkin" / "pumpkin" are not the word "kin"."""
+        scene = _scene(_obj("obj_001", "can", "red", (0.5, 0.2, 0.45)),
+                       _obj("obj_002", label, "white", (0.5, -0.2, 0.45)))
+        assert _ground("kin", scene) == "obj_001"
+        assert _ground(label, scene) == "obj_002"
+
+    def test_no_can_in_view_is_still_not_found_and_names_the_can(self):
+        scene = _scene(_obj("obj_001", "block", "red", (0.5, 0.2, 0.45)))
+        with pytest.raises(ObjectNotFound, match="can"):
+            resolve_reference("kin", scene)
+
+    def test_clarification_answer_kin_picks_the_can_option(self):
+        assert interpret_clarification("the kin", OPTIONS).index == 1
+
+    def test_the_grammar_keeps_the_word_for_grounding(self):
+        """The alias lives in grounding only: the parser must pass "kin" through."""
+        intent = RuleBasedIntentParser(SKILLS).parse("pick up the kin")
+        assert intent.skill == "pick" and intent.params == {"target": "kin"}

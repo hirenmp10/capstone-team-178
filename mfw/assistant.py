@@ -50,12 +50,15 @@ from mfw.config.schema import FrameworkConfig, load_config
 from mfw.core.interfaces import ISkillExecutor
 from mfw.language.grounding import (
     clarification_question,
+    describe_track,
     interpret_clarification,
+    refers_to,
     substitute_referent,
 )
 from mfw.language.intent_parser import (
     IIntentParser,
     LlmIntentParser,
+    NotConfirmed,
     RuleBasedIntentParser,
     split_transfer,
 )
@@ -74,6 +77,10 @@ __all__ = [
     "clarified_command",
     "run_with_clarification",
     "NON_MOTION_SKILLS",
+    "LLM_RELEASE_SKILLS",
+    "describe_release",
+    "release_question",
+    "confirm_by_asking",
 ]
 
 _log = get_logger("assistant")
@@ -103,13 +110,25 @@ def split_conjoined(utterance: str) -> list[str]:
     return parts if len(parts) > 1 else [utterance]
 
 
-def expand_clauses(utterance: str) -> list[str]:
-    """Every atomic clause of ``utterance``, in order (conjunctions, then transfers)."""
+def expand_clauses(
+    utterance: str, names_held: Callable[[str], bool] | None = None
+) -> list[str]:
+    """Every atomic clause of ``utterance``, in order (conjunctions, then transfers).
+
+    ``names_held(object_phrase)`` says whether a transfer's named object is
+    the one already in the gripper; then only the place clause runs ("drop
+    the marker in the bowl" while holding the marker is a plain place). Any
+    other named object keeps its pick, which refuses while something is held
+    -- so a different held object is never put where the operator pointed.
+    """
     clauses: list[str] = []
     for clause in split_conjoined(utterance):
         split = split_transfer(clause)
         if split is not None and split.pick_clause is not None:
-            clauses.extend(split.clauses)
+            if names_held is not None and names_held(split.object_phrase):
+                clauses.append(split.place_clause)
+            else:
+                clauses.extend(split.clauses)
         else:
             clauses.append(clause)
     return clauses
@@ -177,6 +196,14 @@ _NO_WORDS = frozenset(
      "incorrect", "never"}
 )
 _NO_PHRASES = ("never mind", "do not")
+#: "Hold on" is not consent: "okay wait" answering "Did you mean: open the
+#: gripper and drop the marker?" used to read as yes (the "okay") and drop it.
+#: A hesitation blocks a yes (the operator is asked again); it does not turn a
+#: plain no into anything else ("no wait" is still no). Fixer, 2026-09-28;
+#: pinned in tests/test_grounding.py::test_reply_matching_is_word_based.
+_HESITATION_WORDS = frozenset({"wait", "hang", "pause", "hmm", "hm", "um", "uh", "careful"})
+_HESITATION_PHRASES = ("hold on", "hold up", "hold it", "one sec", "one second", "just a sec",
+                       "a sec", "a moment", "a minute", "not yet", "let me", "let me think")
 
 
 def classify_confirmation(reply: str) -> bool | None:
@@ -184,7 +211,8 @@ def classify_confirmation(reply: str) -> bool | None:
 
     Whole words only: the old substring test read "I know" and "nothing" as
     "no" and "yesterday" as "yes". Both at once ("no... yes") is ``None`` so the
-    operator is asked again -- a mixed answer is not consent.
+    operator is asked again -- a mixed answer is not consent. So is a yes with
+    a hesitation in it ("okay wait", "yes, hold on").
     """
     text = str(reply or "").lower().replace("'", "").replace("’", "")
     text = " ".join(re.sub(r"[^\w\s]", " ", text).split())
@@ -192,11 +220,80 @@ def classify_confirmation(reply: str) -> bool | None:
     padded = f" {text} "
     said_yes = bool(words & _YES_WORDS) or any(f" {p} " in padded for p in _YES_PHRASES)
     said_no = bool(words & _NO_WORDS) or any(f" {p} " in padded for p in _NO_PHRASES)
-    if said_yes and not said_no:
+    hesitant = bool(words & _HESITATION_WORDS) or any(f" {p} " in padded for p in _HESITATION_PHRASES)
+    if said_yes and not said_no and not hesitant:
         return True
     if said_no and not said_yes:
         return False
     return None
+
+
+# ----------------------------------------------------------------------
+# LLM-sourced release of a held object
+# ----------------------------------------------------------------------
+
+#: Skills that let go of what the gripper holds. When the LANGUAGE MODEL chose
+#: one (the grammar refused the utterance) while something is held, the
+#: Assistant asks first: measured Qwen maps rule-refused noise onto releases,
+#: and the evidence check accepts "drop" for open_gripper, so a misheard
+#: phrase could otherwise drop the object (review finding, 2026-09-28).
+#: Every Assistant installs the gate, the Isaac sim lane's included (only with
+#: ``--llm``), as it does the held-object transfer collapse in
+#: :meth:`Assistant.clauses`; both sim-lane changes are was -> now rows in
+#: tests/test_language_decisions.py::SIM_LANE_WAS_NOW.
+LLM_RELEASE_SKILLS = frozenset({"open_gripper", "place"})
+
+_PLACE_RELATION_TEXT = {
+    "in": "in", "on": "on", "next_to": "next to", "to": "at", "left_of": "to the left of",
+    "right_of": "to the right of", "in_front_of": "in front of", "behind": "behind",
+}
+_PLACE_DIRECTION_TEXT = {"left": "to the left", "right": "to the right", "forward": "forward",
+                         "back": "back"}
+
+
+def describe_release(intent: Any, held: str | None) -> str:
+    """What a release intent will do, in words: "open the gripper and drop the marker"."""
+    thing = f"the {held}" if held else "what it is holding"
+    params = dict(getattr(intent, "params", None) or intent.get("params") or {})
+    skill = getattr(intent, "skill", None) or intent.get("skill")
+    if skill == "open_gripper":
+        return f"open the gripper and drop {thing}"
+    if not params:
+        return f"put {thing} back where it was picked up"
+    if params.get("relation") == "direction":
+        try:
+            cm = f"{float(params.get('distance')) * 100.0:g} cm "
+        except (TypeError, ValueError):
+            cm = ""
+        direction = str(params.get("direction"))
+        return f"place {thing} {cm}{_PLACE_DIRECTION_TEXT.get(direction, direction)}"
+    relation = str(params.get("relation") or "to")
+    return f"place {thing} {_PLACE_RELATION_TEXT.get(relation, relation)} the {params.get('target')}"
+
+
+def release_question(action: str) -> str:
+    """"Did you mean: open the gripper and drop the marker? say yes or no\""""
+    return f"Did you mean: {action}? say yes or no"
+
+
+def confirm_by_asking(
+    question: str, ask: Callable[[str], str | None], max_questions: int = 3
+) -> bool:
+    """Ask ``question`` until the reply is a clear yes (``True``) or no (``False``).
+
+    No reply (``None``) or ``max_questions`` unclear replies is ``False``:
+    silence is not consent. Replies are read by :func:`classify_confirmation`.
+    """
+    prompt = question
+    for _ in range(max(1, max_questions)):
+        reply = ask(prompt)
+        if reply is None:
+            return False
+        verdict = classify_confirmation(reply)
+        if verdict is not None:
+            return verdict
+        prompt = f"Please say yes or no. {question}"
+    return False
 
 
 # ----------------------------------------------------------------------
@@ -331,6 +428,7 @@ class Assistant:
             if llm_complete is not None
             else RuleBasedIntentParser(skill_names)
         )
+        self._install_llm_gate()
 
         self.executors: dict[str, ISkillExecutor] = {"classical": self.runtime.executor}
         self._gr00t_client: Any = None
@@ -445,8 +543,70 @@ class Assistant:
         return split_conjoined(utterance)
 
     def clauses(self, utterance: str) -> list[str]:
-        """The atomic clauses :meth:`command` will run for ``utterance``, in order."""
-        return expand_clauses(utterance)
+        """The atomic clauses :meth:`command` will run for ``utterance``, in order.
+
+        A transfer whose named object is already held is only its place
+        ("drop the marker in the bowl" with the marker in the gripper). Decided
+        from what is held when this is called: in "pick the marker then drop
+        the marker in the bowl" the second pick still runs and refuses.
+        """
+        return expand_clauses(utterance, names_held=self._names_held_object)
+
+    def _names_held_object(self, phrase: str) -> bool:
+        """Whether ``phrase`` grounds to the object in the gripper right now."""
+        memory = self.runtime.memory
+        held = memory.get_held_object()
+        if held is None:
+            return False
+        base = self.config.robot.base_position
+        return refers_to(
+            phrase, held, self._scenes_with_held(), memory=memory,
+            robot_xy=(float(base[0]), float(base[1])),
+        )
+
+    def _scenes_with_held(self) -> tuple[Any, ...]:
+        """The current scene, then the scene when the held object was picked."""
+        memory = self.runtime.memory
+        at_pick = getattr(memory, "scene_at_pick", None)
+        return (memory.current_scene, at_pick() if callable(at_pick) else None)
+
+    # ------------------------------------------------------------------
+    # confirming an LLM-sourced release
+    # ------------------------------------------------------------------
+
+    def _install_llm_gate(self) -> None:
+        """Make the LLM parser ask before a model-chosen release (see ``_gate_llm_release``)."""
+        if isinstance(self.parser, LlmIntentParser):
+            self.parser.llm_gate = self._gate_llm_release
+
+    def _gate_llm_release(self, intent: Any, utterance: str, context: dict[str, Any]) -> None:
+        """Called by the LLM parser with every intent the MODEL chose.
+
+        An ``open_gripper`` or ``place`` while something is held is confirmed
+        first when there is someone to ask (interactive and voice modes go
+        through :meth:`command_with_clarification`, whose ``ask`` is used), and
+        refused in scripted ``-c`` mode, where nobody can answer. A rule parse
+        never reaches this: "open the gripper" typed plainly is not asked about.
+        A preview (:meth:`planned_skills`) is never asked either -- it only
+        reports the skill, so it is still confirmed as a motion.
+        """
+        if intent.skill not in LLM_RELEASE_SKILLS or not context.get("held_object"):
+            return
+        if getattr(self, "_previewing", False):
+            return
+        held = describe_track(context["held_object"], self._scenes_with_held())
+        action = describe_release(intent, held)
+        ask = getattr(self, "_release_ask", None)
+        if ask is None:
+            raise NotConfirmed(
+                f"not done: the language model read {utterance!r} as '{action}', which releases "
+                f"{'the ' + held if held else 'the held object'}, and a scripted command cannot be "
+                "confirmed. Say it in words the grammar knows (e.g. 'open the gripper', "
+                "'put it in the bowl') or run interactively."
+            )
+        if not confirm_by_asking(release_question(action), ask):
+            raise NotConfirmed(f"cancelled: I did not {action} ({utterance!r} was not confirmed)")
+        _log.info("LLM release confirmed by the operator: %s (%r)", action, utterance)
 
     def command(self, utterance: str) -> CommandOutcome:
         """Execute natural-language command(s): each clause in order, stopping at
@@ -463,9 +623,14 @@ class Assistant:
         ``None`` for a clause that does not parse (it would move nothing).
         """
         skills: list[str | None] = []
-        for clause in self.clauses(utterance):
-            intent = self.planner.preview(clause)
-            skills.append(None if intent is None else intent.skill)
+        previewing = getattr(self, "_previewing", False)
+        self._previewing = True  # an LLM release is reported, not asked about
+        try:
+            for clause in self.clauses(utterance):
+                intent = self.planner.preview(clause)
+                skills.append(None if intent is None else intent.skill)
+        finally:
+            self._previewing = previewing
         return skills
 
     def needs_confirmation(self, utterance: str) -> bool:
@@ -480,17 +645,26 @@ class Assistant:
         notify: Callable[[str], None] | None = None,
         max_questions: int = 3,
     ) -> CommandOutcome:
-        """:meth:`command`, asking "which one?" when a referent is ambiguous."""
+        """:meth:`command`, asking "which one?" when a referent is ambiguous.
+
+        ``ask`` also answers "Did you mean: open the gripper and drop the
+        marker? say yes or no" before an LLM-chosen release of a held object.
+        """
         base = self.config.robot.base_position
-        return run_with_clarification(
-            self.command,
-            utterance,
-            ask,
-            scene_provider=lambda: self.runtime.memory.current_scene,
-            robot_xy=(float(base[0]), float(base[1])),
-            notify=notify,
-            max_questions=max_questions,
-        )
+        previous_ask = getattr(self, "_release_ask", None)
+        self._release_ask = ask
+        try:
+            return run_with_clarification(
+                self.command,
+                utterance,
+                ask,
+                scene_provider=lambda: self.runtime.memory.current_scene,
+                robot_xy=(float(base[0]), float(base[1])),
+                notify=notify,
+                max_questions=max_questions,
+            )
+        finally:
+            self._release_ask = previous_ask
 
     def run_text_loop(self, stream: Any = None, max_commands: int | None = None) -> int:
         """Read typed commands until the stream ends."""

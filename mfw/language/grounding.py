@@ -69,6 +69,7 @@ import numpy as np
 
 from mfw.core.errors import AmbiguousReference, ObjectNotFound
 from mfw.core.types import ObjectHypothesis, SceneGraph
+from mfw.language.intent_parser import strip_correction
 from mfw.utils.logging import get_logger
 
 __all__ = [
@@ -83,6 +84,8 @@ __all__ = [
     "ClarificationChoice",
     "substitute_referent",
     "is_pronoun",
+    "refers_to",
+    "describe_track",
     "SIZE_MARGIN",
     "POSITION_TOLERANCE_M",
     "NEXT_TO_DISTANCE_M",
@@ -170,6 +173,15 @@ _CLASS_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"banana"}),
 )
 
+#: Speech-recognition mishearings of a class word, measured on the ASR itself:
+#: Canary-Qwen-2.5B (bf16 and Q4_K_M alike) transcribes "pick up the can" as
+#: "pick up the kin" (2026-09-26, 30-command set). Applied only while no
+#: visible object's label contains the misheard word itself, so a scene that
+#: really has a "kin" keeps it; the rewrite then behaves exactly as if the
+#: operator had said the class word (exact class before synonym: "kin" with a
+#: can and a tin in view is the can, not a question).
+_ASR_ALIASES: dict[str, str] = {"kin": "can", "kins": "cans"}
+
 #: Words that name a container family without naming one class. A box is not
 #: in the family: in these scenes a box is an object to pick (pudding box, the
 #: default scene's green box), and "the container" must not make it ambiguous.
@@ -245,6 +257,12 @@ _CANCEL_WORDS = frozenset(
     {"cancel", "abort", "stop", "none", "neither", "nothing", "nevermind", "quit", "no", "nope"}
 )
 _CANCEL_PHRASES = ("never mind", "forget it", "forget about it", "no one", "not any")
+#: A negation left in a clarification answer after its leading correction
+#: marker ("no, not the can", "not the red one", "don't take the can"): the
+#: answer excludes an option rather than choosing one, so it is asked again.
+_ANSWER_NEGATION_RE = re.compile(
+    r"\b(?:not|no|nope|nah|never|don t|dont|do not|isn t|isnt|wasn t|wasnt|neither|nor)\b"
+)
 
 
 # ----------------------------------------------------------------------
@@ -537,13 +555,19 @@ def _find_class(query: ReferentQuery, scene: SceneGraph) -> _ClassMatch:
     head: str | None = None
     partial: str | None = None
     unknown: list[str] = []
+    nouns = [
+        _ASR_ALIASES[w]
+        if w in _ASR_ALIASES and w not in label_words and _singular(w) not in label_words
+        else w
+        for w in query.nouns
+    ]
     # Multi-word labels ("picture frame") matched as a whole first.
-    joined = " ".join(query.nouns)
+    joined = " ".join(nouns)
     for label in sorted(labels, key=len, reverse=True):
         if " " in label and re.search(rf"\b{re.escape(label)}s?\b", joined):
             head = label
             break
-    for word in query.nouns:
+    for word in nouns:
         singular = _singular(word)
         if head is not None and (word in head.split() or singular in head.split()):
             continue
@@ -987,6 +1011,9 @@ def _canonical_tokens(text: str) -> set[str]:
         if word in _FILLER or word in GENERIC_NOUNS:
             continue
         word = _COLOUR_SYNONYMS.get(word, word)
+        # Symmetric (options and answer both pass through here), so an option
+        # that really is a "kin" still matches an answer that says "kin".
+        word = _ASR_ALIASES.get(word, word)
         singular = _singular(word)
         groups = _groups_for(word) or _groups_for(singular)
         if groups:
@@ -1023,6 +1050,20 @@ def interpret_clarification(
         set(words) & _CANCEL_WORDS and set(words) <= harmless
     ):
         return ClarificationChoice("cancel")
+    # "Nope, the red one" / "no, the one on the left" (language decisions
+    # stream, 2026-09-28): a leading correction marker in front of an answer
+    # is not part of it. It used to reach the matchers as an unknown word
+    # ("nope") and the question was asked again. A bare "no" is still a
+    # cancel (above), and so is "no, none of them".
+    corrected = strip_correction(text)
+    if corrected != text:
+        text, words = corrected, corrected.split()
+    # "No, not the can" / "not that one, the can": the answer names what NOT
+    # to choose. Every matcher below would read "can" and choose it (measured
+    # before this rule: "no not the can" -> the can). Ask again instead
+    # (fixer, 2026-09-28).
+    if _ANSWER_NEGATION_RE.search(re.sub("['’]", "", text)):
+        return ClarificationChoice("unknown")
 
     # Exact option text.
     for index, option in enumerate(options):
@@ -1066,6 +1107,54 @@ def interpret_clarification(
     if len(matches) == 1:
         return ClarificationChoice("choice", matches[0])
     return ClarificationChoice("unknown")
+
+
+# ----------------------------------------------------------------------
+# is this phrase the object in the gripper?
+# ----------------------------------------------------------------------
+
+
+def refers_to(
+    phrase: str,
+    track_id: str | None,
+    scenes: Iterable[SceneGraph | None],
+    *,
+    memory: Any = None,
+    robot_xy: tuple[float, float] | Sequence[float] = (0.0, 0.0),
+) -> bool:
+    """True when ``phrase`` resolves to exactly ``track_id``.
+
+    Used to decide whether "drop the marker in the bowl" names the object
+    already held (then it is a plain place) or another one (pick it first).
+    The phrase is grounded in the first of ``scenes`` that still contains
+    ``track_id`` -- the current scene, then the scene at pick time, because a
+    held object can drop out of an overhead camera's view for a few frames.
+    Ambiguous or unresolvable phrases are ``False``: the caller then treats
+    the command as a transfer, whose pick refuses while something is held,
+    so nothing is placed that the operator did not name.
+    """
+    if not track_id or not phrase or not str(phrase).strip():
+        return False
+    for scene in scenes:
+        if scene is None or scene.get(track_id) is None:
+            continue
+        try:
+            chosen = resolve_reference(phrase, scene, memory=memory, robot_xy=robot_xy)
+        except (ObjectNotFound, AmbiguousReference):
+            return False
+        return chosen.track_id == track_id
+    return False
+
+
+def describe_track(track_id: str | None, scenes: Iterable[SceneGraph | None]) -> str | None:
+    """:func:`describe` of ``track_id`` from the first scene that has it, else ``None``."""
+    if not track_id:
+        return None
+    for scene in scenes:
+        obj = scene.get(track_id) if scene is not None else None
+        if obj is not None:
+            return describe(obj)
+    return None
 
 
 def substitute_referent(clause: str, phrase: str, replacement: str) -> str | None:

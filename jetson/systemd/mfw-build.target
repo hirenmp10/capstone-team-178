@@ -1,0 +1,9 @@
+# Build mode (docs/JETSON_MODELS_PLAN.md, Mode B): nothing resident, so
+# llama.cpp / transcribe.cpp / TensorRT builds get the whole 8 GB (build with
+# -j4, not -j6). Starting it stops every mfw service.
+
+[Unit]
+Description=mfw build mode (no model resident)
+Conflicts=mfw-conversation.target mfw-robot.service mfw-llama.service mfw-llm-shim.service mfw-speech.service mfw-detector.service
+After=mfw-conversation.target mfw-robot.service mfw-llama.service mfw-llm-shim.service mfw-speech.service mfw-detector.service
+AllowIsolate=no

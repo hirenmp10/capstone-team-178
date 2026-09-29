@@ -197,10 +197,11 @@ memory:
 
 gr00t:
   # Disabled. The checkpoint IS downloaded (HF cache: nvidia/GR00T-N1.7-3B plus
-  # its Cosmos-Reason2-2B backbone), but scripts/groot_server.py has never
-  # completed a live inference on this machine, the bridge has been validated
-  # only against fakes and the mock (tests/test_gr00t_zmq.py), and the hardware
-  # lane excludes GR00T. `run_assistant.py --groot` turns it on for a run.
+  # its Cosmos-Reason2-2B backbone). One live zero-shot inference run completed
+  # on 2026-09-25 (simulation only: actions drove the arm through the safety
+  # filter, 0/2 picks, failure reported honestly; see SYSTEM_VERIFICATION.md).
+  # The bridge is also validated against fakes and the mock
+  # (tests/test_gr00t_zmq.py), and the hardware lane excludes GR00T. `run_assistant.py --groot` turns it on for a run.
   # The classical backend is fully functional without this.
   enabled: false
   host: 127.0.0.1

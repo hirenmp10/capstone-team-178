@@ -1,0 +1,43 @@
+# mfw robot server: arm bridge (Uno servo_bridge.ino over USB serial) + the
+# single overhead webcam (get_frame). No model; starts first so the detector
+# has frames. Part of mfw-conversation.target.
+#
+# Safety: after every start the bridge knows no position, and the FIRST `home`
+# request attaches every servo AT home at full speed. The start itself
+# attaches nothing. That home comes from run_assistant --hardware on startup
+# (it stops at a FIRST HOME prompt and waits for the word `home`; with no
+# terminal it refuses unless --home-confirmed) or from calibrate_servos `home`
+# (asks for `yes`). Hand-pose the arm at home at that prompt, and keep the
+# +6 V E-stop within reach. A later run prompts too once the host timeout has
+# left the servos limp: that home re-attaches AT the last pose first.
+
+[Unit]
+Description=mfw robot server (arm bridge + webcam, ZMQ :5560)
+PartOf=mfw-conversation.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=jetson
+EnvironmentFile=/etc/mfw/mfw.env
+WorkingDirectory=/home/jetson/mfw
+# Drop the page cache and compact memory before every start: on the 8 GB
+# Orin Nano the models' large CUDA allocations fail on fragmented memory
+# (NvMapMemAllocInternalTagged error 12). '+' runs this line as root.
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+ExecStart=/bin/sh -c 'exec "$$MFW_PYTHON" "$$MFW_HOME/jetson/robot_server.py" --config "$$MFW_HOME/jetson/robot_config.yaml" --driver "$$MFW_ARM_DRIVER" --serial "$$MFW_SERIAL" --host 0.0.0.0 --port 5560 --arm-geometry "$$MFW_ARM_GEOMETRY" $$MFW_ROBOT_EXTRA'
+ExecStartPost=/bin/sh -c 'exec "$$MFW_HOME/jetson/systemd/wait_ready.sh" tcp 127.0.0.1 5560 60'
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+# SIGINT: robot_server's KeyboardInterrupt path (server.stop(); driver.close())
+# instead of dying mid-frame. Once frames stop, the Uno sketch's 500 ms
+# watchdog detaches the servos whatever the shutdown did.
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=mfw-conversation.target

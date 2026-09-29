@@ -1,0 +1,28 @@
+# llama-server with Qwen2.5-3B-Instruct GGUF Q4_K_M (~2.5-2.8 GB resident).
+# The FIRST model to load (largest contiguous allocation, on the freshest
+# memory); mfw-speech waits for its /health. Loopback only: the laptop talks
+# to the shim (mfw-llm-shim, :5557), never to llama-server directly.
+
+[Unit]
+Description=mfw llama-server (Qwen2.5-3B-Instruct Q4_K_M, 127.0.0.1:8080)
+PartOf=mfw-conversation.target
+After=network-online.target mfw-robot.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=jetson
+EnvironmentFile=/etc/mfw/mfw.env
+WorkingDirectory=/home/jetson/mfw
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+ExecStart=/bin/sh -c 'exec "$$LLAMA_SERVER" -m "$$QWEN_GGUF" $$LLAMA_ARGS --host 127.0.0.1 --port "$$LLAMA_PORT"'
+# Ready = model loaded (llama-server answers /health with 200 only then).
+ExecStartPost=/bin/sh -c 'exec "$$MFW_HOME/jetson/systemd/wait_ready.sh" http "http://127.0.0.1:$$LLAMA_PORT/health" 240'
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=mfw-conversation.target
